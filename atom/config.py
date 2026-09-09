@@ -1949,8 +1949,13 @@ class Config:
             draft_cfg = self.speculative_config.draft_model_hf_config
             if not is_dspark:
                 # Sequential drafters (MTP / Eagle): one drafted token per
-                # backbone pass, so the horizon is a small fixed depth.
-                max_spec = 4
+                # backbone pass, so the horizon is a small fixed depth. A
+                # checkpoint that ships several MTP modules states the depth it
+                # was trained for (MiniMax-M3: num_mtp_modules=7) and the
+                # predictor reuses its instantiated layers modulo that count, so
+                # honour it. Most MTP checkpoints declare nothing, hence the
+                # floor -- which keeps every existing model at the old bound.
+                max_spec = max(4, int(getattr(draft_cfg, "num_mtp_modules", 0) or 0))
             else:
                 # DSpark is a PARALLEL block drafter: all flavors
                 # (inline V4, standalone K3 / Qwen3 / ...) share this path with
