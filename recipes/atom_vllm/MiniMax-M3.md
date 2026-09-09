@@ -1,171 +1,245 @@
-# MiniMax-M3 with ATOM vLLM Plugin Backend
+# MiniMax-M3 (gluon) with the ATOM vLLM Plugin Backend
 
-This recipe shows how to run MiniMax-M3 sparse checkpoints with the ATOM vLLM
-plugin backend. For background on the plugin backend, see
-[ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
+This recipe covers the source installation of vLLM, AITER and ATOM, the server
+commands, and the accuracy-validation commands for the MiniMax-M3 gluon path.
 
-MiniMax-M3 uses the ATOM-owned model implementation and vLLM attention adapters
-for both dense and sparse attention layers.
+Base image: `vllm/vllm-openai-rocm:nightly-27a94d1ce4e3fc100c4732439ccec10f8246a804`
+(digest `sha256:91e381f072d6a44e1e4c97c82dce06e50e5189905cb3999a11471c5a8fc6a563`).
 
-## Step 1: Pull the OOT Docker
+TP=4 only: `pa_decode_gluon` needs `num_kv_heads == 1` per rank and M3 has 4 KV heads.
+
+Path macros used below:
 
 ```bash
-docker pull rocm/atom-dev:vllm-latest
+MODEL=/path/to/MiniMax-M3-MXFP8            # M3 MXFP8 checkpoint
+DRAFT=/path/to/MiniMax-M3-EAGLE3-GQA       # EAGLE3 GQA draft (decode spec only)
 ```
 
-## Step 2: Launch vLLM Server
+---
 
-The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and
-general usage flow compatible with upstream vLLM. For general server options and
-API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
+## 1. Installation
 
-The example below serves the MXFP8 checkpoint on four GPUs. Use your local
-checkpoint path or the corresponding model id for `MODEL`.
+### 1.1 vLLM — `Inferact/vllm-m3-amd`, commit `8a9bad879`
 
 ```bash
+git clone git@github.com:Inferact/vllm-m3-amd.git vllm-m3-amd
+cd vllm-m3-amd
+git checkout 8a9bad879
+
+export PYTORCH_ROCM_ARCH=gfx950 GPU_ARCHS=gfx950 MAX_JOBS=64 \
+       CMAKE_BUILD_TYPE=Release VLLM_TARGET_DEVICE=rocm
+python3 use_existing_torch.py          # keep the image torch
+python3 -m pip install -e . --no-build-isolation -v
+```
+
+### 1.2 AITER — `zejunchen-zejun/aiter-m3`, branch `main`
+
+```bash
+git clone -b main git@github.com:zejunchen-zejun/aiter-m3.git aiter
+cd aiter
+PREBUILD_KERNELS=0 python3 -m pip install -e . --no-build-isolation --no-deps -v
+```
+
+### 1.3 ATOM — `zejunchen-zejun/ATOM-m3`, branch `M3-AMD`
+
+```bash
+git clone -b M3-AMD git@github.com:zejunchen-zejun/ATOM-m3.git ATOM
+cd ATOM
+# --no-deps keeps the transformers the image ships and vLLM was built against
+python3 -m pip install -e . --no-build-isolation --no-deps -v
+python3 -m pip install --no-deps pybind11 zmq msgspec xxhash setproctitle openpyxl
+```
+
+### 1.4 lm-eval
+
+```bash
+python3 -m pip install "lm_eval[api]"
+```
+
+---
+
+## 2. Environment variables
+
+| Variable | Value | Purpose |
+|---|---|---|
+| `ATOM_M3_DENSE_ATTN_BACKEND` | `gluon` | Routes M3's 3 dense layers onto AITER's shuffle kernels (`flash_attn_varlen` for prefill, `pa_decode_gluon` for decode) instead of vLLM's Triton `unified_attention`, and requests a K/V-separated KV cache. |
+| `VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT` | `1` | Required by gluon — enables the page-16 SHUFFLE KV layout the shuffle kernels read. |
+| `VLLM_USE_V2_MODEL_RUNNER` | `0` | ATOM's EAGLE3 integration patches vLLM's V1 proposer; M3 defaults to V2 on ROCm, which bypasses it. |
+| `ATOM_M3_UNIFORM_BATCH_CAPTURE` | `1` | Lets EAGLE3 spec-verify batches (`query_len > 1`) be CUDA-graph captured under `FULL_DECODE_ONLY`; without it decode falls back to eager. |
+
+---
+
+## 3. Server commands
+
+Run `rm -rf /root/.cache/atom/*` before each launch.
+
+### 3.1 Prefill
+
+```bash
+cd /root
+rm -rf /root/.cache/atom/*
+
 MODEL=/path/to/MiniMax-M3-MXFP8
-TP=4
-PORT=8001
+
+export ATOM_M3_DENSE_ATTN_BACKEND=gluon
+export VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1
+export VLLM_USE_V2_MODEL_RUNNER=0
+export SAFETENSORS_FAST_GPU=1
+export NCCL_SOCKET_IFNAME=lo
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-vllm serve "${MODEL}" \
-    --dtype auto \
-    --load-format auto \
-    --host localhost \
-    --port "${PORT}" \
-    --tensor-parallel-size "${TP}" \
-    --gpu-memory-utilization 0.85 \
-    --max-model-len 32768 \
-    --max-num-batched-tokens 32768 \
-    --block-size 128 \
-    --no-async-scheduling \
-    --kv-cache-dtype auto \
-    --no-enable-prefix-caching \
+export AITER_LOG_LEVEL=WARNING
+export PYTHONNOUSERSITE=1
+export VLLM_DO_NOT_TRACK=1
+
+vllm serve "$MODEL" \
+    --served-model-name minimax-m3-mxfp8 \
+    --host 0.0.0.0 --port 8000 \
     --language-model-only \
+    --tensor-parallel-size 4 \
     --no-trust-remote-code \
-    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
-    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}}' \
-    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
+    --block-size 128 \
+    --kv-cache-dtype fp8 \
+    --enable-prefix-caching \
+    --max-model-len 131072 \
+    --max-num-seqs 128 \
+    --max-num-batched-tokens 16384 \
+    --gpu-memory-utilization 0.90 \
+    --enforce-eager \
+    --no-async-scheduling \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4, "text_config": {"use_index_cache": true, "index_topk_freq": 4}}' \
+    --compilation-config '{"cudagraph_mode":"NONE"}'
 ```
 
-For the MXFP4 checkpoint, change `MODEL` and omit the MXFP8 online quantization
-config:
+### 3.2 Decode, with EAGLE3 speculative decoding
+
+Performance harness only — `DecodeBenchConnector` fabricates the KV cache and
+`rejection_sample_method: "synthetic"` fixes the acceptance rate. Use §4.1 for
+accuracy.
 
 ```bash
-MODEL=/path/to/MiniMax-M3-MXFP4
+cd /root
+rm -rf /root/.cache/atom/*
+
+MODEL=/path/to/MiniMax-M3-MXFP8
+DRAFT=/path/to/MiniMax-M3-EAGLE3-GQA
+
+export ATOM_M3_DENSE_ATTN_BACKEND=gluon
+export VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1
+export VLLM_USE_V2_MODEL_RUNNER=0
+export ATOM_M3_UNIFORM_BATCH_CAPTURE=1
+export SAFETENSORS_FAST_GPU=1
+export NCCL_SOCKET_IFNAME=lo
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-vllm serve "${MODEL}" \
-    --dtype auto \
-    --load-format auto \
-    --host localhost \
-    --port "${PORT}" \
-    --tensor-parallel-size "${TP}" \
-    --gpu-memory-utilization 0.85 \
-    --max-model-len 32768 \
-    --max-num-batched-tokens 32768 \
-    --block-size 128 \
-    --no-async-scheduling \
-    --kv-cache-dtype auto \
-    --no-enable-prefix-caching \
+export AITER_LOG_LEVEL=WARNING
+export PYTHONNOUSERSITE=1
+export VLLM_DO_NOT_TRACK=1
+
+vllm serve "$MODEL" \
+    --served-model-name minimax-m3-mxfp8 \
+    --host 0.0.0.0 --port 8000 \
     --language-model-only \
+    --tensor-parallel-size 4 \
     --no-trust-remote-code \
-    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
-    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
+    --max-model-len 131072 \
+    --block-size 128 \
+    --kv-cache-dtype fp8 \
+    --gpu-memory-utilization 0.85 \
+    --max-num-seqs 88 \
+    --max-num-batched-tokens 2048 \
+    --no-enable-prefix-caching \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4, "text_config": {"use_index_cache": true, "index_topk_freq": 4}}' \
+    --kv-transfer-config '{"kv_connector":"DecodeBenchConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_buffer_device":"cuda","kv_connector_extra_config":{"fill_mean":0.015,"fill_std":0.0}}' \
+    --speculative-config '{"method":"eagle3","model":"'"$DRAFT"'","num_speculative_tokens":3,"draft_tensor_parallel_size":1,"attention_backend":"ROCM_AITER_FA","rejection_sample_method":"synthetic","synthetic_acceptance_rates":[0.7,0.5,0.4]}' \
+    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":512}'
 ```
 
-To validate FP8 KV cache, set `--kv-cache-dtype fp8` in either command.
+---
 
-Notes:
-- Keep `--block-size 128`; MiniMax-M3 sparse attention assumes 128-token sparse
-  blocks.
-- `--no-trust-remote-code` is expected because ATOM registers the MiniMax-M3
-  model classes used by the vLLM plugin path.
-- `--language-model-only` serves the language model path for MiniMax-M3 VL
-  checkpoints.
+## 4. Accuracy validation
 
-## Step 3: Accuracy Validation
-
-The accuracy can be verified on GSM8K with the chat-completions API:
+### 4.1 Server (no speculative decoding)
 
 ```bash
-BS=65
+cd /root
+rm -rf /root/.cache/atom/*
 
+MODEL=/path/to/MiniMax-M3-MXFP8
+
+export ATOM_M3_DENSE_ATTN_BACKEND=gluon
+export VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1
+export VLLM_USE_V2_MODEL_RUNNER=0
+export ATOM_M3_UNIFORM_BATCH_CAPTURE=1
+export SAFETENSORS_FAST_GPU=1
+export NCCL_SOCKET_IFNAME=lo
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_LOG_LEVEL=WARNING
+export PYTHONNOUSERSITE=1
+export VLLM_DO_NOT_TRACK=1
+
+vllm serve "$MODEL" \
+    --served-model-name minimax-m3 \
+    --host 0.0.0.0 --port 8902 \
+    --language-model-only \
+    --tensor-parallel-size 4 \
+    --no-trust-remote-code \
+    --max-model-len 131072 \
+    --block-size 128 \
+    --kv-cache-dtype fp8 \
+    --gpu-memory-utilization 0.85 \
+    --max-num-seqs 88 \
+    --max-num-batched-tokens 8192 \
+    --enable-prefix-caching \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4, "text_config": {"use_index_cache": true, "index_topk_freq": 4}}' \
+    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":512}'
+```
+
+### 4.2 gsm8k (5-shot)
+
+```bash
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HOME=/path/to/hf_cache \
 lm_eval \
   --model local-chat-completions \
-  --model_args "model=${MODEL},base_url=http://localhost:${PORT}/v1/chat/completions,num_concurrent=32,max_gen_toks=2048" \
-  --tasks gsm8k \
-  --num_fewshot 5 \
-  --batch_size "${BS}" \
-  --apply_chat_template \
-  --fewshot_as_multiturn
+  --model_args "model=minimax-m3,base_url=http://localhost:8902/v1/chat/completions,num_concurrent=32,max_gen_toks=2048,max_retries=3" \
+  --tasks gsm8k --num_fewshot 5 --batch_size 65 \
+  --apply_chat_template --fewshot_as_multiturn \
+  --output_path ./eval_out/gsm8k
 ```
 
-Reference average results from five local GSM8K runs are shown below.
+### 4.3 AIME25 (maj@16)
 
-| Config | `flexible-extract` avg | `strict-match` avg |
-| --- | ---: | ---: |
-| MIXFP8 | 0.9503 | 0.9510 |
-| MIXFP4 | 0.9399 | 0.9407 |
-| MIXFP8-kv_fp8 | 0.9480 | 0.9487 |
-| MIXFP4-kv_fp8 | 0.9439 | 0.9445 |
-
-## Step 4: EAGLE3 Speculative Decoding
-
-MiniMax-M3 sparse serving supports an EAGLE3 draft model
-(`Inferact/MiniMax-M3-EAGLE3`, a 1-layer MHA Llama drafter that shares the
-target's embedding and `lm_head`). Attach it with `--speculative-config`:
+One-time setup:
 
 ```bash
-MODEL=/path/to/MiniMax-M3-MXFP8
-DRAFT=/path/to/MiniMax-M3-EAGLE3
-TP=8
-PORT=8900
-export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-# MiniMaxM3Sparse defaults to vLLM's V2 model runner on ROCm; ATOM's EAGLE3
-# integration targets the V1 runner, so force V1 (env only, no source edit).
-export VLLM_USE_V2_MODEL_RUNNER=0
-vllm serve "${MODEL}" \
-    --served-model-name minimax-m3 \
-    --host localhost \
-    --port "${PORT}" \
-    --tensor-parallel-size "${TP}" \
-    --gpu-memory-utilization 0.85 \
-    --max-model-len 32768 \
-    --max-num-batched-tokens 32768 \
-    --max-num-seqs 128 \
-    --block-size 128 \
-    --no-async-scheduling \
-    --kv-cache-dtype auto \
-    --no-enable-prefix-caching \
-    --language-model-only \
-    --no-trust-remote-code \
-    --enforce-eager \
-    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
-    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}}' \
-    --speculative-config '{"method": "eagle3", "model": "'"${DRAFT}"'", "num_speculative_tokens": 3}'
+HF_HOME=/path/to/hf_cache python3 -c \
+  'from datasets import load_dataset; load_dataset("math-ai/aime25", split="test")'
+
+LM_EVAL_TASKS=$(python3 -c "import lm_eval.tasks, os; print(os.path.dirname(lm_eval.tasks.__file__))")
+cat > "$LM_EVAL_TASKS/aime/aime25_maj16.yaml" <<'YAML'
+include: aime25.yaml
+task: aime25_maj16
+repeats: 16
+filter_list:
+  - name: maj@16
+    filter:
+      - function: regex
+        regex_pattern: '\\boxed\{([^}]*)\}'
+        group_select: -1
+        fallback: "[invalid]"
+      - function: majority_vote
+      - function: take_first
+YAML
 ```
 
-Notes:
-- **Force the V1 model runner** (`VLLM_USE_V2_MODEL_RUNNER=0`). On ROCm,
-  MiniMaxM3Sparse defaults to the V2 runner, which bypasses ATOM's EAGLE3
-  patches — the draft then runs with a batch bug and acceptance collapses to
-  ~`1/concurrency`. V1 restores normal acceptance.
-- **`--enforce-eager` is expected with speculative decoding.** The M3 sparse
-  attention backends declare `UNIFORM_SINGLE_TOKEN_DECODE` CUDAGraph support,
-  but spec-verify runs a multi-token (`num_spec + 1`) query, so vLLM disables
-  CUDAGraph and runs eager regardless of `cudagraph_mode`. This is backend-
-  driven, not a regression.
-- The speculative path is **lossless**: because verify accepts a draft token
-  only when it matches the target's own argmax, GSM8K accuracy with the draft
-  attached equals the no-draft baseline.
+Run:
 
-### Speculative decoding results
-
-GSM8K (5-shot, chat-completions, concurrency 16, MXFP8, TP=8, MI355X):
-
-| Config | `flexible-extract` | `strict-match` | accept rate | accepted len / step | draft toks / step |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| no draft (baseline) | 0.9515 | 0.9522 | — | — | — |
-| EAGLE3 (`num_speculative_tokens=3`) | 0.9515 | 0.9522 | 0.588 | 2.76 | 3.0 |
-
-Accuracy is identical to the baseline (lossless), acceptance is ~59% (mean
-accepted length ~2.76), and the drafter emits exactly 3 tokens per step.
+```bash
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HOME=/path/to/hf_cache \
+lm_eval \
+  --model local-chat-completions \
+  --model_args "model=minimax-m3,base_url=http://localhost:8902/v1/chat/completions,num_concurrent=64,max_retries=3,timeout=7200,tokenized_requests=False" \
+  --tasks aime25_maj16 \
+  --apply_chat_template \
+  --gen_kwargs "temperature=1.0,top_p=0.95,do_sample=True,max_gen_toks=98304" \
+  --batch_size 64 --seed 42 \
+  --log_samples --output_path ./eval_out/aime25
+```
