@@ -44,6 +44,10 @@ logger = logging.getLogger("atom")
 _MTP_MASK_INPUT_ARCH: set[str] = {
     "DeepSeekMTPModel",
     "Glm4MoeMTPModel",
+    # vLLM's own MiniMaxM3MultiTokenPredictorLayer.forward zeroes the embedding
+    # at position 0 before enorm; ATOM's MiniMaxM3MTPPredictorLayer does not, so
+    # _adapt_mtp_layers_for_vllm has to install that mask here.
+    "MiniMaxM3MTP",
 }
 _MTP_DRAFT_MODEL_ARCHES: set[str] = {
     "DeepSeekMTPModel",
@@ -51,6 +55,7 @@ _MTP_DRAFT_MODEL_ARCHES: set[str] = {
     "DeepseekV4MTPModel",
     "Qwen3NextMTP",
     "Glm4MoeMTPModel",
+    "MiniMaxM3MTP",
 }
 _EAGLE3_DRAFT_ARCH_TO_ATOM_ARCH: dict[str, str] = {
     # vLLM/HF draft arch name: ATOM server-mode draft class
@@ -162,6 +167,11 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "DeepseekV4ForCausalLM": "atom.plugin.vllm.models.deepseek_v4:DeepseekV4ForCausalLM",
     "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3:MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3:MiniMaxM3SparseForConditionalGeneration",
+    # "MiniMaxM3MTP" is what SpeculativeConfig.hf_config_override writes into the
+    # draft architectures; ATOM's server mode names the same class
+    # "MiniMaxM3MTPModel", so both keys map here.
+    "MiniMaxM3MTP": "atom.models.minimax_m3_mtp:MiniMaxM3MTP",
+    "MiniMaxM3MTPModel": "atom.models.minimax_m3_mtp:MiniMaxM3MTP",
     "Eagle3LlamaModel": "atom.models.eagle3_llama:Eagle3LlamaModel",
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla:Eagle3DeepseekMLAModel",
     "K3DSparkModel": "atom.plugin.vllm.models.kimi_k3_dspark:KimiK3DSparkDraft",
@@ -530,7 +540,15 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             and not self.is_dspark_draft_model
         ):
             self._enable_eagle3_target_interface()
-        if self.is_mtp:
+        if self.is_mtp and model_arch in _DEEPSEEK_V4_ARCHES:
+            # Only DeepSeek-V4 has a hidden state to override with: the buffer
+            # and the `_mtp_target_hidden_states` fallback are both written from
+            # the V4-only branch of `forward`. Every other MTP target would
+            # return None here, and vLLM's V2 runner subscripts the result
+            # unguarded (`pre_hc_hidden_states[: hidden_states.shape[0]]`), so
+            # binding the attribute unconditionally turns a no-op into a
+            # TypeError. vLLM probes for the attribute, not for a non-None
+            # return, so the gate has to be on the binding.
             self.get_mtp_target_hidden_states = self._get_mtp_target_hidden_states
         if self.is_mtp or self.is_eagle3:
             # Mirror nested attributes required by vLLM speculative decoding.
@@ -1011,7 +1029,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     self._mtp_target_hidden_states = hidden_states
         else:
             if (
-                self.model_arch in {"Qwen3NextMTP", "DeepSeekMTPModel"}
+                self.model_arch in {"Qwen3NextMTP", "DeepSeekMTPModel", "MiniMaxM3MTP"}
                 and "spec_step_idx" not in model_kwargs
             ):
                 model_kwargs["spec_step_idx"] = (
@@ -1033,6 +1051,15 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # post-final-norm hidden, and compute_logits no longer re-norms, so
             # the state vLLM samples from and the state it recycles into the
             # next MTP step are the same tensor.
+            #
+            # MiniMaxM3MTP deliberately stays off this path. The tuple contract
+            # is opt-in on vLLM's side: model_returns_tuple() whitelists only
+            # DeepSeekMTPModel/DeepseekV32MTPModel/KimiK3MTPModel, and for any
+            # other arch the proposer keeps the raw return value and subscripts
+            # it with a token-index tensor -- against a tuple that raises
+            # "IndexError: tuple index out of range" from tuple.__getitem__.
+            # M3 loses nothing: its sample and recycle states are the same
+            # tensor, which is exactly what vLLM derives from a bare return.
             return hidden_states, hidden_states
 
         return hidden_states
