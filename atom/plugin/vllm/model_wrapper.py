@@ -117,6 +117,49 @@ def _probe_v4_routed_expert_dtype(model_path) -> str | None:
     return None
 
 
+def _maybe_unquantize_separate_mtp_draft(
+    atom_config, draft_model_config, vllm_config
+) -> None:
+    """Rebuild the MTP draft's ``quant_config`` from its own checkpoint when
+    ``--speculative-config`` points at a separate, differently-quantized draft.
+
+    ``_generate_atom_config_from_vllm_config`` passes ``model=model_config.model``
+    -- the TARGET's path -- so ``Config.__post_init__`` derives ``quant_config``
+    from the target checkpoint. That is right for the usual MTP case, where the
+    draft head ships inside the target checkpoint and is quantized identically,
+    and wrong for a standalone unquantized draft: its layers get built to the
+    target's spec, so a dummy-loaded draft dies casting Half to fp4 (which
+    reports ``finfo().bits == 8``, landing in the branch written for FP8).
+
+    Note ``vllm_config.quant_config`` is not the lever here -- ATOM builds every
+    layer from ``atom_config.quant_config``, which it derives itself.
+    """
+    draft_path = getattr(draft_model_config, "model", None)
+    target_path = getattr(getattr(vllm_config, "model_config", None), "model", None)
+    if not draft_path or draft_path == target_path:
+        return  # draft head lives in the target checkpoint: same quantization
+
+    from atom.config import QuantizationConfig, get_hf_config
+
+    draft_hf_config = get_hf_config(
+        draft_path, trust_remote_code=atom_config.trust_remote_code
+    )
+    draft_quant_config = QuantizationConfig(
+        draft_hf_config, atom_config.online_quant_config
+    )
+    if draft_quant_config.quant_method == atom_config.quant_config.quant_method:
+        return
+
+    logger.info(
+        "MTP draft: rebuilt quant_config from %s (quant_method=%r) instead of "
+        "inheriting the target's %r",
+        draft_path,
+        draft_quant_config.quant_method,
+        atom_config.quant_config.quant_method,
+    )
+    atom_config.quant_config = draft_quant_config
+
+
 def _maybe_set_v4_expert_dtype(atom_config, vllm_config) -> None:
     """Pin DeepSeek-V4 ``hf_config.expert_dtype`` from the on-disk routed-expert
     dtype so ``make_v4_quant_config`` selects the correct (FP4 vs FP8) spec.
@@ -429,6 +472,9 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             main_atom_config = get_current_atom_config()
             self.atom_config = _generate_atom_config_from_vllm_config(vllm_config)
             self.atom_config.hf_config = main_atom_config.hf_config
+            _maybe_unquantize_separate_mtp_draft(
+                self.atom_config, draft_model_config, vllm_config
+            )
         elif self._is_standalone_draft:
             self.atom_config = _generate_atom_config_from_vllm_config(vllm_config)
             # Prefer ATOM's normalized copy: building the atom_config ran
