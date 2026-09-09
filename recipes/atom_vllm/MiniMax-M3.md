@@ -6,8 +6,6 @@ commands, and the accuracy-validation commands for the MiniMax-M3 gluon path.
 Base image: `vllm/vllm-openai-rocm:nightly-27a94d1ce4e3fc100c4732439ccec10f8246a804`
 (digest `sha256:91e381f072d6a44e1e4c97c82dce06e50e5189905cb3999a11471c5a8fc6a563`).
 
-TP=4 only: `pa_decode_gluon` needs `num_kv_heads == 1` per rank and M3 has 4 KV heads.
-
 Path macros used below:
 
 ```bash
