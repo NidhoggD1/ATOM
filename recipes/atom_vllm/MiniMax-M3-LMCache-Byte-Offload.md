@@ -6,7 +6,9 @@ MiniMax-M3 cannot use LMCache's own GPU connector. This recipe adds
 vLLM's KV-connector API and leaves LMCache as a pure byte store.
 
 Everything from that recipe still applies — the same install (§1), the same
-gluon environment (§2), the same flags. This page only adds the offload tier.
+environment (§2), the same flags — except that the dense layers run
+`ATOM_M3_DENSE_ATTN_BACKEND=aiter` rather than `gluon`. This page only adds the
+offload tier.
 
 For the generic plugin + `LMCacheConnectorV1` path (works on M2.5 and other
 dense models), see [LMCache KV Cache Offload](LMCache-KV-Cache-Offload.md). That
@@ -18,8 +20,8 @@ M3 registers 117 KV tensors in three different physical layouts at once:
 
 | layers | per-layer view | note |
 |---|---|---|
-| 3 dense | `(nb, 2, 128, C)` | gluon: K/V on the head-slot axis (`num_head_slots=2`), `C = num_kv_heads * head_size` |
-| 57 sparse | `(nb, 2, 128, 128)` | same, one KV head per rank at TP4 |
+| 3 dense | `(nb, 1, 128, 2*hd)` | `aiter`: one KV head per rank at TP4, K and V interleaved in the content dim (`gluon` instead asks for `num_head_slots=2`, giving `(nb, 2, 128, C)`; the codec takes either) |
+| 57 sparse | `(nb, 2, 128, 128)` | K/V on the head-slot axis (`num_head_slots=2`), one KV head per rank at TP4 |
 | 57 index caches | `(nb, 1, 128, 128)` fp8 | DSA indexer keys, registered as `<layer>.index_cache` |
 
 LMCache's `normalize_kv_and_discover_format()` probes for one **global** format,
@@ -39,9 +41,13 @@ silent corruption.
 
 ### Two KV layouts, and why the namespace records which one
 
-Under `VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1` both M3 backends publish two
-acceptable layouts (`supported_kv_cache_layouts` in
-`atom/plugin/vllm/attention/backend.py`) and vLLM resolves one at startup:
+Under `VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1` the sparse backend publishes two
+acceptable layouts (`MiniMaxM3SparseAttentionBackend.supported_kv_cache_layouts`
+in `atom/plugin/vllm/attention/backend.py`) and vLLM resolves one at startup.
+This is gated on the shuffle flag and on `num_kv_heads == 1` per rank only — it
+does not depend on the dense backend, so the ambiguity is there under `aiter`
+just as under `gluon` (the `gluon` dense backend publishes the same pair; the
+`aiter` one publishes none and its layers always travel as one opaque run):
 
 | resolved | memory order | whole tensor contiguous | segmentation used |
 |---|---|---|---|
@@ -70,8 +76,8 @@ rm -rf /root/.cache/atom/*
 
 MODEL=/path/to/MiniMax-M3-MXFP8
 
-# --- unchanged from MiniMax-M3.md §4.1 ---
-export ATOM_M3_DENSE_ATTN_BACKEND=gluon
+# --- MiniMax-M3.md §4.1, with the dense backend on aiter ---
+export ATOM_M3_DENSE_ATTN_BACKEND=aiter
 export VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1
 export VLLM_USE_V2_MODEL_RUNNER=0
 export ATOM_M3_UNIFORM_BATCH_CAPTURE=1
