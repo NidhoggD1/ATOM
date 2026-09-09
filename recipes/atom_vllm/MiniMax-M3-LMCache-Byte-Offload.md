@@ -195,18 +195,45 @@ code, same workload, sizing the only difference.
   different vLLM commits** without checking the `layout=` line on both. The
   namespace separates the two known layouts, but it can only separate what it is
   told about.
+- **This connector needs a vLLM that resolves KV layouts** (the
+  `vllm.v1.kv_cache_layout` resolver). On an older vLLM the caches are bound
+  through the legacy 5-D path, where a dense layer arrives as `(2, nb, ...)` and
+  its block count reads as 2 while the sparse layers still read `nb`; every
+  segment would then be sliced at the wrong granularity with the right dtype and
+  a plausible size. Registration refuses that outright — *registered layers
+  disagree on the block count* — but the same vLLM cannot import M3's attention
+  backend anyway, so in practice the server never gets that far.
 - **Stop the server with `podman restart`, not `pkill`.** Killing TP workers
   leaves zombies holding GPU memory (82 GiB/card observed); only restarting the
   container releases it.
 
 ## Validation status
 
-- `layout=kv-whole` (LBHNC) is exercised end-to-end.
-- `layout=kv-split` (LHBNC) is covered by unit tests
-  (`tests/plugin/test_vllm_kv_cache_layout.py`, synthetic strides) but has not
-  been run on a server, because the vLLM build that resolves it
-  (`Inferact/vllm-m3-amd@8a9bad879`) was not reachable from here. The code path
-  it takes is the one PR ROCm/ATOM#2146 validated on the ATOM native stack.
+**Neither layout has been run on a server from this branch.** The M3-AMD tree
+imports `vllm.v1.kv_cache_layout`, which exists only in the vLLM this recipe
+family is built against (`Inferact/vllm-m3-amd@8a9bad879`); stock vLLM 0.28
+carries the older `KVCacheLayoutType` string and no layout resolver at all, so
+`atom/plugin/vllm/attention/backend.py` does not import there and no M3 server
+of any layout can start. That repository is private and was not reachable, and
+no local image or checkout carries the fork.
+
+What was verified instead, on gfx950:
+
+| check | how |
+|---|---|
+| both layouts segment and move every byte | `DenseKVByteCodec` gather/scatter over a 60-layer / 117-tensor M3 census on GPU, KV + fp8 scales + index caches, byte-compared after wiping the gathered blocks |
+| the two layouts cost the same per block | same run: 3 646 464 B under both, from 288 segments (`kv-split`) and 231 (`kv-whole`) |
+| the layout reaches the namespace | `build_page_namespace` yields a different key once `page_layout_tag` is set, and the unset key is byte-identical to the native path's |
+| the rest | 48 unit tests in `tests/plugin/` |
+
+The transfer tier above the codec (`build_offload_engine`, `BlockGPUConnector`,
+LMCache itself) is untouched by this port and is what ROCm/ATOM#2146 validated
+on the ATOM native stack.
+
+**Before running this recipe on the customer stack**, work through *Verify it is
+actually on* above; the `layout=` line says which of the two paths that build
+resolved, and it is the one thing here that has never been observed rather than
+constructed.
 
 ## Related
 

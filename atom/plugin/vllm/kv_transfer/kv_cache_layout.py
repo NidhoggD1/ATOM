@@ -172,6 +172,7 @@ def build_kv_cache_tensors(
         )
 
     out: list[KVCacheTensor] = []
+    block_counts: dict[str, int] = {}
     for layer_num, name in enumerate(sorted(main, key=_layer_sort_key)):
         k_cache, v_cache = split_kv_tensor(main[name])
         index_cache = index_caches.get(name)
@@ -203,6 +204,8 @@ def build_kv_cache_tensors(
                     f"(shape={tuple(seg.shape)}, num_blocks={num_blocks})"
                 )
 
+        block_counts[name] = num_blocks
+
         out.append(
             KVCacheTensor(
                 layer_num=layer_num,
@@ -212,6 +215,23 @@ def build_kv_cache_tensors(
                 v_scale=v_scale,
                 index_cache=index_cache,
             )
+        )
+
+    # One block table indexes every layer, so a layer whose leading axis is not
+    # the block axis is not merely odd -- it is the only symptom of a vLLM that
+    # bound the caches through the legacy 5-D path, where dense arrives as
+    # (2, nb, ...) and num_blocks reads as 2. Every segment would then be sliced
+    # at the wrong granularity, with the right dtype and a plausible size.
+    distinct = sorted(set(block_counts.values()))
+    if len(distinct) > 1:
+        witnesses = {
+            count: next(n for n, c in block_counts.items() if c == count)
+            for count in distinct
+        }
+        raise ValueError(
+            "registered layers disagree on the block count "
+            + ", ".join(f"{witnesses[c]}={c}" for c in distinct)
+            + "; every layer must be block-major on its leading axis"
         )
     return out
 

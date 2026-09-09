@@ -291,3 +291,27 @@ def test_codec_accepts_the_mapped_tensors():
     assert codec.bytes_per_block == (
         DENSE_LAYERS * dense_bytes + SPARSE_LAYERS * sparse_bytes
     )
+
+
+def test_a_layer_whose_leading_axis_is_not_blocks_is_rejected():
+    """The one symptom of a vLLM that bound the caches through the legacy path.
+
+    There, dense arrives as ``(2, nb, ...)`` and its block count reads as 2
+    while the sparse layers still read ``nb``. Nothing about the dtypes or the
+    sizes looks wrong; only the disagreement does.
+    """
+    kv = _m3_registration()
+    layers = _m3_layers(kv)  # dense layers carry a scalar scale, so no hook
+    legacy = "model.layers.0.self_attn.attn"
+    kv[legacy] = torch.zeros((2, NB, BS, 1, 2 * HD), dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="disagree on the block count"):
+        build_kv_cache_tensors(kv, layers)
+
+
+def test_agreeing_block_counts_are_not_disturbed():
+    """Both layouts already agree, so the guard must stay out of the way."""
+    for sparse in (_sparse_kv, _sparse_kv_lbhnc):
+        kv = _m3_registration(sparse=sparse)
+        tensors = build_kv_cache_tensors(kv, _m3_layers(kv))
+        assert {int(t.k_cache.shape[0]) for t in tensors} == {NB}
