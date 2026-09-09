@@ -652,6 +652,7 @@ def apply_vllm_spec_decode_patch() -> None:
         AiterMlaMetadataForVllm,
         AiterMlaSparseIndexerMetadataForVllm,
         AiterMlaSparseMetadataForVllm,
+        MinimaxM3SparseMetadata,
     )
     from atom.utils.forward_context import (
         AttentionMetaData as AtomAttentionMetaData,
@@ -679,6 +680,10 @@ def apply_vllm_spec_decode_patch() -> None:
         AiterMlaMetadataForVllm,
         AiterMlaSparseMetadataForVllm,
         AiterMlaSparseIndexerMetadataForVllm,
+        # ATOM's MiniMax-M3 lightning-indexer metadata. vLLM already allows its
+        # own MiniMaxM3SparseMetadata; the ATOM backend emits this one instead,
+        # so multi-step drafting (num_speculative_tokens > 1) needs it too.
+        MinimaxM3SparseMetadata,
     )
 
     @functools.wraps(original_init)
