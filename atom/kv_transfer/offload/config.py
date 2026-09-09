@@ -205,6 +205,15 @@ def build_page_namespace(
             getattr(config, "speculative_config", None)
         ),
     }
+    # How a block's bytes were packed, when the caller knows it can vary. vLLM
+    # can resolve a K/V-separated cache as either LHBNC or LBHNC; the same
+    # block is then laid out differently, so two servers that resolved
+    # different layouts must not read each other's entries on a shared
+    # disk/remote backend. Added only when set, leaving every existing key
+    # (the native path, which has one layout) byte-identical.
+    page_layout_tag = getattr(config, "page_layout_tag", None)
+    if page_layout_tag:
+        document["page_layout_tag"] = str(page_layout_tag)
     canonical = json.dumps(
         document,
         sort_keys=True,
