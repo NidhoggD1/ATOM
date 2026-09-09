@@ -1,4 +1,4 @@
-# MiniMax-M3 (gluon) with the ATOM vLLM Plugin Backend
+# MiniMax-M3 with the ATOM vLLM Plugin Backend
 
 This recipe covers the source installation of vLLM, AITER and ATOM, the server
 commands, and the accuracy-validation commands for the MiniMax-M3 gluon path.
