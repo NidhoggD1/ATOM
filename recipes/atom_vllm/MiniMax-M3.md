@@ -203,41 +203,106 @@ lm_eval \
   --output_path ./eval_out/gsm8k
 ```
 
-### 4.3 AIME25 (maj@16)
+### 4.3 AIME25 (`pass_avg,all` @16 + non-stop, evalscope)
 
-One-time setup:
+The customer scores AIME25 with **evalscope** (not lm_eval), and the reported
+metric is **`pass_avg,all`** — the plain mean of the per-generation accuracy over
+all `30 problems × 16 repeats = 480` generations (i.e. avg@16), **not** majority
+vote. A second, independent hard requirement is the **non-stop ratio < 0.5%**:
+the fraction of generations that hit `MAX_TOKENS` without a natural EOS (the model
+rambling past the budget instead of converging). Baseline floor: `pass_avg,all ≥
+0.927`, `non-stop < 0.5%`.
+
+Customer-exact knobs (do **not** change the test method; only `repeats` may be
+temporarily lowered for a fast smoke run):
+
+| knob | value |
+|------|-------|
+| task | `aime25`, prompt **without** "step by step" |
+| repeats | 16 (480 gens total) |
+| `max_tokens` | 98304 |
+| `temperature` / `top_p` | 1.0 / 0.95 |
+| metric | `pass_avg,all` (evalscope `mean` aggregation) |
+| grader | rule (`grade_answer`), invalid answers always count as a wrong vote |
+
+One-time setup (protects the image's torch/vLLM):
 
 ```bash
+pip install --no-deps evalscope colorlog filetype jsonlines editdistance overrides
+# dataset: HF math-ai/aime25 (same 30 problems as evalscope/aime25)
 HF_HOME=/path/to/hf_cache python3 -c \
   'from datasets import load_dataset; load_dataset("math-ai/aime25", split="test")'
-
-LM_EVAL_TASKS=$(python3 -c "import lm_eval.tasks, os; print(os.path.dirname(lm_eval.tasks.__file__))")
-cat > "$LM_EVAL_TASKS/aime/aime25_maj16.yaml" <<'YAML'
-include: aime25.yaml
-task: aime25_maj16
-repeats: 16
-filter_list:
-  - name: maj@16
-    filter:
-      - function: regex
-        regex_pattern: '\\boxed\{([^}]*)\}'
-        group_select: -1
-        fallback: "[invalid]"
-      - function: majority_vote
-      - function: take_first
-YAML
 ```
 
-Run:
+Runner (`evalscope_aime25.py`) — the customer prompt with "step by step" removed,
+and the **mandatory** client `timeout`:
+
+```python
+import os
+from evalscope import run_task
+from evalscope.config import TaskConfig
+
+PORT    = os.environ.get("AIME_PORT", "8902")
+REPEATS = int(os.environ.get("AIME_REPEATS", "16"))   # only debug knob; keep 16 to report
+WORKDIR = os.environ.get("AIME_WORKDIR", "./eval_out/aime25")
+
+# evalscope's default aime25 template MINUS "step by step" (customer spec)
+CUSTOM_PROMPT = ("Solve the following math problem. Put your answer inside \\boxed{{}}.\n\n"
+                 "{question}\n\n"
+                 "Remember to put your answer inside \\boxed{{}}.")
+
+cfg = dict(
+    model="minimax-m3",
+    api_url=f"http://localhost:{PORT}/v1/chat/completions",
+    api_key="EMPTY", eval_type="openai_api",
+    datasets=["aime25"],
+    dataset_args={"aime25": {"prompt_template": CUSTOM_PROMPT, "dataset_id": "math-ai/aime25"}},
+    repeats=REPEATS,
+    generation_config={
+        "temperature": 1.0, "top_p": 0.95, "max_tokens": 98304,
+        # CRITICAL: without this, evalscope uses the openai-SDK default 600s client
+        # timeout. A generation toward the 98304 cap at ~50 tok/s needs ~30 min >> 600s,
+        # so every long gen times out client-side, retries 5x, then is scored FAILED —
+        # silently corrupting BOTH pass_avg and non-stop. 3600s covers a full-length gen.
+        "timeout": 3600,
+    },
+    judge={"strategy": "rule"},
+    eval_batch_size=int(os.environ.get("AIME_BATCH", "64")),
+    work_dir=WORKDIR, dataset_hub="huggingface",
+)
+run_task(task_cfg=TaskConfig(**cfg))
+```
+
+Run (full customer run; for a fast smoke set `AIME_REPEATS=1`):
 
 ```bash
 HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HOME=/path/to/hf_cache \
-lm_eval \
-  --model local-chat-completions \
-  --model_args "model=minimax-m3,base_url=http://localhost:8902/v1/chat/completions,num_concurrent=64,max_retries=3,timeout=7200,tokenized_requests=False" \
-  --tasks aime25_maj16 \
-  --apply_chat_template \
-  --gen_kwargs "temperature=1.0,top_p=0.95,do_sample=True,max_gen_toks=98304" \
-  --batch_size 64 --seed 42 \
-  --log_samples --output_path ./eval_out/aime25
+  AIME_WORKDIR=./eval_out/aime25 python3 evalscope_aime25.py
+```
+
+Read both metrics:
+
+```bash
+# pass_avg,all — from evalscope's report (the Accuracy / mean row)
+python3 - <<'PY'
+import glob, json
+rep = sorted(glob.glob("./eval_out/aime25/2*/reports/minimax-m3/aime25.json"))[-1]
+d = json.load(open(rep))
+print("pass_avg,all =", d["metrics"][0]["score"])   # evalscope mean aggregation over 480 gens
+PY
+
+# non-stop ratio — from the raw predictions (per-choice stop_reason)
+python3 - <<'PY'
+import glob, json, ast
+pf = sorted(glob.glob("./eval_out/aime25/2*/predictions/minimax-m3/aime25_default.jsonl"))[-1]
+tot = ns = 0
+for line in open(pf):
+    mo = json.loads(line)["model_output"]
+    mo = ast.literal_eval(mo) if isinstance(mo, str) else mo
+    for ch in mo["choices"]:
+        tot += 1
+        if ch.get("stop_reason") not in ("stop", "eos"):   # max_tokens / length = truncated
+            ns += 1
+print(f"non-stop = {ns}/{tot} = {ns/tot:.4%}   (floor < 0.5%)")
+PY
 ```
