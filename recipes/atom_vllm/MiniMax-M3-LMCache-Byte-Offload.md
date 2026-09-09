@@ -223,8 +223,17 @@ What was verified instead, on gfx950:
 |---|---|
 | both layouts segment and move every byte | `DenseKVByteCodec` gather/scatter over a 60-layer / 117-tensor M3 census on GPU, KV + fp8 scales + index caches, byte-compared after wiping the gathered blocks |
 | the two layouts cost the same per block | same run: 3 646 464 B under both, from 288 segments (`kv-split`) and 231 (`kv-whole`) |
+| an LMCache engine stores and returns those bytes | real `build_offload_engine` + `BlockGPUConnector` + LMCache 0.4.5 LocalCPU: 4 blocks stored and retrieved, all 23 segments byte-identical |
 | the layout reaches the namespace | `build_page_namespace` yields a different key once `page_layout_tag` is set, and the unset key is byte-identical to the native path's |
 | the rest | 48 unit tests in `tests/plugin/` |
+
+The first three are one script, and it needs a GPU but no server:
+
+```bash
+PYTHONHASHSEED=0 LMCACHE_LOCAL_CPU=True LMCACHE_MAX_LOCAL_CPU_SIZE=4 \
+LMCACHE_CHUNK_SIZE=128 HIP_VISIBLE_DEVICES=0 \
+python3 tests/plugin/m3_offload_gpu_selfcheck.py
+```
 
 The transfer tier above the codec (`build_offload_engine`, `BlockGPUConnector`,
 LMCache itself) is untouched by this port and is what ROCm/ATOM#2146 validated
