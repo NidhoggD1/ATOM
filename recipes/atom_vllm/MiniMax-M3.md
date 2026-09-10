@@ -153,6 +153,118 @@ vllm serve "$MODEL" \
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":512}'
 ```
 
+### 3.3 Decode, with serial MTP speculative decoding
+
+M3 declares `num_mtp_modules: 7`, but **no released M3 checkpoint ships MTP
+weights** — the MXFP4 index has 45,475 keys and zero `*mtp*` matches, the bf16
+one 23,416 keys and likewise zero. The MTP head can still be exercised with
+randomly initialized draft weights: spec decode verifies every draft token
+against the target, so the *output text stays correct* and only the acceptance
+rate collapses. This is a plumbing / performance harness, not an accuracy or
+speedup demo.
+
+**Step 1 — build a weights-free draft config directory.**
+
+`draft_load_config: {"load_format": "dummy"}` still needs a config to size the
+draft, and it cannot be the target checkpoint: dummy init writes through
+`copy_()`, which has no Half→fp4 cast, so pointing the draft at an MXFP4 path
+dies with `copy_() does not support casting Float4_e2m1fn_x2 to different
+types`. Derive an unquantized bf16 config instead — the directory holds only
+`config.json` plus the remote-code config module, no safetensors:
+
+```bash
+cat > /tmp/make_m3_mtp_draft.py <<'PY'
+import json, shutil, sys
+from pathlib import Path
+
+src, dst = Path(sys.argv[1]), Path(sys.argv[2])
+cfg = json.loads((src / "config.json").read_text())
+text = cfg.get("text_config", cfg)
+
+# Dummy init cannot fill MXFP4/MXFP8 params, so the draft must be plain bf16.
+cfg.pop("quantization_config", None)
+text.pop("quantization_config", None)
+cfg["torch_dtype"] = text["torch_dtype"] = "bfloat16"
+
+# Keep 4 backbone layers. MiniMaxM3MultiTokenPredictor keys its MTP layer at
+# num_hidden_layers and only instantiates num_nextn_predict_layers of them, so
+# the backbone depth is just an index base -- but the per-layer sparse-attention
+# lists are indexed by it and must be truncated to match. Shrinking the expert
+# count is a real saving: it sizes the MoE inside the MTP block.
+KEEP = 4
+text["num_hidden_layers"] = KEEP
+text["num_local_experts"] = 8
+text["moe_layer_freq"] = text["moe_layer_freq"][:KEEP]
+sparse = text.get("sparse_attention_config", {})
+for k in ("sparse_attention_freq", "sparse_disable_index_value"):
+    if k in sparse:
+        sparse[k] = sparse[k][:KEEP]
+
+# num_nextn_predict_layers = how many MTP layers are instantiated.
+# num_mtp_modules = the depth num_speculative_tokens may reach; the single
+# instantiated layer is reused modulo the instantiated count. The MXFP8
+# checkpoint declares 1, hence the max().
+text["num_nextn_predict_layers"] = 1
+text["num_mtp_modules"] = max(int(text.get("num_mtp_modules") or 0), 7)
+
+dst.mkdir(parents=True, exist_ok=True)
+(dst / "config.json").write_text(json.dumps(cfg, indent=2))
+shutil.copy(src / "configuration_minimax_m3_vl.py", dst)
+PY
+
+python3 /tmp/make_m3_mtp_draft.py "$MODEL" /tmp/m3_mtp_draft
+```
+
+**Step 2 — serve.**
+
+`draft_load_config` scopes dummy init to the draft alone: `get_model()` takes
+`load_config or vllm_config.load_config`, and the proposer passes
+`speculative_config.draft_load_config` only for the draft head, so the target
+keeps loading its real quantized weights under the global `--load-format auto`.
+
+```bash
+cd /root
+rm -rf /root/.cache/atom/*
+
+MODEL=/path/to/MiniMax-M3-MXFP8
+DRAFT=/tmp/m3_mtp_draft
+
+export ATOM_FORCE_ATTN_TRITON=1
+export VLLM_USE_V2_MODEL_RUNNER=0
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_LOG_LEVEL=WARNING
+# Mandatory at TP>1: platforms/rocm.py imports amdsmi inside a try/except that
+# only warns, but CustomAllreduce.__init__ calls amdsmi_init() unconditionally,
+# so a missing amdsmi turns into `NameError: name 'amdsmi_init' is not defined`
+# on every worker. The bindings ship with ROCm, just not on sys.path.
+export PYTHONPATH=/opt/rocm-7.2.4/share/amd_smi${PYTHONPATH:+:$PYTHONPATH}
+
+vllm serve "$MODEL" \
+    --served-model-name m3-mtp \
+    --host 0.0.0.0 --port 8000 \
+    --tensor-parallel-size 4 \
+    --trust-remote-code \
+    --block-size 128 \
+    --max-model-len 4096 \
+    --max-num-batched-tokens 4096 \
+    --max-num-seqs 8 \
+    --no-enable-prefix-caching \
+    --gpu-memory-utilization 0.85 \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4, "text_config": {"use_index_cache": true, "index_topk_freq": 4}}' \
+    --speculative-config '{"method":"mtp","model":"'"$DRAFT"'","num_speculative_tokens":7,"draft_load_config":{"load_format":"dummy"}}'
+```
+
+Do **not** drop `"model"` and let vLLM default it — for `method: "mtp"` the
+default is the target checkpoint, which reintroduces the fp4 cast failure above.
+
+`num_speculative_tokens` may go up to the draft config's `num_mtp_modules`
+(7 for M3); ATOM derives the bound from that field.
+
+Expected: `/metrics` shows `spec_decode_num_draft_tokens_total` =
+7 × `spec_decode_num_drafts_total`, all seven `num_accepted_tokens_per_pos`
+buckets present and at 0, and mean acceptance length 1.00. Generated text
+matches the no-spec server.
+
 ---
 
 ## 4. Accuracy validation
