@@ -96,6 +96,8 @@ export LMCACHE_LOCAL_CPU=True
 export LMCACHE_MAX_LOCAL_CPU_SIZE=20 # GiB **per TP rank**
 export LMCACHE_CHUNK_SIZE=128        # must equal --block-size
 export OFFLOAD_MIN_LOAD_TOKENS=256   # default 8192 disables the tier for chat-sized prompts
+export OFFLOAD_COPY_WORKERS=4        # default 1 is a throughput cliff, see below
+export OFFLOAD_GPU_STAGING_CHUNKS=8  # default 2; give the 4 workers room to overlap
 
 vllm serve "$MODEL" \
     --served-model-name minimax-m3 \
@@ -180,6 +182,48 @@ nothing — the tier is live, it simply has nothing to offer. Cap the pool
 about it. On the ATOM native backend the same codec measured 76.65% total cache
 read with a capped pool against 56.81% on a larger one (ROCm/ATOM#2146) — same
 code, same workload, sizing the only difference.
+
+## The save pipe is the throughput knob
+
+`OFFLOAD_COPY_WORKERS` (default **1**) is the width of the per-rank save
+executor, and `OFFLOAD_GPU_STAGING_CHUNKS` (default **2**) the depth of the
+staging buffer it copies through. On the gfx950 box these numbers come from,
+one worker sustains only ~0.85 GB/s of device-to-host writes, which is below
+what a busy M3 server produces.
+
+The failure is not a slow tier, it is block starvation. `should_defer_free`
+holds a finished request's KV blocks while a save is in flight **or merely
+queued**, so once the save executor saturates, blocks stop returning to the
+pool: `vllm:kv_cache_usage_perc` pins near 1.0,
+`vllm:num_requests_waiting_by_reason{reason="capacity"}` climbs, and TTFT goes
+to tens of seconds. It drains once the load stops — it is backpressure, not a
+leak — which is why it only shows up under sustained concurrency.
+
+Measured with the talos radix generator (MiniMax-M3-MXFP8, TP=4, MTP=7, 25
+concurrent sessions, `--num-gpu-blocks-override 16612`, 60 GiB CPU tier,
+150 s eval). "LMCache off" is the same server with `--kv-transfer-config`
+removed:
+
+| | off | on, defaults | on, `COPY_WORKERS=4` `STAGING=8` |
+|---|---|---|---|
+| logical TPM | 11,281,781 | 942,378 | 10,067,546 |
+| decode TPS | 1,358.3 | 181.4 | 1,144.0 |
+| TTFT p50 / p90 (ms) | 248 / 955 | 75,222 / 87,478 | 306 / 1,022 |
+| `kv_cache_usage_perc` | 0.54 | 0.985 | 0.49 |
+| waiting (capacity) | 0 | 22.2 | 0.25 |
+| save duty cycle / rank | — | 100% | 46% |
+
+Four workers were enough here (46% duty); raise it further only if
+`[OFFLOAD-SAVE-PROF]` still shows the executor saturated. To read the duty
+cycle, start with `OFFLOAD_PROFILE=1` and sum `store_ms` per rank over the
+wall-clock window — note `toks` in that record is the cumulative save frontier
+and `skip` the floor, so bytes written are `(toks - skip) * bytes_per_block /
+block_size`, not `toks`.
+
+The staging buffer is allocated per rank at `OFFLOAD_GPU_STAGING_CHUNKS x
+bytes_per_block`; at `chunk=128` on M3 that is 3,008,512 B per chunk, so 8
+chunks costs 24 MiB of device memory per rank. The startup line reports the
+figure it actually used.
 
 ## Gotchas
 
@@ -272,8 +316,17 @@ and lose on throughput.
 | steady state (rounds 1-2) | no offload | offload |
 |---|---|---|
 | cached-token ratio | 0.0% | **79.8%** |
+| of which served by the CPU tier | n/a | **all of it** |
 | prefill throughput | ~37,590 tok/s (spread 0.7%) | **~62,260 tok/s** (spread 5.9%) |
 | p50 request latency | 0.273-0.275 s | **0.158-0.170 s** |
+
+The 79.8% is the offload tier's own hit rate, not a mix. Read straight off the
+counters over a 3-round run (739,191 prompt tokens): `prefix_cache_hits_total`
+moved by **0** -- vLLM's GPU prefix cache contributed nothing, because the
+working set is 3.8x the pool -- while `external_prefix_cache_hits_total` moved
+by 393,216, which equals the API's summed `cached_tokens` exactly. Per replay
+round that is 196,608 / 246,397 = **79.79%**; including the cold round,
+393,216 / 739,191 = 53.20%.
 
 1.66x on replay. The cold round pays 8-9% for the save path, so end-to-end over
 cold + 2 replays it is 1.30x. Both gaps are far outside the measured noise floor
