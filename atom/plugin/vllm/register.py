@@ -44,6 +44,9 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "DeepseekV4ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "MiniMaxM3SparseForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "MiniMaxM3SparseForConditionalGeneration": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    # SpeculativeConfig.hf_config_override rewrites the M3 draft architectures
+    # to this, for both the bundled VL checkpoint and a standalone MTP one.
+    "MiniMaxM3MTP": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Eagle3LlamaForCausalLM": ATOM_CAUSAL_LM_MODEL_WRAPPER,
     "LlamaForCausalLMEagle3": ATOM_CAUSAL_LM_MODEL_WRAPPER,
     "Eagle3DeepseekV2ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
@@ -140,6 +143,33 @@ def _register_mxfp8_quantization_config() -> None:
             return None
 
 
+def _apply_v4_block_reuse_patch() -> None:
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
+        apply_vllm_v4_block_reuse_patch,
+    )
+
+    apply_vllm_v4_block_reuse_patch()
+
+
+def _try_optional_step(step, what: str) -> bool:
+    """Run a best-effort registration step, never propagating its failure.
+
+    Only for steps that register_model() repeats, so a skip here is recovered
+    later rather than silently lost.
+    """
+    try:
+        step()
+        return True
+    except Exception:
+        logger.warning(
+            "ATOM vLLM plugin: skipping %s during platform registration; "
+            "it will be retried from register_model().",
+            what,
+            exc_info=True,
+        )
+        return False
+
+
 def register_platform() -> str | None:
 
     if disable_vllm_plugin:
@@ -175,18 +205,60 @@ def register_platform() -> str | None:
     # absent. Backbone is set in register_model() for real vLLM runs.
 
     _register_hf_configs()
-    _register_mxfp8_quantization_config()
+
+    # Anything below that imports vllm.* submodules is best-effort ONLY.
+    #
+    # vLLM resolves the platform inside resolve_current_platform_cls_qualname(),
+    # whose plugin loop swallows every exception with a bare `except Exception:
+    # pass`. When resolution is triggered from *within* a vLLM import (some vllm
+    # internal touches current_platform while vllm.utils.torch_utils is still
+    # partially initialized), importing vllm.model_executor / vllm.v1.core from
+    # here raises a circular ImportError. Unguarded, that aborts this function
+    # before its return statement, the loop swallows the error, and vLLM
+    # silently falls back to UnspecifiedPlatform -- the ATOM platform never
+    # activates and the failure surfaces much later as "Failed to infer device
+    # type". Returning the platform qualname is the one job this hook must never
+    # fail at, so each optional step is isolated and re-run from register_model()
+    # (which loads after vllm is fully imported, and before any config is built).
+    _try_optional_step(_register_mxfp8_quantization_config, "mxfp8 quant config")
     # DeepSeek-V4's packed proxy arena cannot immediately recycle block ids;
     # install the targeted scheduler-side queue-order compatibility patch before
     # any KVCacheManager is constructed.
-    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
-        apply_vllm_v4_block_reuse_patch,
-    )
+    _try_optional_step(_apply_v4_block_reuse_patch, "DeepSeek-V4 block reuse patch")
 
-    apply_vllm_v4_block_reuse_patch()
+    _register_kv_connectors()
 
     # return the ATOM platform to vllm
     return "atom.plugin.vllm.platform.ATOMPlatform"
+
+
+def _register_kv_connectors() -> None:
+    """Expose ATOM's byte-level LMCache offload to vLLM's connector factory.
+
+    Convenience only. vLLM validates ``kv_transfer_config`` while building
+    VllmConfig, which happens BEFORE platform plugins are invoked, so a run
+    that names the connector by bare name fails config validation before this
+    ever runs. The supported way to select it is vLLM's out-of-tree entry
+    point, which takes priority over the registry and needs no registration:
+
+        --kv-transfer-config '{"kv_connector": "AtomLMCacheOffloadConnector",
+          "kv_connector_module_path": "atom.plugin.vllm.kv_transfer.connector",
+          "kv_role": "kv_both"}'
+
+    Registered by module path so importing the plugin does not drag in the
+    offload stack (and LMCache) for every run.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+    name = "AtomLMCacheOffloadConnector"
+    if name in getattr(KVConnectorFactory, "_registry", {}):
+        return
+    KVConnectorFactory.register_connector(
+        name,
+        "atom.plugin.vllm.kv_transfer.connector",
+        name,
+    )
+    logger.info("Registered ATOM KV connector: %s", name)
 
 
 def _patch_vllm_attention_process_weights_after_loading(attention) -> None:
@@ -272,13 +344,13 @@ def register_model() -> None:
         return
 
     _set_plugin_mode()
+    # Both of these are also attempted from register_platform(), which may have
+    # had to skip them (see the note there). Repeating them here is the recovery
+    # path; each is idempotent.
+    _register_mxfp8_quantization_config()
     # The general-plugin hook runs in the EngineCore process that owns the
     # scheduler/KVCacheManager; install this here as well as in the platform hook.
-    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
-        apply_vllm_v4_block_reuse_patch,
-    )
-
-    apply_vllm_v4_block_reuse_patch()
+    _apply_v4_block_reuse_patch()
 
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 
@@ -317,6 +389,13 @@ def register_model() -> None:
     )
 
     apply_vllm_dspark_dcp_config_patch()
+
+    # Same hook, same reason: MiniMax-M3 ships no MTP weights, so the head is
+    # only reachable with dummy draft weights, and vLLM's default draft model
+    # (the quantized target) cannot be dummy-initialized.
+    from atom.plugin.vllm.m3_mtp_draft_patch import apply_vllm_m3_mtp_draft_patch
+
+    apply_vllm_m3_mtp_draft_patch()
 
     # patch attention process weights after loading
     # to avoid the specific handle in ATOM loader

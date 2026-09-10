@@ -274,6 +274,126 @@ vllm serve "$MODEL" \
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":512}'
 ```
 
+### 3.3 Decode, with serial MTP speculative decoding
+
+M3 declares `num_mtp_modules: 7`, but **no released M3 checkpoint ships MTP
+weights** — the MXFP4 index has 45,475 keys and zero `*mtp*` matches, the bf16
+one 23,416 keys and likewise zero. The MTP head can still be exercised with
+randomly initialized draft weights: spec decode verifies every draft token
+against the target, so a random draft costs acceptance rate, not correctness.
+This is a plumbing harness — with acceptance near 0 it demonstrates neither
+accuracy nor speedup. §3.4 forces the acceptance rate to recover the second
+of those.
+
+Pass no draft path — `--speculative-config '{"method":"mtp",...,
+"draft_load_config":{"load_format":"dummy"}}'` is the whole invocation. ATOM
+generates the draft config for you (`atom/plugin/vllm/m3_mtp_draft_patch.py`).
+
+`draft_load_config` scopes dummy init to the draft alone: `get_model()` takes
+`load_config or vllm_config.load_config`, and the proposer passes
+`speculative_config.draft_load_config` only for the draft head, so the target
+keeps loading its real quantized weights under the global `--load-format auto`.
+
+But `load_format` governs *how* parameters are filled, not *where the config
+describing them comes from*. With no `"model"`, vLLM's
+`SpeculativeConfig.__post_init__` defaults the draft to the target checkpoint
+**and copies its quantization** — and dummy init cannot write fp4: `copy_()` has
+no Half→fp4 cast, so it dies with `copy_() does not support casting
+Float4_e2m1fn_x2 to different types`. The ATOM patch closes that gap by deriving
+an unquantized bf16 draft config from the target, caching it under
+`~/.cache/atom/m3_mtp_draft/<digest>/` (`config.json` plus the remote-code
+config module — no safetensors), and filling in `"model"` before vLLM's
+defaulting runs. It keeps 4 backbone layers, since
+`MiniMaxM3MultiTokenPredictor` keys its MTP layer at `num_hidden_layers` and
+instantiates only `num_nextn_predict_layers` of them, and leaves
+`num_local_experts` at the target's value so the drafting cost matches a real
+MTP head. Passing `"model"` explicitly still works and disables the patch.
+
+```bash
+cd /root
+rm -rf /root/.cache/atom/*
+
+MODEL=/path/to/MiniMax-M3-MXFP8
+
+export ATOM_FORCE_ATTN_TRITON=1
+export VLLM_USE_V2_MODEL_RUNNER=0
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_LOG_LEVEL=WARNING
+# Mandatory at TP>1: platforms/rocm.py imports amdsmi inside a try/except that
+# only warns, but CustomAllreduce.__init__ calls amdsmi_init() unconditionally,
+# so a missing amdsmi turns into `NameError: name 'amdsmi_init' is not defined`
+# on every worker. The bindings ship with ROCm, just not on sys.path.
+export PYTHONPATH=/opt/rocm-7.2.4/share/amd_smi${PYTHONPATH:+:$PYTHONPATH}
+
+vllm serve "$MODEL" \
+    --served-model-name m3-mtp \
+    --host 0.0.0.0 --port 8000 \
+    --tensor-parallel-size 4 \
+    --trust-remote-code \
+    --block-size 128 \
+    --max-model-len 4096 \
+    --max-num-batched-tokens 4096 \
+    --max-num-seqs 8 \
+    --no-enable-prefix-caching \
+    --gpu-memory-utilization 0.85 \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4, "text_config": {"use_index_cache": true, "index_topk_freq": 4}}' \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":7,"draft_load_config":{"load_format":"dummy"}}'
+```
+
+`num_speculative_tokens` may go up to the draft config's `num_mtp_modules`
+(7 for M3); ATOM derives the bound from that field.
+
+Expected: `/metrics` shows `spec_decode_num_draft_tokens_total` =
+7 × `spec_decode_num_drafts_total`, all seven `num_accepted_tokens_per_pos`
+buckets present and at 0, and mean acceptance length 1.00.
+
+Do not use this configuration to compare output text against a no-spec server:
+under these flags the target is not self-consistent at `temperature=0` (the same
+prompt yields different continuations across requests), so a text mismatch here
+says nothing about spec decode.
+
+### 3.4 Decode, with MTP and a forced acceptance rate
+
+§3.3 measures the cost of drafting but never the benefit, because a random draft
+head is rejected almost every time. `rejection_sample_method: "synthetic"`
+replaces the probability-ratio test with a fixed schedule, so the accepted length
+becomes a knob: the server then answers "what would MTP-7 be worth at acceptance
+rate X", which is the number worth having before real MTP weights exist.
+
+Use vLLM's spelling, inside `--speculative-config`. ATOM's own
+`--spec-decode-acceptance-rate` / `--spec-decode-acceptance-length` belong to its
+native engine and do not exist in plugin mode; the plugin patches only the
+proposer side, leaving `RejectionSampler` stock, and it reads these three fields
+straight off the speculative config.
+
+Take §3.3's block and extend the last line:
+
+```bash
+    --speculative-config '{"method":"mtp","num_speculative_tokens":7,"draft_load_config":{"load_format":"dummy"},"rejection_sample_method":"synthetic","synthetic_acceptance_rates":[0.95,0.85,0.75,0.65,0.50,0.35,0.15]}'
+```
+
+`synthetic_acceptance_rates` are *unconditional* — entry i is the marginal
+probability that the first i+1 draft tokens are **all** accepted, not that token
+i survives given its predecessors did. Hence the validation in
+`SpeculativeConfig._resolve_synthetic_acceptance_rates`: length exactly
+`num_speculative_tokens`, entries in [0, 1], monotonically non-increasing. Mean
+accepted length is `1 + sum(rates)`, so the list above targets 5.2 of 8.
+
+To name that mean directly instead, swap the list for
+`"synthetic_acceptance_length": 4.0` (the two are mutually exclusive). Note it
+resolves to the *minimum-variance* schedule, not a smooth decay — at depth 7,
+4.0 becomes `[1,1,1,0,0,0,0]`, i.e. deterministically 3 accepted tokens every
+step. Pass explicit rates when the distribution matters.
+
+This still applies at `temperature=0`: `rejection_sampler.py` gates on
+`synthetic_mode or not sampling_metadata.all_greedy`, so the greedy fast path
+does not bypass it.
+
+The `/metrics` acceptance counters now report the schedule you asked for rather
+than anything the draft head earned, and accepted tokens are no longer the
+target's tokens. Read TPOT and mean acceptance length from this server; read
+nothing else.
+
 ---
 
 ## 5. Accuracy validation
@@ -326,41 +446,107 @@ lm_eval \
   --output_path ./eval_out/gsm8k
 ```
 
-### 5.3 AIME25 (maj@16)
 
-One-time setup:
+### 5.3 AIME25 (`pass_avg,all` @16 + non-stop, evalscope)
+
+The customer scores AIME25 with **evalscope** (not lm_eval), and the reported
+metric is **`pass_avg,all`** — the plain mean of the per-generation accuracy over
+all `30 problems × 16 repeats = 480` generations (i.e. avg@16), **not** majority
+vote. A second, independent hard requirement is the **non-stop ratio < 0.5%**:
+the fraction of generations that hit `MAX_TOKENS` without a natural EOS (the model
+rambling past the budget instead of converging). Baseline floor: `pass_avg,all ≥
+0.927`, `non-stop < 0.5%`.
+
+Customer-exact knobs (do **not** change the test method; only `repeats` may be
+temporarily lowered for a fast smoke run):
+
+| knob | value |
+|------|-------|
+| task | `aime25`, prompt **without** "step by step" |
+| repeats | 16 (480 gens total) |
+| `max_tokens` | 98304 |
+| `temperature` / `top_p` | 1.0 / 0.95 |
+| metric | `pass_avg,all` (evalscope `mean` aggregation) |
+| grader | rule (`grade_answer`), invalid answers always count as a wrong vote |
+
+One-time setup (protects the image's torch/vLLM):
 
 ```bash
+pip install --no-deps evalscope colorlog filetype jsonlines editdistance overrides
+# dataset: HF math-ai/aime25 (same 30 problems as evalscope/aime25)
 HF_HOME=/path/to/hf_cache python3 -c \
   'from datasets import load_dataset; load_dataset("math-ai/aime25", split="test")'
-
-LM_EVAL_TASKS=$(python3 -c "import lm_eval.tasks, os; print(os.path.dirname(lm_eval.tasks.__file__))")
-cat > "$LM_EVAL_TASKS/aime/aime25_maj16.yaml" <<'YAML'
-include: aime25.yaml
-task: aime25_maj16
-repeats: 16
-filter_list:
-  - name: maj@16
-    filter:
-      - function: regex
-        regex_pattern: '\\boxed\{([^}]*)\}'
-        group_select: -1
-        fallback: "[invalid]"
-      - function: majority_vote
-      - function: take_first
-YAML
 ```
 
-Run:
+Runner (`evalscope_aime25.py`) — the customer prompt with "step by step" removed,
+and the **mandatory** client `timeout`:
+
+```python
+import os
+from evalscope import run_task
+from evalscope.config import TaskConfig
+
+PORT    = os.environ.get("AIME_PORT", "8902")
+REPEATS = int(os.environ.get("AIME_REPEATS", "16"))   # only debug knob; keep 16 to report
+WORKDIR = os.environ.get("AIME_WORKDIR", "./eval_out/aime25")
+
+# evalscope's default aime25 template MINUS "step by step" (customer spec)
+CUSTOM_PROMPT = ("Solve the following math problem. Put your answer inside \\boxed{{}}.\n\n"
+                 "{question}\n\n"
+                 "Remember to put your answer inside \\boxed{{}}.")
+
+cfg = dict(
+    model="minimax-m3",
+    api_url=f"http://localhost:{PORT}/v1/chat/completions",
+    api_key="EMPTY", eval_type="openai_api",
+    datasets=["aime25"],
+    dataset_args={"aime25": {"prompt_template": CUSTOM_PROMPT, "dataset_id": "math-ai/aime25"}},
+    repeats=REPEATS,
+    generation_config={
+        "temperature": 1.0, "top_p": 0.95, "max_tokens": 98304,
+        # CRITICAL: without this, evalscope uses the openai-SDK default 600s client
+        # timeout. A generation toward the 98304 cap at ~50 tok/s needs ~30 min >> 600s,
+        # so every long gen times out client-side, retries 5x, then is scored FAILED —
+        # silently corrupting BOTH pass_avg and non-stop. 3600s covers a full-length gen.
+        "timeout": 3600,
+    },
+    judge={"strategy": "rule"},
+    eval_batch_size=int(os.environ.get("AIME_BATCH", "64")),
+    work_dir=WORKDIR, dataset_hub="huggingface",
+)
+run_task(task_cfg=TaskConfig(**cfg))
+```
+
+Run (full customer run; for a fast smoke set `AIME_REPEATS=1`):
 
 ```bash
 HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HOME=/path/to/hf_cache \
-lm_eval \
-  --model local-chat-completions \
-  --model_args "model=minimax-m3,base_url=http://localhost:8902/v1/chat/completions,num_concurrent=64,max_retries=3,timeout=7200,tokenized_requests=False" \
-  --tasks aime25_maj16 \
-  --apply_chat_template \
-  --gen_kwargs "temperature=1.0,top_p=0.95,do_sample=True,max_gen_toks=98304" \
-  --batch_size 64 --seed 42 \
-  --log_samples --output_path ./eval_out/aime25
+  AIME_WORKDIR=./eval_out/aime25 python3 evalscope_aime25.py
+```
+
+Read both metrics:
+
+```bash
+# pass_avg,all — from evalscope's report (the Accuracy / mean row)
+python3 - <<'PY'
+import glob, json
+rep = sorted(glob.glob("./eval_out/aime25/2*/reports/minimax-m3/aime25.json"))[-1]
+d = json.load(open(rep))
+print("pass_avg,all =", d["metrics"][0]["score"])   # evalscope mean aggregation over 480 gens
+PY
+
+# non-stop ratio — from the raw predictions (per-choice stop_reason)
+python3 - <<'PY'
+import glob, json, ast
+pf = sorted(glob.glob("./eval_out/aime25/2*/predictions/minimax-m3/aime25_default.jsonl"))[-1]
+tot = ns = 0
+for line in open(pf):
+    mo = json.loads(line)["model_output"]
+    mo = ast.literal_eval(mo) if isinstance(mo, str) else mo
+    for ch in mo["choices"]:
+        tot += 1
+        if ch.get("stop_reason") not in ("stop", "eos"):   # max_tokens / length = truncated
+            ns += 1
+print(f"non-stop = {ns}/{tot} = {ns/tot:.4%}   (floor < 0.5%)")
+PY
 ```
