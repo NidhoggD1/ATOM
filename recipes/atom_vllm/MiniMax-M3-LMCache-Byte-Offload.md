@@ -272,8 +272,17 @@ and lose on throughput.
 | steady state (rounds 1-2) | no offload | offload |
 |---|---|---|
 | cached-token ratio | 0.0% | **79.8%** |
+| of which served by the CPU tier | n/a | **all of it** |
 | prefill throughput | ~37,590 tok/s (spread 0.7%) | **~62,260 tok/s** (spread 5.9%) |
 | p50 request latency | 0.273-0.275 s | **0.158-0.170 s** |
+
+The 79.8% is the offload tier's own hit rate, not a mix. Read straight off the
+counters over a 3-round run (739,191 prompt tokens): `prefix_cache_hits_total`
+moved by **0** -- vLLM's GPU prefix cache contributed nothing, because the
+working set is 3.8x the pool -- while `external_prefix_cache_hits_total` moved
+by 393,216, which equals the API's summed `cached_tokens` exactly. Per replay
+round that is 196,608 / 246,397 = **79.79%**; including the cold round,
+393,216 / 739,191 = 53.20%.
 
 1.66x on replay. The cold round pays 8-9% for the save path, so end-to-end over
 cold + 2 replays it is 1.30x. Both gaps are far outside the measured noise floor
