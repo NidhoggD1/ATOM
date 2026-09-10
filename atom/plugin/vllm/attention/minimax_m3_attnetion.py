@@ -587,6 +587,56 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             self.v_scale = self.kv_scale[1]
         return self.k_scale, self.v_scale
 
+    def get_kv_transfer_scales(
+        self, kv_cache: "torch.Tensor | None" = None
+    ) -> tuple["torch.Tensor | None", "torch.Tensor | None"]:
+        """The fp8 scales a KV transfer must carry alongside this layer's bytes.
+
+        The sparse cache stores fp8 mantissas whose scale is per token AND per
+        head -- `(num_blocks, num_kv_heads, block_size)`, one fp32 per element
+        of the paged cache. Move the mantissas without them and a restored
+        block is dequantised against whatever the block's previous occupant
+        left behind: fluent-looking garbage, no error anywhere. So any tier
+        that moves this layer's KV has to move these too, and it can only know
+        that by asking -- vLLM's `kv_caches` registration carries the KV
+        tensors alone, and these live on the layer.
+
+        Named after the native path's `get_kv_transfer_tensors`, which reports
+        the same regions off `runner.kv_scale`.
+
+        `kv_cache` overrides the layer's own tensor, for callers that hold it
+        before the layer does -- a connector registering at engine start runs
+        before the first forward, and the scales are allocated lazily. Passing
+        the tensor vLLM registered is also what keeps the allocation stable:
+        `_ensure_fp8_scales` reallocates on a shape or device change, which
+        would strand a pointer a tier had already registered.
+
+        The cache is normalised to the 5-D form `_ensure_fp8_scales` unpacks:
+        vLLM binds this layer 4-D under either KV layout (the singleton
+        num_kv_heads axis folded away), and it is the same two reshapes the
+        forward paths already use -- `_asm_kv_cache_5d`'s `unsqueeze(3)` for
+        the K/V-separated cache, `_kv_cache_5d` for the plain interleaved one.
+
+        Returns `(None, None)` when the cache is not fp8 -- nothing to carry.
+        """
+        cache = self.kv_cache if kv_cache is None else kv_cache
+        if self.kv_cache_dtype != "fp8":
+            return None, None
+        if cache is None or cache.numel() == 0:
+            raise RuntimeError(
+                f"{self.layer_name}: cannot size the fp8 KV scales before the "
+                "KV cache is allocated"
+            )
+        if cache.ndim == 5:
+            view = cache
+        elif (
+            cache.ndim == 4 and cache.shape[1] == 2 and cache.shape[-1] == self.head_dim
+        ):
+            view = cache.unsqueeze(3)
+        else:
+            view = self._kv_cache_5d()
+        return self._ensure_fp8_scales(view)
+
     def _page16_shuffle_cache_for_sparse_kernel(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, object, object]:
