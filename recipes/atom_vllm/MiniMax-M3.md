@@ -78,16 +78,12 @@ prefixes, prefix-cache dominated).
 **Result being reproduced** — 4x MI355X (gfx950), single node, TP4, concurrency
 25, 300 s warmup + 600 s eval window:
 
-| Draft | Accept len<br>configured / **engine** / client | Device KV pool | Host KV pool | GPU hit | CPU hit | Total hit | TPM/GPU | Extend TPM | Decode TPS | TTFT p50 | TPOT p50 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| MTP (NextN head), dummy weights | 4.0 / **4.000** / 4.06 | **5,891,590** tok<br>(engine default) | **0** | **92.39%** | 0.00% | **92.39%** | **2,754,716** | **832,937** | **1,160.2** | **345 ms** | **11.5 ms** |
+| Draft | Index sharing | Accept len<br>configured / **engine** / client | Device KV pool | Host KV pool | GPU hit | CPU hit | Total hit | TPM/GPU | Extend TPM | Decode TPS | TTFT p50 | TPOT p50 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| MTP (NextN head), dummy weights | **on**, `index_topk_freq=4` | 4.0 / **4.000** / 4.06 | **5,891,590** tok<br>(engine default) | **0** | **92.39%** | 0.00% | **92.39%** | **2,754,716** | **832,937** | **1,160.2** | **345 ms** | **11.5 ms** |
+| MTP (NextN head), dummy weights | off (freq=1) | 4.0 / **4.000** / 3.97 | **5,891,590** tok<br>(engine default) | **0** | **91.70%** | 0.00% | **91.70%** | **2,367,584** | **781,357** | **1,005.4** | **378 ms** | **14.0 ms** |
 
-Raw counters behind that row, so a repro can be checked against it: 1479 / 1479
-requests succeeded, eval `duration` 621.085 s, prompt 113,340,290 tok, cache-hit
-104,718,208 tok, extend 8,622,082 tok, decode 720,557 tok, mean prompt 76,501
-tok, `vllm:num_preemptions_total` 0.
-
-Three things about that table:
+Four things about that table:
 
 - **Acceptance is forced, not earned.** `rejection_sample_method: "synthetic"` +
   `synthetic_acceptance_length: 4.0` makes the verifier accept a mean of exactly
@@ -112,6 +108,10 @@ Three things about that table:
   column is structurally zero rather than merely unmeasured. Do not compare it
   against another engine's two-tier "cache hit" number without splitting that
   number into its device and host parts first.
+- **`use_index_cache` ** turning it off frees no HBM, it just multiplies the indexer work by 4.
+  The cost lands on decode (TPOT p50 +21.7 %, Decode TPS -13.3 %) rather than on
+  prefill (Extend TPM -6.2 %), which is what the -14.1 % TPM/GPU is made of. For
+  the accuracy side of the trade see §5.3 (AIME25 `pass_avg` 0.848 -> 0.900).
 
 ### 3.1 Server
 
@@ -153,6 +153,14 @@ vllm serve "$MODEL" \
     --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4, "text_config": {"use_index_cache": true, "index_topk_freq": 4, "num_nextn_predict_layers": 1}}' \
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":640}' \
     --speculative-config '{"method":"mtp","num_speculative_tokens":7,"draft_load_config":{"load_format":"dummy"},"rejection_sample_method":"synthetic","synthetic_acceptance_length":4.0}'
+```
+
+For the second row of the table (index sharing off) change exactly one flag and
+nothing else. `num_nextn_predict_layers` must stay — it is what makes
+`method: mtp` loadable at all, not a workload knob:
+
+```bash
+    --hf-overrides '{"text_config": {"num_nextn_predict_layers": 1}}' \
 ```
 
 Notes on the non-obvious flags:
@@ -312,12 +320,15 @@ vllm serve "$MODEL" \
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":80}' \
 ```
 
+There is no speculative decoding here, so the index-sharing-off variant used for
+the second score in §5.2/§5.3 simply drops the `--hf-overrides` line entirely.
+
 ### 5.2 gsm8k (20-shot)
 
 ```bash
 python3 -m lm_eval --model local-chat-completions --apply_chat_template --tasks gsm8k --output_path ./eval_out-tta1J8 --log_samples --num_fewshot 20 --model_args 'model=minimax-m3-mxfp8,base_url=http://0.0.0.0:8015/v1/chat/completions,api_key=EMPTY,eos_string=</s>,max_retries=5,num_concurrent=64,timeout=1800,tokenized_requests=False,max_length=1048576' --gen_kwargs max_tokens=16384,temperature=0,top_p=1
 ```
-Results:
+Result with index_cache:
 ```bash
 local-chat-completions ({'model': 'minimax-m3-mxfp8', 'base_url': 'http://0.0.0.0:8015/v1/chat/completions', 'api_key': 'EMPTY', 'eos_string': '</s>', 'max_retries': 5, 'num_concurrent': 64, 'timeout': 1800, 'tokenized_requests': False, 'max_length': 1048576}), gen_kwargs: ({'max_tokens': 16384, 'temperature': 0, 'top_p': 1}), limit: None, num_fewshot: 20, batch_size: 1
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
@@ -325,7 +336,14 @@ local-chat-completions ({'model': 'minimax-m3-mxfp8', 'base_url': 'http://0.0.0.
 |gsm8k|      3|flexible-extract|    20|exact_match|↑  |0.9500|±  | 0.006|
 |     |       |strict-match    |    20|exact_match|↑  |0.9507|±  | 0.006|
 ```
-
+Result without index_cache:
+```bash
+local-chat-completions ({'model': 'minimax-m3-mxfp8', 'base_url': 'http://0.0.0.0:8015/v1/chat/completions', 'api_key': 'EMPTY', 'eos_string': '</s>', 'max_retries': 5, 'num_concurrent': 64, 'timeout': 1800, 'tokenized_requests': False, 'max_length': 1048576}), gen_kwargs: ({'max_tokens': 16384, 'temperature': 0, 'top_p': 1}), limit: None, num_fewshot: 20, batch_size: 1
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|    20|exact_match|↑  |0.9454|±  |0.0063|
+|     |       |strict-match    |    20|exact_match|↑  |0.9462|±  |0.0062|
+```
 
 ### 5.3 AIME25 (`pass_avg,all` @16 + non-stop, evalscope)
 
@@ -430,3 +448,9 @@ for line in open(pf):
 print(f"non-stop = {ns}/{tot} = {ns/tot:.4%}   (floor < 0.5%)")
 PY
 ```
+
+Result:
+| 组合 | KV dtype | index-cache | sparse topk | pass_avg | non-stop |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| fp8 kv cache, index-cache off | fp8 | OFF | 16 | 0.900 | 10.0% |
+| fp8 kv cache, index-cache on | fp8 | ON | 16 | ~0.848 | ~9.4% |
