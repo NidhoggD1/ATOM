@@ -423,3 +423,91 @@ def test_dense_lookup_unpin_passes_one_string_id():
     finally:
         worker._save_executor.shutdown(wait=True)
         worker._load_executor.shutdown(wait=True)
+
+
+# --- Save-floor lifetime -----------------------------------------------------
+#
+# The plugin (vLLM) path has to call `should_park_for_load_after_alloc` BEFORE
+# `update_state_after_alloc`, because returning True parks the request in
+# WAITING_FOR_REMOTE_KVS and vLLM offers no second chance. ATOM's native
+# scheduler asks after alloc. `_hit_save_floors` must therefore survive a
+# declined load under either ordering, or the request re-saves a prefix LMCache
+# already holds.
+
+
+class _StubLookup:
+    def __init__(self, hit):
+        self._hit = hit
+        self.cleared = []
+
+    def lookup(self, token_ids, lookup_id=None):
+        return self._hit
+
+    def clear_lookup_status(self, sid):
+        self.cleared.append(sid)
+
+
+def _lookup_seq(req_id, *, num_prompt_tokens, num_cached_tokens):
+    return SimpleNamespace(
+        id=req_id,
+        num_cached_tokens=num_cached_tokens,
+        num_prompt_tokens=num_prompt_tokens,
+        token_ids=list(range(num_prompt_tokens)),
+        block_table=[],
+    )
+
+
+def _declined_load_scheduler(monkeypatch, *, hit):
+    scheduler = _scheduler(monkeypatch)
+    scheduler._lookup_client = _StubLookup(hit)
+    # Default OFFLOAD_MIN_LOAD_TOKENS: any tail shorter than this is declined.
+    scheduler._min_load_tokens = 8192
+    return scheduler
+
+
+def test_declined_load_keeps_lmcache_hit_save_floor(monkeypatch):
+    scheduler = _declined_load_scheduler(monkeypatch, hit=896)
+    seq = _lookup_seq("r1", num_prompt_tokens=1024, num_cached_tokens=768)
+
+    need, park = scheduler.get_num_new_matched_tokens(seq)
+    assert (need, park) == (128, True)
+    assert scheduler._hit_save_floors["r1"] == 896
+
+    # vLLM hook order: the load is declined ("too_small") before alloc state.
+    assert scheduler.should_park_for_load_after_alloc(seq) is False
+    assert scheduler._load_specs.get("r1") is None
+    assert scheduler._hit_save_floors["r1"] == 896
+
+    scheduler.update_state_after_alloc(seq)
+    # Only the tail is new; tokens [0, 896) are already in LMCache.
+    assert scheduler._save_tracker["r1"][1] == 896
+
+
+def test_request_finished_drops_hit_save_floor(monkeypatch):
+    scheduler = _declined_load_scheduler(monkeypatch, hit=896)
+    seq = _lookup_seq("r1", num_prompt_tokens=1024, num_cached_tokens=768)
+
+    scheduler.get_num_new_matched_tokens(seq)
+    scheduler.should_park_for_load_after_alloc(seq)
+    scheduler.request_finished(seq)
+
+    assert "r1" not in scheduler._hit_save_floors
+
+
+def test_reused_request_id_does_not_inherit_hit_save_floor(monkeypatch):
+    scheduler = _declined_load_scheduler(monkeypatch, hit=896)
+    first = _lookup_seq("r1", num_prompt_tokens=1024, num_cached_tokens=768)
+
+    scheduler.get_num_new_matched_tokens(first)
+    scheduler.should_park_for_load_after_alloc(first)
+    assert scheduler._hit_save_floors["r1"] == 896
+
+    # Same id, different request object, and this time LMCache holds nothing.
+    scheduler._lookup_client = _StubLookup(0)
+    second = _lookup_seq("r1", num_prompt_tokens=1024, num_cached_tokens=0)
+    need, park = scheduler.get_num_new_matched_tokens(second)
+    assert (need, park) == (0, False)
+    assert "r1" not in scheduler._hit_save_floors
+
+    scheduler.update_state_after_alloc(second)
+    assert scheduler._save_tracker["r1"][1] == 0

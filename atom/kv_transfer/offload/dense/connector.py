@@ -402,6 +402,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         previous = self._load_lifecycles.get(sid)
         if previous is not None and previous is not seq:
             self._clear_pending_load(sid)
+            self._hit_save_floors.pop(sid, None)
             self._active_load_operations.pop(sid, None)
         self._load_lifecycles[sid] = seq
 
@@ -497,11 +498,21 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 entry[1] = max(int(entry[1]), initial_saved)
 
     def _clear_pending_load(self, sid: str) -> None:
+        # NB: `_hit_save_floors` is deliberately NOT cleared here. It records
+        # "LMCache already holds tokens [0, floor)", which stays true whether
+        # or not we go on to load them, and `update_state_after_alloc` reads it
+        # to avoid re-saving that prefix. ATOM's native scheduler asks
+        # `should_park_for_load_after_alloc` *after* `update_state_after_alloc`,
+        # so clearing it here was harmless there; vLLM has to ask *before*
+        # (returning True parks the request in WAITING_FOR_REMOTE_KVS with no
+        # second chance), so on the plugin path every declined load wiped the
+        # floor and the request re-saved its whole prompt. Measured on the M3
+        # radix workload: 58% of all D2H save traffic. The floor is dropped by
+        # `request_finished` and by `_begin_load_lifecycle` on id reuse.
         self._load_specs.pop(sid, None)
         self._reqs_need_recv.pop(sid, None)
         self._handoff_loads.discard(sid)
         self._load_save_floors.pop(sid, None)
-        self._hit_save_floors.pop(sid, None)
         self._lookup_in_step = [
             req_id for req_id in self._lookup_in_step if req_id != sid
         ]
@@ -781,5 +792,6 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         entry = self._save_tracker.get(sid)
         if entry is not None and entry[0] is seq and not self.should_defer_free(seq):
             self._save_tracker.pop(sid, None)
+        self._hit_save_floors.pop(sid, None)
         if hasattr(seq, "_load_operation"):
             delattr(seq, "_load_operation")
