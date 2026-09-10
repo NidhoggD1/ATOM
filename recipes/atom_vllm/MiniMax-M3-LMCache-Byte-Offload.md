@@ -98,6 +98,7 @@ export LMCACHE_CHUNK_SIZE=128        # must equal --block-size
 export OFFLOAD_MIN_LOAD_TOKENS=256   # default 8192 disables the tier for chat-sized prompts
 export OFFLOAD_COPY_WORKERS=4        # default 1 is a throughput cliff, see below
 export OFFLOAD_GPU_STAGING_CHUNKS=8  # default 2; give the 4 workers room to overlap
+export LMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3  # every rank answers, see below
 
 vllm serve "$MODEL" \
     --served-model-name minimax-m3 \
@@ -183,6 +184,30 @@ about it. On the ATOM native backend the same codec measured 76.65% total cache
 read with a capped pool against 56.81% on a larger one (ROCm/ATOM#2146) — same
 code, same workload, sizing the only difference.
 
+**The symptom to look for is `need=128` on the declined loads.** Start with
+`OFFLOAD_PROFILE=1` and read the `[OFFLOAD-LOAD-SKIP]` records:
+
+```
+[OFFLOAD-LOAD-SKIP] hbm_cached=29952 lmc_cached=30080 need=128 reason=too_small
+[OFFLOAD-LOAD-SKIP] hbm_cached=3968  lmc_cached=4096  need=128 reason=too_small
+```
+
+A `need` of exactly one chunk means LMCache holds precisely what HBM holds. The
+128 tokens are the fixed offset between vLLM's `num_cached_tokens`, which drops
+the last block so there is a token left to recompute, and LMCache's
+chunk-aligned hit — not real content. On the radix workload at
+`--num-gpu-blocks-override 16612` this was 497 of 499 declines, with
+`kv_cache_usage_perc` peaking at 0.49: the pool never filled, so vLLM's prefix
+cache never evicted, so the CPU tier could never hold more than a subset of
+HBM. No amount of `OFFLOAD_MIN_LOAD_TOKENS` tuning recovers this — 444 of
+those lookups reported a hit above 8192 tokens and every one of them still had
+`need=128`.
+
+There is a floor on how far the pool can be capped: vLLM requires it to hold
+one `--max-model-len` request, so `--num-gpu-blocks-override` cannot go below
+`max_model_len / block_size` (7813 at 1M context and block 128). Below that the
+engine refuses to start with a KV-cache-memory `ValueError`.
+
 ## The save pipe is the throughput knob
 
 `OFFLOAD_COPY_WORKERS` (default **1**) is the width of the per-rank save
@@ -224,6 +249,31 @@ The staging buffer is allocated per rank at `OFFLOAD_GPU_STAGING_CHUNKS x
 bytes_per_block`; at `chunk=128` on M3 that is 3,008,512 B per chunk, so 8
 chunks costs 24 MiB of device memory per rank. The startup line reports the
 figure it actually used.
+
+## Lookup scope: which rank answers "is it offloaded?"
+
+Every TP rank stores its own KV shard, but by default only rank 0 answers the
+LMCache lookup. That is safe while the ranks agree, and they do agree as long as
+nothing evicts — this connector saves on all ranks in lockstep. Under
+CPU-tier capacity pressure they stop agreeing: each rank evicts on its own
+recency, so rank 0 can report a hit whose shards are already gone elsewhere,
+and the load falls back to a full recompute after paying for the attempt.
+
+```bash
+export LMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3
+```
+
+makes every rank answer. The minimum across ranks is the prefix all four shards
+can actually restore, and each rank refreshes its own recency and pins its own
+shard. Leave it unset to keep the historical rank-0 behaviour.
+
+`LMCACHE_CACHE_POLICY=ATOM_SLRU` is available alongside it: new chunks enter a
+probationary segment and only reused ones become protected, so one long scan
+cannot flush the reusable prefixes. Both are opt-in; the defaults are rank-0
+lookup and plain LRU.
+
+Only synchronous lookup is supported. `LMCACHE_ENABLE_ASYNC_LOADING=true` is
+rejected at startup rather than silently issuing duplicate lookups.
 
 ## Gotchas
 
