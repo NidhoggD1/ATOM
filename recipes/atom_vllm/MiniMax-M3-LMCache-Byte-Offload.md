@@ -63,7 +63,9 @@ disk or remote backend instead of reading them as their own.
 
 Which one a given build resolves depends on whether its vLLM exempts a single
 uniform type group from mixed-HNC narrowing; M3's key-only indexer spec
-triggers that narrowing. Read the startup line rather than assuming.
+triggers that narrowing. Read the startup line rather than assuming --
+`Inferact/vllm-m3-amd@8a9bad879` resolves `kv-split`, stock vLLM 0.28
+resolves `kv-whole`.
 
 ## Launch
 
@@ -215,25 +217,92 @@ code, same workload, sizing the only difference.
 
 ## Validation status
 
-**Neither layout has been run on a server from this branch.** The M3-AMD tree
-imports `vllm.v1.kv_cache_layout`, which exists only in the vLLM this recipe
-family is built against (`Inferact/vllm-m3-amd@8a9bad879`); stock vLLM 0.28
-carries the older `KVCacheLayoutType` string and no layout resolver at all, so
-`atom/plugin/vllm/attention/backend.py` does not import there and no M3 server
-of any layout can start. That repository is private and was not reachable, and
-no local image or checkout carries the fork.
+**Both layouts are now covered, and `kv-split` (LHBNC) is the one the customer
+fork actually resolves.** The M3-AMD tree imports `vllm.v1.kv_cache_layout`,
+which exists only in the vLLM this recipe family is built against
+(`Inferact/vllm-m3-amd@8a9bad879`); stock vLLM 0.28 carries the older
+`KVCacheLayoutType` string and no layout resolver, so
+`atom/plugin/vllm/attention/backend.py` does not import there. That fork was
+supplied as a source archive and built locally, so the server numbers below are
+from the customer's own vLLM rather than a stand-in.
 
-What was verified instead, on gfx950:
+### Environment the numbers come from
 
-| check | how |
+| piece | version |
 |---|---|
-| both layouts segment and move every byte | `DenseKVByteCodec` gather/scatter over a 60-layer / 117-tensor M3 census on GPU, KV + fp8 scales + index caches, byte-compared after wiping the gathered blocks |
-| the two layouts cost the same per block | same run: 3 646 464 B under both, from 288 segments (`kv-split`) and 231 (`kv-whole`) |
-| an LMCache engine stores and returns those bytes | real `build_offload_engine` + `BlockGPUConnector` + LMCache 0.4.5 LocalCPU: 4 blocks stored and retrieved, all 23 segments byte-identical |
-| the layout reaches the namespace | `build_page_namespace` yields a different key once `page_layout_tag` is set, and the unset key is byte-identical to the native path's |
-| the rest | 48 unit tests in `tests/plugin/` |
+| base image | `vllm/vllm-openai-rocm:nightly-27a94d1ce4e3fc100c4732439ccec10f8246a804` (torch 2.12.0) |
+| vLLM | `0.28.1.dev0+g76538dc71` built from `Inferact/vllm-m3-amd@8a9bad879` |
+| AITER | public `ROCm/aiter@878d60d77` — **deviation**, `zejunchen-zejun/aiter-m3` is private and unreachable; this is the same build a previously working M3 container carried, and all four M3 symbols are present |
+| LMCache | 0.5.3 — **deviation**, ROCm/ATOM#2146 validated against 0.4.5 |
+| hardware | 8x gfx950, TP=4 per arm, `MiniMax-M3-MXFP8` |
 
-The first three are one script, and it needs a GPU but no server:
+The fork requires torch >= 2.11 (`csrc/libtorch_stable/cuda_view.cu` uses
+`torch::stable::Tensor::layout`), which rules out the `rocm/atom-dev` images
+shipping torch 2.10 — use the base image above.
+
+### What the server reports at startup
+
+Under `ATOM_M3_DENSE_ATTN_BACKEND=aiter` and
+`VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1`, all four ranks print:
+
+```
+ATOM LMCache offload: registered 60 layers, num_blocks=512, layout=kv-split
+ATOM LMCache offload:   57 x index tail_shape=(1, 128, 128) dtype=torch.float8_e4m3fn
+ATOM LMCache offload:   3 x kv    tail_shape=(1, 128, 256) dtype=torch.uint8
+ATOM LMCache offload:   57 x kv   tail_shape=(2, 128, 128) dtype=torch.uint8
+LMCache offload worker rank=N: bytes_per_block=2958336 chunk=128 ...
+LMCache offload scheduler: lookup client on atom-offload-dp0 (world=4)
+```
+
+117 tensors over 60 layers, `world=4` (the `tensor_parallel_size` the shim adds
+-- without it the scheduler computes `world=1` while the workers compute 4).
+
+### A/B against the same server with the connector removed
+
+Single variable: two servers from the same container, identical flags and an
+identical 65,536-token HBM pool (`--num-gpu-blocks-override 512`), differing
+only in `--kv-transfer-config` and port. Workload: 24 distinct ~10.3K-token
+prompts (~246K tokens, **3.8x the pool**, so round 2 cannot hit in HBM),
+`max_tokens=1` to isolate prefill, 3 rounds, 3 repeats on different seeds.
+
+Sizing that working set above the pool is the whole experiment. If the pool
+holds the working set, the offload tier has nothing to do and will tie on hits
+and lose on throughput.
+
+| steady state (rounds 1-2) | no offload | offload |
+|---|---|---|
+| cached-token ratio | 0.0% | **79.8%** |
+| prefill throughput | ~37,590 tok/s (spread 0.7%) | **~62,260 tok/s** (spread 5.9%) |
+| p50 request latency | 0.273-0.275 s | **0.158-0.170 s** |
+
+1.66x on replay. The cold round pays 8-9% for the save path, so end-to-end over
+cold + 2 replays it is 1.30x. Both gaps are far outside the measured noise floor
+(hit rate 2.64 pp, throughput <1%).
+
+### Correctness
+
+| check | result |
+|---|---|
+| gsm8k 5-shot, no offload | 0.9553 +/- 0.0057 (strict-match) |
+| gsm8k 5-shot, offload cold | 0.9484 +/- 0.0061 |
+| gsm8k 5-shot, offload replay (no cache clear) | 0.9492 +/- 0.0060 |
+| marker recall over a pure external hit | 8192 tokens loaded from LMCache after the prompt was evicted; the answer still names the marker |
+| both layouts segment and move every byte | `DenseKVByteCodec` gather/scatter over a 60-layer / 117-tensor M3 census on GPU, KV + fp8 scales + index caches, byte-compared after wiping the gathered blocks |
+| an LMCache engine stores and returns those bytes | real `build_offload_engine` + `BlockGPUConnector` + LMCache LocalCPU: all 23 segments byte-identical |
+| the layout reaches the namespace | `build_page_namespace` yields a different key once `page_layout_tag` is set, and the unset key is byte-identical to the native path's |
+| the rest | unit tests in `tests/plugin/` |
+
+The three arms are within each other's error bars, and the replay does not lose
+accuracy against the cold run -- which is the signal that the fp8 scales travel
+with the bytes.
+
+Do **not** gate on byte-identical continuations: this build is not
+bit-reproducible across a cache hit even without the offload tier. The same
+prompt sent twice to the *baseline* server, hitting only vLLM's own GPU prefix
+cache, already returns a different (still correct) continuation. Judge a replay
+on whether it stays coherent and recalls the content, and on aggregate accuracy.
+
+The codec self-check needs a GPU but no server:
 
 ```bash
 PYTHONHASHSEED=0 LMCACHE_LOCAL_CPU=True LMCACHE_MAX_LOCAL_CPU_SIZE=4 \
@@ -241,14 +310,26 @@ LMCACHE_CHUNK_SIZE=128 HIP_VISIBLE_DEVICES=0 \
 python3 tests/plugin/m3_offload_gpu_selfcheck.py
 ```
 
+### Known behaviour: `load failed ...; recomputing`
+
+Under concurrent chat traffic (`num_concurrent=32`) roughly 2% of requests log
+
+```
+ATOM LMCache offload: load failed for [...]; recomputing
+```
+
+on ranks 1..N-1 and never on rank 0. That asymmetry is the signature of
+`lookup_server_worker_ids: [0]`: the scheduler asks rank 0's store whether the
+tokens are there and every rank then tries to load them. When another rank's
+store does not have them yet, it reports `failed_loading` and vLLM recomputes
+that stretch. Accuracy is unaffected (the gsm8k replay above was measured with
+these warnings present) and the cost is one recompute. It does not appear under
+sequential long-prompt traffic. This is a property of the ATOM offload layer
+this port sits on, not of the port.
+
 The transfer tier above the codec (`build_offload_engine`, `BlockGPUConnector`,
 LMCache itself) is untouched by this port and is what ROCm/ATOM#2146 validated
 on the ATOM native stack.
-
-**Before running this recipe on the customer stack**, work through *Verify it is
-actually on* above; the `layout=` line says which of the two paths that build
-resolved, and it is the one thing here that has never been observed rather than
-constructed.
 
 ## Related
 
