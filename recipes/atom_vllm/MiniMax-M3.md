@@ -158,8 +158,9 @@ weights** — the MXFP4 index has 45,475 keys and zero `*mtp*` matches, the bf16
 one 23,416 keys and likewise zero. The MTP head can still be exercised with
 randomly initialized draft weights: spec decode verifies every draft token
 against the target, so a random draft costs acceptance rate, not correctness.
-This is a plumbing harness — with acceptance pinned near 0 it demonstrates
-neither accuracy nor speedup.
+This is a plumbing harness — with acceptance near 0 it demonstrates neither
+accuracy nor speedup. §3.4 forces the acceptance rate to recover the second
+of those.
 
 Pass no draft path — `--speculative-config '{"method":"mtp",...,
 "draft_load_config":{"load_format":"dummy"}}'` is the whole invocation. ATOM
@@ -227,6 +228,48 @@ Do not use this configuration to compare output text against a no-spec server:
 under these flags the target is not self-consistent at `temperature=0` (the same
 prompt yields different continuations across requests), so a text mismatch here
 says nothing about spec decode.
+
+### 3.4 Decode, with MTP and a forced acceptance rate
+
+§3.3 measures the cost of drafting but never the benefit, because a random draft
+head is rejected almost every time. `rejection_sample_method: "synthetic"`
+replaces the probability-ratio test with a fixed schedule, so the accepted length
+becomes a knob: the server then answers "what would MTP-7 be worth at acceptance
+rate X", which is the number worth having before real MTP weights exist.
+
+Use vLLM's spelling, inside `--speculative-config`. ATOM's own
+`--spec-decode-acceptance-rate` / `--spec-decode-acceptance-length` belong to its
+native engine and do not exist in plugin mode; the plugin patches only the
+proposer side, leaving `RejectionSampler` stock, and it reads these three fields
+straight off the speculative config.
+
+Take §3.3's block and extend the last line:
+
+```bash
+    --speculative-config '{"method":"mtp","num_speculative_tokens":7,"draft_load_config":{"load_format":"dummy"},"rejection_sample_method":"synthetic","synthetic_acceptance_rates":[0.95,0.85,0.75,0.65,0.50,0.35,0.15]}'
+```
+
+`synthetic_acceptance_rates` are *unconditional* — entry i is the marginal
+probability that the first i+1 draft tokens are **all** accepted, not that token
+i survives given its predecessors did. Hence the validation in
+`SpeculativeConfig._resolve_synthetic_acceptance_rates`: length exactly
+`num_speculative_tokens`, entries in [0, 1], monotonically non-increasing. Mean
+accepted length is `1 + sum(rates)`, so the list above targets 5.2 of 8.
+
+To name that mean directly instead, swap the list for
+`"synthetic_acceptance_length": 4.0` (the two are mutually exclusive). Note it
+resolves to the *minimum-variance* schedule, not a smooth decay — at depth 7,
+4.0 becomes `[1,1,1,0,0,0,0]`, i.e. deterministically 3 accepted tokens every
+step. Pass explicit rates when the distribution matters.
+
+This still applies at `temperature=0`: `rejection_sampler.py` gates on
+`synthetic_mode or not sampling_metadata.all_greedy`, so the greedy fast path
+does not bypass it.
+
+The `/metrics` acceptance counters now report the schedule you asked for rather
+than anything the draft head earned, and accepted tokens are no longer the
+target's tokens. Read TPOT and mean acceptance length from this server; read
+nothing else.
 
 ---
 
