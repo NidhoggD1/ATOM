@@ -359,6 +359,13 @@ def register_model() -> None:
 
     apply_vllm_dspark_dcp_config_patch()
 
+    # Same hook, same reason: MiniMax-M3 ships no MTP weights, so the head is
+    # only reachable with dummy draft weights, and vLLM's default draft model
+    # (the quantized target) cannot be dummy-initialized.
+    from atom.plugin.vllm.m3_mtp_draft_patch import apply_vllm_m3_mtp_draft_patch
+
+    apply_vllm_m3_mtp_draft_patch()
+
     # patch attention process weights after loading
     # to avoid the specific handle in ATOM loader
     try:
