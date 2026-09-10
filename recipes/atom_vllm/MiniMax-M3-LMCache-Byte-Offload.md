@@ -283,18 +283,39 @@ cold + 2 replays it is 1.30x. Both gaps are far outside the measured noise floor
 
 | check | result |
 |---|---|
-| gsm8k 5-shot, no offload | 0.9553 +/- 0.0057 (strict-match) |
-| gsm8k 5-shot, offload cold | 0.9484 +/- 0.0061 |
-| gsm8k 5-shot, offload replay (no cache clear) | 0.9492 +/- 0.0060 |
+| gsm8k 5-shot, 5 runs, both arms replicated | offload mean 0.9527 vs no-offload mean 0.9526 -- see the table below |
 | marker recall over a pure external hit | 8192 tokens loaded from LMCache after the prompt was evicted; the answer still names the marker |
 | both layouts segment and move every byte | `DenseKVByteCodec` gather/scatter over a 60-layer / 117-tensor M3 census on GPU, KV + fp8 scales + index caches, byte-compared after wiping the gathered blocks |
 | an LMCache engine stores and returns those bytes | real `build_offload_engine` + `BlockGPUConnector` + LMCache LocalCPU: all 23 segments byte-identical |
 | the layout reaches the namespace | `build_page_namespace` yields a different key once `page_layout_tag` is set, and the unset key is byte-identical to the native path's |
 | the rest | unit tests in `tests/plugin/` |
 
-The three arms are within each other's error bars, and the replay does not lose
-accuracy against the cold run -- which is the signal that the fp8 scales travel
-with the bytes.
+gsm8k in full, strict-match, 1319 questions per run. Both arms are replicated
+so the between-arm gap can be read against each arm's *own* run-to-run spread;
+the per-run stderr is a sampling bound and does not predict re-run variance.
+
+| arm | run | strict-match | flexible-extract |
+|---|---|---|---|
+| no offload | A1 | 0.9553 +/- 0.0057 | 0.9545 |
+| no offload | A2 | 0.9500 +/- 0.0060 | 0.9492 |
+| offload | B1, cold | 0.9484 +/- 0.0061 | 0.9477 |
+| offload | B2, replay (no cache clear) | 0.9492 +/- 0.0060 | 0.9484 |
+| offload | B3, replay (no cache clear) | 0.9606 +/- 0.0054 | 0.9598 |
+
+| | no offload | offload |
+|---|---|---|
+| mean | **0.9526** | **0.9527** |
+| own spread (max-min) | 0.0053 | 0.0122 |
+
+The between-arm gap is **0.0001** against a within-arm spread of up to
+**0.0122**: the arms are indistinguishable, and turning the offload tier on
+moves accuracy less than the baseline moves itself between two runs. The
+highest of all five runs is an offload run. Replay does not lose accuracy
+against its own cold run -- the signal that the fp8 scales travel with the
+bytes.
+
+Run each arm at least twice. A single pair (A1 vs B1) reads as a 0.7-point
+regression; it is the noise floor, not a regression.
 
 Do **not** gate on byte-identical continuations: this build is not
 bit-reproducible across a cache hit even without the offload tier. The same
