@@ -62,52 +62,72 @@ python3 -m pip install "lm_eval[api]"
 |---|---|---|
 | `ATOM_M3_DENSE_ATTN_BACKEND` | `gluon` | Routes M3's 3 dense layers onto AITER's shuffle kernels (`flash_attn_varlen` for prefill, `pa_decode_gluon` for decode) instead of vLLM's Triton `unified_attention`, and requests a K/V-separated KV cache. |
 | `VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT` | `1` | Required by gluon — enables the page-16 SHUFFLE KV layout the shuffle kernels read. |
-| `VLLM_USE_V2_MODEL_RUNNER` | `0` | ATOM's EAGLE3 integration patches vLLM's V1 proposer; M3 defaults to V2 on ROCm, which bypasses it. |
-| `ATOM_M3_UNIFORM_BATCH_CAPTURE` | `1` | Lets EAGLE3 spec-verify batches (`query_len > 1`) be CUDA-graph captured under `FULL_DECODE_ONLY`; without it decode falls back to eager. |
+| `VLLM_USE_V2_MODEL_RUNNER` | `0` | ATOM's speculative-decoding integration (EAGLE3 and MTP alike) patches vLLM's V1 proposer; M3 defaults to V2 on ROCm, which bypasses it. |
+| `ATOM_M3_UNIFORM_BATCH_CAPTURE` | `1` | Lets spec-verify batches (`query_len > 1`) be CUDA-graph captured under `FULL_DECODE_ONLY`; without it decode falls back to eager. |
+| `USE_ATOM` | `1` | Activates the ATOM plugin inside vLLM. |
+| `ATOM_FORCE_ATTN_TRITON` | `1` | Forces the Triton path for the layers gluon does not cover. |
+| `VLLM_SERVER_DEV_MODE` | `1` | Mounts `POST /reset_prefix_cache`, needed to start a benchmark from a cold prefix cache (§3.2). |
 
 ---
 
 ## 3. Multi-turn throughput benchmark
 
 End-to-end serving benchmark on a multi-turn session replay (long shared
-prefixes, prefix-cache dominated). 
+prefixes, prefix-cache dominated).
 
-**Result being reproduced** — 4x MI355X (gfx950), single node, TP4, concurrency 25:
+**Result being reproduced** — 4x MI355X (gfx950), single node, TP4, concurrency
+25, 300 s warmup + 600 s eval window:
 
-| Draft | Accept len<br>configured / measured | Device KV pool | Cache hit | TPM/GPU | Extend TPM | Decode TPS | TTFT p50 | TPOT p50 | Host-side cache |
-|---|---:|---|---:|---:|---:|---:|---:|---:|---|
-| EAGLE3, real weights | 4.0 / **3.82** | `--num-gpu-blocks-override 16612`<br>-> 2,126,199 tok | 90.40% | **1,657,488** | 631,579 | 816.2 | **407 ms** | **20.5 ms** | none |
+| Draft | Index sharing | Accept len<br>configured / **engine** / client | Device KV pool | Host KV pool | GPU hit | CPU hit | Total hit | TPM/GPU | Extend TPM | Decode TPS | TTFT p50 | TPOT p50 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| MTP (NextN head), dummy weights | **on**, `index_topk_freq=4` | 4.0 / **4.000** / 4.06 | **5,891,590** tok<br>(engine default) | **0** | **92.39%** | 0.00% | **92.39%** | **2,754,716** | **832,937** | **1,160.2** | **345 ms** | **11.5 ms** |
+| MTP (NextN head), dummy weights | off (freq=1) | 4.0 / **4.000** / 3.97 | **5,891,590** tok<br>(engine default) | **0** | **91.70%** | 0.00% | **91.70%** | **2,367,584** | **781,357** | **1,005.4** | **378 ms** | **14.0 ms** |
 
-Two things about that table:
+Four things about that table:
 
 - **Acceptance is forced, not earned.** `rejection_sample_method: "synthetic"` +
   `synthetic_acceptance_length: 4.0` makes the verifier accept a mean of exactly
-  4.0 of the 7 drafted tokens, so draft *quality* never enters the measurement.
-  The `3.82` is the load generator's client-side estimate
-  (`completion_tokens / sse_chunk_count`); short completions pay a fixed
-  first/last-chunk cost that drags the mean below the configured value, while
-  requests with >= 256 completion tokens land on it. Only the **configured**
-  value is comparable across engines.
-- **The device KV pool override is for parity, not for speed.** At concurrency 25
-  the in-flight working set is 1.57 M tokens (74 % of the pinned pool) and
-  `vllm:num_preemptions_total` stays 0 for the whole run. Dropping the override
-  lets the engine allocate 5,037,373 tokens instead and moves TPM/GPU by -0.1 %.
-
+  4.0 of the 7 drafted tokens, so draft *quality* never enters the measurement —
+  which is why `draft_load_config.load_format: "dummy"` (a randomly initialised
+  NextN head) is fine here, and why the generated text is meaningless by design.
+  The **engine** column is `1 + accepted/drafts` read off vLLM's own counters and
+  is the only cross-engine comparable one (§3.3). The `4.06` is the load
+  generator's client-side estimate (`completion_tokens / sse_chunk_count`); vLLM's
+  API server merges several verify steps into one SSE chunk, so on some requests
+  that estimate exceeds the theoretical ceiling of `num_speculative_tokens + 1 =
+  8`. Do not draw conclusions from it.
+- **Do not pass `--num-gpu-blocks-override`.** This arm lets the engine size the
+  device pool itself: 126.43 GiB/rank of KV memory -> 46,031 blocks ->
+  **5,891,590 tokens**. At concurrency 25 the in-flight working set is 1.91 M
+  tokens (32 % of the pool) and `vllm:num_preemptions_total` stays 0 all run.
+  Pinning the pool to 2,126,199 tokens (`--num-gpu-blocks-override 16612`, which
+  is only useful when matching another engine's pool size) costs 14.2 pp of hit
+  rate and 41.6 % of TPM/GPU on this workload.
+- **No host-side KV tier.** No `--kv-transfer-config`, no `LMCACHE_*`. The 92.39 %
+  is device prefix cache only; host KV usage is 0 by construction, so the CPU-hit
+  column is structurally zero rather than merely unmeasured. Do not compare it
+  against another engine's two-tier "cache hit" number without splitting that
+  number into its device and host parts first.
+- **`use_index_cache` ** turning it off frees no HBM, it just multiplies the indexer work by 4.
+  The cost lands on decode (TPOT p50 +21.7 %, Decode TPS -13.3 %) rather than on
+  prefill (Extend TPM -6.2 %), which is what the -14.1 % TPM/GPU is made of. For
+  the accuracy side of the trade see §5.3 (AIME25 `pass_avg` 0.848 -> 0.900).
 
 ### 3.1 Server
 
 ```bash
-cd /root
+cd /root                             # NOT /app -- see the pitfalls below
 rm -rf /root/.cache/atom/*
 
 MODEL=/path/to/MiniMax-M3-MXFP8
-DRAFT=/path/to/MiniMax-M3-EAGLE3
 
 export USE_ATOM=1
 export ATOM_M3_DENSE_ATTN_BACKEND=gluon
+export VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1
+export ATOM_FORCE_ATTN_TRITON=1
 export VLLM_USE_V2_MODEL_RUNNER=0
 export ATOM_M3_UNIFORM_BATCH_CAPTURE=1
-export VLLM_SERVER_DEV_MODE=1
+export VLLM_SERVER_DEV_MODE=1        # mounts POST /reset_prefix_cache
 export SAFETENSORS_FAST_GPU=1
 export NCCL_SOCKET_IFNAME=lo
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
@@ -115,8 +135,7 @@ export AITER_LOG_LEVEL=WARNING
 export PYTHONNOUSERSITE=1
 export VLLM_DO_NOT_TRACK=1
 export HF_HUB_OFFLINE=1
-export CUDA_VISIBLE_DEVICES=4,5,6,7
-export VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1
+
 
 vllm serve "$MODEL" \
     --served-model-name minimax-m3-mxfp8 \
@@ -131,18 +150,35 @@ vllm serve "$MODEL" \
     --max-num-seqs 80 \
     --max-num-batched-tokens 32768 \
     --enable-prefix-caching \
-    --num-gpu-blocks-override 16612 \
-    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4, "text_config": {"use_index_cache": true, "index_topk_freq": 4}}' \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4, "text_config": {"use_index_cache": true, "index_topk_freq": 4, "num_nextn_predict_layers": 1}}' \
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":640}' \
-    --speculative-config '{"method":"eagle3","model":"'"$DRAFT"'","num_speculative_tokens":7,"draft_tensor_parallel_size":1,"attention_backend":"ROCM_AITER_FA","rejection_sample_method":"synthetic","synthetic_acceptance_length":4.0}'
+    --speculative-config '{"method":"mtp","num_speculative_tokens":7,"draft_load_config":{"load_format":"dummy"},"rejection_sample_method":"synthetic","synthetic_acceptance_length":4.0}'
+```
+
+For the second row of the table (index sharing off) change exactly one flag and
+nothing else. `num_nextn_predict_layers` must stay — it is what makes
+`method: mtp` loadable at all, not a workload knob:
+
+```bash
+    --hf-overrides '{"text_config": {"num_nextn_predict_layers": 1}}' \
 ```
 
 Notes on the non-obvious flags:
 
-- `--num-gpu-blocks-override 16612` -> `16612 x 128 = 2,126,336` nominal; the
-  engine reports **2,126,199** usable KV tokens. vLLM has no `--max-total-tokens`,
-  so this is the only way to pin the device pool. Without it the engine picks
-  39,357 blocks (5,037,373 tokens).
+- `"num_nextn_predict_layers": 1` in `--hf-overrides` is **mandatory for `method: mtp`
+  on the MXFP8 checkpoint**. ATOM's generated draft config carries the key, but
+  `model_wrapper.py` overwrites the draft's `hf_config` with the target's, and
+  `MiniMaxM3MultiTokenPredictor.__init__` then reads `config.num_nextn_predict_layers`
+  off the MXFP8 config, which only declares `text_config.num_mtp_modules = 1`.
+  Without the override the server dies at load with
+  `AttributeError: 'MiniMaxM3TextConfig' object has no attribute 'num_nextn_predict_layers'`.
+  The two names are the same quantity (1 MTP layer, reused across the 7 steps),
+  so this is an alias, not a behaviour change. The MXFP4 export declares
+  `num_nextn_predict_layers` directly, which is why it starts without the override.
+- `num_speculative_tokens: 7` needs an ATOM new enough to derive the sequential
+  drafter's depth from the draft config
+  (`max_spec = max(4, draft_cfg.num_mtp_modules)`). Older revisions hard-code
+  `max_spec = 4` and reject the config outright.
 - `max_cudagraph_capture_size: 640` = `80 x (7+1)`, the spec-verify batch width.
   A smaller value silently drops decode out of CUDA graphs.
 - Use `synthetic_acceptance_length`, **never** hand-written
@@ -150,11 +186,9 @@ Notes on the non-obvious flags:
   length = `1 + sum`, and they must be non-increasing), which is very easy to get
   wrong. The two keys are mutually exclusive; the valid range here is
   `[1, num_speculative_tokens + 1] = [1, 8]`.
-- No `--kv-transfer-config` and no `LMCACHE_*`: this arm has **zero** host-side
-  KV cache. The 90.40 % hit rate is device prefix cache only.
-- NextN: TBD
 
-### 3.5 Load generator
+
+### 3.2 Load generator
 
 Run on the host. The workload is an open-loop replay of recorded agentic
 sessions: each session's turns are issued with the original inter-turn gaps
@@ -186,266 +220,130 @@ podman run --rm --network host \
     --max-concurrent-session 25 \
     --warmup-time-in-seconds 300 \
     --eval-time-in-seconds 600 --grace-period-secs 30 --seed 2026 \
-    --output-path /output/results.jsonl
+    --output-path /output/results.jsonl > "$OUT/talos.log" 2>&1 &
+
+# 2. `duration` in results.summary.json covers the EVAL window only, so the
+#    baseline snapshot must be taken the instant warmup ends.
+until grep -qa 'warmup phase ended' "$OUT/talos.log"; do sleep 1; done
+curl -fsS "$ENDPOINT/metrics" > "$OUT/metrics.before.prom"
+
+wait
+until idle; do sleep 5; done
+curl -fsS "$ENDPOINT/metrics" > "$OUT/metrics.after.prom"
 ```
 
+### 3.3 Deriving the numbers
 
-## 4. Server commands
+Every throughput figure is `delta = after - before` over the two Prometheus
+snapshots, divided by `duration` from `results.summary.json` (a Go duration
+string such as `10m21.085s`, so it needs parsing). TTFT/TPOT percentiles come
+straight out of `results.summary.json`.
 
-Run `rm -rf /root/.cache/atom/*` before each launch.
+```
+prompt  = delta(vllm:prompt_tokens_total)
+decode  = delta(vllm:generation_tokens_total)
+gpu_hit = delta(vllm:prompt_tokens_cached_total)
+cpu_hit = 0                                  # no host tier in this arm
+extend  = prompt - gpu_hit
 
-### 4.1 Prefill
-
-```bash
-cd /root
-rm -rf /root/.cache/atom/*
-
-MODEL=/path/to/MiniMax-M3-MXFP8
-
-export ATOM_M3_DENSE_ATTN_BACKEND=gluon
-export VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1
-export VLLM_USE_V2_MODEL_RUNNER=0
-export SAFETENSORS_FAST_GPU=1
-export NCCL_SOCKET_IFNAME=lo
-export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-export AITER_LOG_LEVEL=WARNING
-export PYTHONNOUSERSITE=1
-export VLLM_DO_NOT_TRACK=1
-
-vllm serve "$MODEL" \
-    --served-model-name minimax-m3-mxfp8 \
-    --host 0.0.0.0 --port 8000 \
-    --language-model-only \
-    --tensor-parallel-size 4 \
-    --no-trust-remote-code \
-    --block-size 128 \
-    --kv-cache-dtype fp8 \
-    --enable-prefix-caching \
-    --max-model-len 131072 \
-    --max-num-seqs 128 \
-    --max-num-batched-tokens 16384 \
-    --gpu-memory-utilization 0.90 \
-    --enforce-eager \
-    --no-async-scheduling \
-    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4, "text_config": {"use_index_cache": true, "index_topk_freq": 4}}' \
-    --compilation-config '{"cudagraph_mode":"NONE"}'
+GPU hit    = gpu_hit / prompt                # 92.39 %
+Total hit  = (gpu_hit + cpu_hit) / prompt    # same, 92.39 %
+TPM/GPU    = (prompt + decode) / duration * 60 / 4
+Extend TPM = extend / duration * 60
+Decode TPS = decode / duration
 ```
 
-### 4.2 Decode, with EAGLE3 speculative decoding
+The **engine-side** accept length, which is the only one worth quoting:
 
-Performance harness only — `DecodeBenchConnector` fabricates the KV cache and
-`rejection_sample_method: "synthetic"` fixes the acceptance rate. Use §5.1 for
-accuracy.
+```
+drafts   = delta(vllm:spec_decode_num_drafts_total)              #   180,318
+drafted  = delta(vllm:spec_decode_num_draft_tokens_total)        # 1,262,226
+accepted = delta(vllm:spec_decode_num_accepted_tokens_total)     #   540,954
 
-```bash
-cd /root
-rm -rf /root/.cache/atom/*
-
-MODEL=/path/to/MiniMax-M3-MXFP8
-DRAFT=/path/to/MiniMax-M3-EAGLE3-GQA
-
-export ATOM_M3_DENSE_ATTN_BACKEND=gluon
-export VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1
-export VLLM_USE_V2_MODEL_RUNNER=0
-export ATOM_M3_UNIFORM_BATCH_CAPTURE=1
-export SAFETENSORS_FAST_GPU=1
-export NCCL_SOCKET_IFNAME=lo
-export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-export AITER_LOG_LEVEL=WARNING
-export PYTHONNOUSERSITE=1
-export VLLM_DO_NOT_TRACK=1
-
-vllm serve "$MODEL" \
-    --served-model-name minimax-m3-mxfp8 \
-    --host 0.0.0.0 --port 8000 \
-    --language-model-only \
-    --tensor-parallel-size 4 \
-    --no-trust-remote-code \
-    --max-model-len 131072 \
-    --block-size 128 \
-    --kv-cache-dtype fp8 \
-    --gpu-memory-utilization 0.85 \
-    --max-num-seqs 88 \
-    --max-num-batched-tokens 2048 \
-    --no-enable-prefix-caching \
-    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4, "text_config": {"use_index_cache": true, "index_topk_freq": 4}}' \
-    --kv-transfer-config '{"kv_connector":"DecodeBenchConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_buffer_device":"cuda","kv_connector_extra_config":{"fill_mean":0.015,"fill_std":0.0}}' \
-    --speculative-config '{"method":"eagle3","model":"'"$DRAFT"'","num_speculative_tokens":3,"draft_tensor_parallel_size":1,"attention_backend":"ROCM_AITER_FA","rejection_sample_method":"synthetic","synthetic_acceptance_rates":[0.7,0.5,0.4]}' \
-    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":512}'
+drafted / drafts     = 7.000000    # == num_speculative_tokens
+accepted / drafted   = 0.428571    # == 3/7
+1 + accepted/drafts  = 4.000000    # == synthetic_acceptance_length, incl. bonus
 ```
 
-### 3.3 Decode, with serial MTP speculative decoding
+### 3.4 Validity checks
 
-M3 declares `num_mtp_modules: 7`, but **no released M3 checkpoint ships MTP
-weights** — the MXFP4 index has 45,475 keys and zero `*mtp*` matches, the bf16
-one 23,416 keys and likewise zero. The MTP head can still be exercised with
-randomly initialized draft weights: spec decode verifies every draft token
-against the target, so a random draft costs acceptance rate, not correctness.
-This is a plumbing harness — with acceptance near 0 it demonstrates neither
-accuracy nor speedup. §3.4 forces the acceptance rate to recover the second
-of those.
+Reject the run unless all of these hold:
 
-Pass no draft path — `--speculative-config '{"method":"mtp",...,
-"draft_load_config":{"load_format":"dummy"}}'` is the whole invocation. ATOM
-generates the draft config for you (`atom/plugin/vllm/m3_mtp_draft_patch.py`).
-
-`draft_load_config` scopes dummy init to the draft alone: `get_model()` takes
-`load_config or vllm_config.load_config`, and the proposer passes
-`speculative_config.draft_load_config` only for the draft head, so the target
-keeps loading its real quantized weights under the global `--load-format auto`.
-
-But `load_format` governs *how* parameters are filled, not *where the config
-describing them comes from*. With no `"model"`, vLLM's
-`SpeculativeConfig.__post_init__` defaults the draft to the target checkpoint
-**and copies its quantization** — and dummy init cannot write fp4: `copy_()` has
-no Half→fp4 cast, so it dies with `copy_() does not support casting
-Float4_e2m1fn_x2 to different types`. The ATOM patch closes that gap by deriving
-an unquantized bf16 draft config from the target, caching it under
-`~/.cache/atom/m3_mtp_draft/<digest>/` (`config.json` plus the remote-code
-config module — no safetensors), and filling in `"model"` before vLLM's
-defaulting runs. It keeps 4 backbone layers, since
-`MiniMaxM3MultiTokenPredictor` keys its MTP layer at `num_hidden_layers` and
-instantiates only `num_nextn_predict_layers` of them, and leaves
-`num_local_experts` at the target's value so the drafting cost matches a real
-MTP head. Passing `"model"` explicitly still works and disables the patch.
-
-```bash
-cd /root
-rm -rf /root/.cache/atom/*
-
-MODEL=/path/to/MiniMax-M3-MXFP8
-
-export ATOM_FORCE_ATTN_TRITON=1
-export VLLM_USE_V2_MODEL_RUNNER=0
-export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-export AITER_LOG_LEVEL=WARNING
-# Mandatory at TP>1: platforms/rocm.py imports amdsmi inside a try/except that
-# only warns, but CustomAllreduce.__init__ calls amdsmi_init() unconditionally,
-# so a missing amdsmi turns into `NameError: name 'amdsmi_init' is not defined`
-# on every worker. The bindings ship with ROCm, just not on sys.path.
-export PYTHONPATH=/opt/rocm-7.2.4/share/amd_smi${PYTHONPATH:+:$PYTHONPATH}
-
-vllm serve "$MODEL" \
-    --served-model-name m3-mtp \
-    --host 0.0.0.0 --port 8000 \
-    --tensor-parallel-size 4 \
-    --trust-remote-code \
-    --block-size 128 \
-    --max-model-len 4096 \
-    --max-num-batched-tokens 4096 \
-    --max-num-seqs 8 \
-    --no-enable-prefix-caching \
-    --gpu-memory-utilization 0.85 \
-    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4, "text_config": {"use_index_cache": true, "index_topk_freq": 4}}' \
-    --speculative-config '{"method":"mtp","num_speculative_tokens":7,"draft_load_config":{"load_format":"dummy"}}'
-```
-
-`num_speculative_tokens` may go up to the draft config's `num_mtp_modules`
-(7 for M3); ATOM derives the bound from that field.
-
-Expected: `/metrics` shows `spec_decode_num_draft_tokens_total` =
-7 × `spec_decode_num_drafts_total`, all seven `num_accepted_tokens_per_pos`
-buckets present and at 0, and mean acceptance length 1.00.
-
-Do not use this configuration to compare output text against a no-spec server:
-under these flags the target is not self-consistent at `temperature=0` (the same
-prompt yields different continuations across requests), so a text mismatch here
-says nothing about spec decode.
-
-### 3.4 Decode, with MTP and a forced acceptance rate
-
-§3.3 measures the cost of drafting but never the benefit, because a random draft
-head is rejected almost every time. `rejection_sample_method: "synthetic"`
-replaces the probability-ratio test with a fixed schedule, so the accepted length
-becomes a knob: the server then answers "what would MTP-7 be worth at acceptance
-rate X", which is the number worth having before real MTP weights exist.
-
-Use vLLM's spelling, inside `--speculative-config`. ATOM's own
-`--spec-decode-acceptance-rate` / `--spec-decode-acceptance-length` belong to its
-native engine and do not exist in plugin mode; the plugin patches only the
-proposer side, leaving `RejectionSampler` stock, and it reads these three fields
-straight off the speculative config.
-
-Take §3.3's block and extend the last line:
-
-```bash
-    --speculative-config '{"method":"mtp","num_speculative_tokens":7,"draft_load_config":{"load_format":"dummy"},"rejection_sample_method":"synthetic","synthetic_acceptance_rates":[0.95,0.85,0.75,0.65,0.50,0.35,0.15]}'
-```
-
-`synthetic_acceptance_rates` are *unconditional* — entry i is the marginal
-probability that the first i+1 draft tokens are **all** accepted, not that token
-i survives given its predecessors did. Hence the validation in
-`SpeculativeConfig._resolve_synthetic_acceptance_rates`: length exactly
-`num_speculative_tokens`, entries in [0, 1], monotonically non-increasing. Mean
-accepted length is `1 + sum(rates)`, so the list above targets 5.2 of 8.
-
-To name that mean directly instead, swap the list for
-`"synthetic_acceptance_length": 4.0` (the two are mutually exclusive). Note it
-resolves to the *minimum-variance* schedule, not a smooth decay — at depth 7,
-4.0 becomes `[1,1,1,0,0,0,0]`, i.e. deterministically 3 accepted tokens every
-step. Pass explicit rates when the distribution matters.
-
-This still applies at `temperature=0`: `rejection_sampler.py` gates on
-`synthetic_mode or not sampling_metadata.all_greedy`, so the greedy fast path
-does not bypass it.
-
-The `/metrics` acceptance counters now report the schedule you asked for rather
-than anything the draft head earned, and accepted tokens are no longer the
-target's tokens. Read TPOT and mean acceptance length from this server; read
-nothing else.
+| Check | Expected |
+|---|---|
+| `results.summary.json` has `duration` | yes |
+| `requests_success == requests_total` | 1479 / 1479 in the reference run |
+| `/v1/models` still answers after the run | yes |
+| `delta(vllm:prefix_cache_hits_total) / delta(vllm:prefix_cache_queries_total)` | 0.923927 — equals the token-granularity hit rate (block vs token cross-check) |
+| `delta(vllm:num_preemptions_total)` | **0** |
+| `1 + accepted/drafts` | **4.000000**, i.e. exactly `synthetic_acceptance_length` |
+| Other traffic on the endpoint during the window | none |
 
 ---
 
-## 5. Accuracy validation
+## 4. Accuracy validation
 
-### 5.1 Server (no speculative decoding)
+### 4.1 Server (no speculative decoding)
 
 ```bash
 cd /root
 rm -rf /root/.cache/atom/*
 
 MODEL=/path/to/MiniMax-M3-MXFP8
-
+ 
 export ATOM_M3_DENSE_ATTN_BACKEND=gluon
 export VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1
 export VLLM_USE_V2_MODEL_RUNNER=0
-export ATOM_M3_UNIFORM_BATCH_CAPTURE=1
 export SAFETENSORS_FAST_GPU=1
 export NCCL_SOCKET_IFNAME=lo
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_LOG_LEVEL=WARNING
 export PYTHONNOUSERSITE=1
 export VLLM_DO_NOT_TRACK=1
-
+export HF_HUB_OFFLINE=1
+export ATOM_FORCE_ATTN_TRITON=1
+ 
 vllm serve "$MODEL" \
-    --served-model-name minimax-m3 \
-    --host 0.0.0.0 --port 8902 \
+    --served-model-name minimax-m3-mxfp8 \
+    --host 0.0.0.0 --port 8015 \
     --language-model-only \
     --tensor-parallel-size 4 \
     --no-trust-remote-code \
-    --max-model-len 131072 \
+    --max-model-len 1000000 \
     --block-size 128 \
     --kv-cache-dtype fp8 \
-    --gpu-memory-utilization 0.85 \
-    --max-num-seqs 88 \
-    --max-num-batched-tokens 8192 \
+    --gpu-memory-utilization 0.90 \
+    --max-num-seqs 80 \
+    --max-num-batched-tokens 32768 \
     --enable-prefix-caching \
     --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4, "text_config": {"use_index_cache": true, "index_topk_freq": 4}}' \
-    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":512}'
+    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":80}' \
 ```
 
-### 5.2 gsm8k (5-shot)
+There is no speculative decoding here, so the index-sharing-off variant used for
+the second score in §5.2/§5.3 simply drops the `--hf-overrides` line entirely.
+
+### 5.2 gsm8k (20-shot)
 
 ```bash
-HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HOME=/path/to/hf_cache \
-lm_eval \
-  --model local-chat-completions \
-  --model_args "model=minimax-m3,base_url=http://localhost:8902/v1/chat/completions,num_concurrent=32,max_gen_toks=2048,max_retries=3" \
-  --tasks gsm8k --num_fewshot 5 --batch_size 65 \
-  --apply_chat_template --fewshot_as_multiturn \
-  --output_path ./eval_out/gsm8k
+python3 -m lm_eval --model local-chat-completions --apply_chat_template --tasks gsm8k --output_path ./eval_out-tta1J8 --log_samples --num_fewshot 20 --model_args 'model=minimax-m3-mxfp8,base_url=http://0.0.0.0:8015/v1/chat/completions,api_key=EMPTY,eos_string=</s>,max_retries=5,num_concurrent=64,timeout=1800,tokenized_requests=False,max_length=1048576' --gen_kwargs max_tokens=16384,temperature=0,top_p=1
 ```
-
+Result with index_cache:
+```bash
+local-chat-completions ({'model': 'minimax-m3-mxfp8', 'base_url': 'http://0.0.0.0:8015/v1/chat/completions', 'api_key': 'EMPTY', 'eos_string': '</s>', 'max_retries': 5, 'num_concurrent': 64, 'timeout': 1800, 'tokenized_requests': False, 'max_length': 1048576}), gen_kwargs: ({'max_tokens': 16384, 'temperature': 0, 'top_p': 1}), limit: None, num_fewshot: 20, batch_size: 1
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|    20|exact_match|↑  |0.9500|±  | 0.006|
+|     |       |strict-match    |    20|exact_match|↑  |0.9507|±  | 0.006|
+```
+Result without index_cache:
+```bash
+local-chat-completions ({'model': 'minimax-m3-mxfp8', 'base_url': 'http://0.0.0.0:8015/v1/chat/completions', 'api_key': 'EMPTY', 'eos_string': '</s>', 'max_retries': 5, 'num_concurrent': 64, 'timeout': 1800, 'tokenized_requests': False, 'max_length': 1048576}), gen_kwargs: ({'max_tokens': 16384, 'temperature': 0, 'top_p': 1}), limit: None, num_fewshot: 20, batch_size: 1
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|    20|exact_match|↑  |0.9454|±  |0.0063|
+|     |       |strict-match    |    20|exact_match|↑  |0.9462|±  |0.0062|
+```
 
 ### 5.3 AIME25 (`pass_avg,all` @16 + non-stop, evalscope)
 
@@ -550,3 +448,9 @@ for line in open(pf):
 print(f"non-stop = {ns}/{tot} = {ns/tot:.4%}   (floor < 0.5%)")
 PY
 ```
+
+Result:
+| 组合 | KV dtype | index-cache | sparse topk | pass_avg | non-stop |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| fp8 kv cache, index-cache off | fp8 | OFF | 16 | 0.900 | 10.0% |
+| fp8 kv cache, index-cache on | fp8 | ON | 16 | ~0.848 | ~9.4% |
