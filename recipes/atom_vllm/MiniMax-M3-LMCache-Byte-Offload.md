@@ -323,6 +323,40 @@ prompt sent twice to the *baseline* server, hitting only vLLM's own GPU prefix
 cache, already returns a different (still correct) continuation. Judge a replay
 on whether it stays coherent and recalls the content, and on aggregate accuracy.
 
+### Two-pass check: does the *load* path itself change answers
+
+The five runs above compare cold against replay, which is a weak test of the
+load path -- a first pass only ever SAVEs. To force every prefix through the
+offload tier, prefix each gsm8k question with a unique salt so no two prompts
+share a prefix and the working set blows past the HBM pool, then replay the
+identical prompts. Accuracy is the pass1 -> pass2 delta. The noise band must
+come from the same two passes with the connector **off**, not from a per-run
+stderr.
+
+```bash
+python3 tests/plugin/m3_twopass_accuracy.py --port 8902 --n 1319 --shots 5 --conc 32 --salt on_r1
+python3 tests/plugin/m3_twopass_accuracy.py --port 8903 --n 1319 --shots 5 --conc 32 --salt off_r1
+```
+
+5-shot is enough on M3 (chunk 128, `OFFLOAD_MIN_LOAD_TOKENS=256`). Use a
+distinct salt per run so runs cannot contaminate each other.
+
+| run | arm | pass1 | pass2 | delta | pass2 external hits |
+|---|---|---|---|---|---|
+| on_r1  | offload    | 0.8074 | 0.8059 | **-0.0015** | 844,672 |
+| on_r2  | offload    | 0.8180 | 0.8158 | **-0.0023** | 844,672 |
+| off_r1 | no offload | 0.8165 | 0.8302 | **+0.0136** | 0 |
+| off_r2 | no offload | 0.8241 | 0.8218 | **-0.0023** | 0 |
+
+Both offload deltas sit inside the no-offload arm's own delta range
+[-0.0023, +0.0136] (spread **0.0159**), and the four pass1 scores -- identical
+no-load work in both arms -- span **0.0167**. The offload arm reloads 844,672
+tokens per pass and moves accuracy by less than the baseline moves itself while
+reloading nothing: the delta does not scale with reload volume.
+
+The salted scores (~0.81) are lower than the 5-shot scores above because the
+salt header perturbs the prompt; only the within-run delta is meaningful.
+
 The codec self-check needs a GPU but no server:
 
 ```bash
