@@ -1097,6 +1097,7 @@ class SpeculativeConfig:
         "deepseek_v4_mtp": ("num_nextn_predict_layers", "DeepseekV4MTPModel"),
         "qwen3_next_mtp": ("num_nextn_predict_layers", "Qwen3NextMTPModel"),
         "qwen3_5_mtp": ("mtp_num_hidden_layers", "Qwen3_5MTPModel"),
+        "minimax_m3_mtp": ("num_nextn_predict_layers", "MiniMaxM3MTPModel"),
     }
 
     def use_dspark(self) -> bool:
@@ -1250,6 +1251,26 @@ class SpeculativeConfig:
             )
             _normalize_moe_config_fields(hf_config, model_path)
             return
+
+        # MiniMax-M3 detection (before the _MTP_TYPE_MAP lookup). This cannot be
+        # a plain _MTP_TYPE_MAP entry, for two reasons:
+        #   * There is no model_type to key on. __post_init__ has already
+        #     unwrapped text_config by the time we get here, and the shipped
+        #     MiniMax-M3-MXFP4 config.json gives its text_config no model_type
+        #     at all -- it deserializes to "". Only the outer config carries
+        #     model_type="minimax_m3_vl", and that one is gone.
+        #   * The one spelling that does appear ("minimax_m2", used for M3's
+        #     text backbone in some revisions -- see sglang's
+        #     configs/minimax_vl.py) is also a genuine MiniMax-M2's model_type,
+        #     so keying on it would capture a real M2 draft.
+        # So match on the architecture, which the text_config does carry
+        # (MiniMaxM3SparseForCausalLM), and require the lightning-indexer block
+        # that M3 ships and M2 does not.
+        if (
+            arch.startswith("MiniMaxM3")
+            or str(hf_config.model_type).startswith("minimax_m3")
+        ) and getattr(hf_config, "sparse_attention_config", None):
+            hf_config.model_type = "minimax_m3_mtp"
 
         # Step 1: resolve model_type → mtp model_type
         mtp_type = SpeculativeConfig._MTP_TYPE_MAP.get(hf_config.model_type)
@@ -1928,8 +1949,13 @@ class Config:
             draft_cfg = self.speculative_config.draft_model_hf_config
             if not is_dspark:
                 # Sequential drafters (MTP / Eagle): one drafted token per
-                # backbone pass, so the horizon is a small fixed depth.
-                max_spec = 4
+                # backbone pass, so the horizon is a small fixed depth. A
+                # checkpoint that ships several MTP modules states the depth it
+                # was trained for (MiniMax-M3: num_mtp_modules=7) and the
+                # predictor reuses its instantiated layers modulo that count, so
+                # honour it. Most MTP checkpoints declare nothing, hence the
+                # floor -- which keeps every existing model at the old bound.
+                max_spec = max(4, int(getattr(draft_cfg, "num_mtp_modules", 0) or 0))
             else:
                 # DSpark is a PARALLEL block drafter: all flavors
                 # (inline V4, standalone K3 / Qwen3 / ...) share this path with

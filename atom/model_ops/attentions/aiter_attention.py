@@ -43,6 +43,42 @@ def _is_indexed_sparse_attention(module) -> bool:
     return bool(getattr(impl, "is_indexed_sparse_attention", False))
 
 
+def _num_sparse_index_cache_slices(sparse_cfg: dict, runner) -> int:
+    """Index-cache slices to reserve for a MiniMax-M3-style sparse model.
+
+    One slice per target sparse layer (``sparse_attention_freq`` flags), plus one
+    per MTP draft layer: the draft block is built with
+    ``is_sparse_attention_layer=True`` unconditionally, but it lives past the end
+    of ``sparse_attention_freq`` so it has no flag of its own. Without the extra
+    slices ``build_kv_cache_tensor`` would index the index-cache out of range when
+    it reaches the draft layer.
+
+    Kept in one place because ``sub_pool_specs`` (sizing) and
+    ``allocate_kv_cache_tensors`` (allocation) must agree — the pool-vs-allocation
+    cross-check in model_runner tolerates only a 3% mismatch.
+
+    The draft count is derived from ``_get_total_num_layers()`` rather than from
+    the ``num_draft_layers`` argument ModelRunner passes to
+    ``allocate_kv_cache_tensors``, for the same reason
+    ``KimiMLAGDNMetadataBuilder._num_cache_rows`` does: those two spellings
+    disagree whenever an ``eagle3_draft_builder`` exists. ModelRunner sets
+    ``num_draft_layers = _num_draft_kv_layers()`` unconditionally, while
+    ``_get_total_num_layers()`` deliberately omits draft layers that own a
+    sibling pool. Reading the latter in both places excludes such a draft from
+    sizing and allocation at once, so the two can never diverge.
+    """
+    sparse_layers = sum(
+        1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
+    )
+    # max(0, ...): under pipeline parallelism _get_total_num_layers() returns
+    # this rank's LOCAL slice, which is smaller than the model-wide
+    # num_hidden_layers, so the difference goes negative on every rank.
+    num_draft_layers = max(
+        0, runner._get_total_num_layers() - runner.config.hf_config.num_hidden_layers
+    )
+    return sparse_layers + num_draft_layers
+
+
 def _resolve_index_cache_dtype(config) -> torch.dtype:
     from aiter import dtypes
 
@@ -488,9 +524,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
         sparse_cfg = getattr(text_config, "sparse_attention_config", None)
         if sparse_cfg:
-            sparse_layers = sum(
-                1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
-            )
+            sparse_layers = _num_sparse_index_cache_slices(sparse_cfg, runner)
             index_dim = sparse_cfg["sparse_index_dim"]
             index_cache_dtype = _resolve_index_cache_dtype(config)
             block_bytes += (
@@ -551,9 +585,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         }
         sparse_cfg = getattr(text_config, "sparse_attention_config", None)
         if sparse_cfg:
-            sparse_layers = sum(
-                1 for enabled in sparse_cfg.get("sparse_attention_freq", []) if enabled
-            )
+            sparse_layers = _num_sparse_index_cache_slices(sparse_cfg, runner)
             index_cache_dtype = _resolve_index_cache_dtype(config)
             tensors["sparse_attention_index_cache"] = torch.zeros(
                 sparse_layers,
