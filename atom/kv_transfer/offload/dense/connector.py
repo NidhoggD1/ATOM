@@ -241,12 +241,26 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         lmc = int(ls.lmcache_cached_tokens)
         toks = req.token_ids[:lmc]
         t_total0 = time.perf_counter()
+        # Whether the slow tier earned its keep on this request, from the same
+        # two numbers the branches below already turn on. Recorded before them
+        # so a request the tier could not serve still counts against it -- the
+        # save side needs the failures, not just the wins.
+        # getattr, not attribute access: this now runs before the early
+        # returns that used to guard it, and a worker can reach the load
+        # path before chunk_size is wired up.
+        chunk_size = int(getattr(self, "chunk_size", None) or 256)
+        if lmc <= hbm:
+            payoff_reason = "hbm_satisfies_after_alloc"
+        elif hbm % chunk_size != 0:
+            payoff_reason = "unaligned_hbm_prefill"
+        else:
+            payoff_reason = "aligned_large_hit"
+        self.save_admission().record_load_decision(payoff_reason)
         if lmc <= hbm:
             self._lookup_unpin(req.req_id)
             with self._lock:
                 self._done_load.add(self._load_completion_id(req))
             return
-        chunk_size = int(self.chunk_size or 256)
         if hbm % chunk_size != 0:
             logger.warning(
                 "LMCache offload: HBM prefix is not chunk-aligned req=%s "
@@ -325,6 +339,18 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         skip = (ss.skip_leading_tokens // self.chunk_size) * self.chunk_size
         if skip >= len(toks):
             self._record_store_terminal(req, True)
+            return
+
+        if not self.save_admission().admit_save():
+            # Declining to save is a normal outcome, not a failure: the request
+            # keeps its KV in HBM either way, and the completion contract is the
+            # one the empty-payload case above already satisfies. Only the dense
+            # family gates here -- DSV4's save owns PAGE/SLOT sidecar and
+            # snapshot cleanup whose contract this cannot be validated against
+            # on M3 hardware, so that path measures the payoff but never acts
+            # on it.
+            with self._lock:
+                self._done_save.add(self._save_completion_id(req))
             return
 
         t_total0 = time.perf_counter()

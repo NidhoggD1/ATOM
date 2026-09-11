@@ -1189,9 +1189,23 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         lmc = int(ls.lmcache_cached_tokens)
         toks = req.token_ids[:lmc]
         t_total0 = time.perf_counter()
+        # Whether the slow tier earned its keep on this request, from the same
+        # two numbers the branches below already turn on. Recorded before them
+        # so a request the tier could not serve still counts against it -- the
+        # save side needs the failures, not just the wins.
+        # getattr, not attribute access: this now runs before the early
+        # returns that used to guard it, and a worker can reach the load
+        # path before chunk_size is wired up.
+        chunk_size = int(getattr(self, "chunk_size", None) or 256)
+        if lmc <= hbm:
+            payoff_reason = "hbm_satisfies_after_alloc"
+        elif hbm % chunk_size != 0:
+            payoff_reason = "unaligned_hbm_prefill"
+        else:
+            payoff_reason = "aligned_large_hit"
+        self.save_admission().record_load_decision(payoff_reason)
         if lmc <= hbm:
             return True
-        chunk_size = int(self.chunk_size or 256)
         if hbm % chunk_size != 0:
             logger.warning(
                 "LMCache offload: HBM prefix is not chunk-aligned req=%s "

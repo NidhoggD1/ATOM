@@ -58,6 +58,151 @@ def tokens_to_tensor(tokens: list[int]) -> torch.Tensor:
     return torch.from_numpy(np.asarray(tokens, dtype=np.int64))
 
 
+def _env_float(name: str, default: float, lo: float, hi: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return min(hi, max(lo, float(raw)))
+    except ValueError:
+        logger.warning(
+            "LMCache offload: %s=%r is not a number; using %s", name, raw, default
+        )
+        return default
+
+
+# Outcome names produced by ``_decide_load_after_alloc``. Only the first means
+# the slow tier beat what vLLM's own HBM prefix cache already held.
+_LOAD_PAID_OFF = "aligned_large_hit"
+
+
+_ADMISSION_INIT_LOCK = threading.Lock()
+
+
+class SlowTierAdmission:
+    """Whether a request's KV is worth the cost of pushing it to the slow tier.
+
+    Saving is unconditional today, which is only right when the slow tier has
+    customers. It does not always have them. With a KV pool big enough to hold
+    the working set, vLLM's own HBM prefix cache answers nearly everything, the
+    slow tier returns almost nothing -- 0.03% of the tokens queried, on M3 at
+    46647 blocks -- and the full save tax buys that. The same build at 16612
+    blocks gains 21.7%. The difference is not the implementation; it is whether
+    anyone ever reads what was written.
+
+    The load path already reaches that verdict per request and names it:
+    ``aligned_large_hit`` when the slow tier contributed, and
+    ``hbm_satisfies_after_alloc`` / ``unaligned_hbm_prefill`` / ``too_small``
+    when it did not. Feeding that verdict back to the save side is the whole
+    policy; nothing new has to be measured.
+
+    The loop is circular -- saving less can only lower the observed payoff --
+    so a floor keeps a fixed share of traffic flowing to the tier however low
+    the estimate falls. That floor is the parameter that matters: it bounds the
+    worst-case tax still paid, and it keeps enough content in the tier for a
+    workload that starts cold and later develops reuse to climb back to saving
+    everything. Admission is a heuristic over a workload property, so it is off
+    unless asked for.
+    """
+
+    __slots__ = (
+        "_alpha",
+        "_credit",
+        "_enabled",
+        "_floor",
+        "_lock",
+        "_payoff",
+        "_probes",
+        "_reasons",
+        "_report_every",
+        "_saved",
+        "_skipped",
+        "_target",
+        "_warmup",
+    )
+
+    def __init__(self) -> None:
+        self._enabled = os.environ.get("OFFLOAD_SAVE_ADMISSION", "0").lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        # Payoff at which every request is worth saving. Below it, admission
+        # falls off linearly to the floor.
+        self._target = _env_float("OFFLOAD_ADMISSION_TARGET", 0.10, 0.0, 1.0)
+        self._floor = _env_float("OFFLOAD_ADMISSION_FLOOR", 0.25, 0.0, 1.0)
+        self._alpha = _env_float("OFFLOAD_ADMISSION_ALPHA", 1.0 / 64.0, 1e-4, 1.0)
+        # Save everything until the payoff estimate is built from real traffic.
+        # A cold tier necessarily reports zero payoff, and throttling on that
+        # would be throttling on the absence of evidence.
+        self._warmup = int(_env_float("OFFLOAD_ADMISSION_WARMUP", 128, 0, 1e6))
+        self._payoff = 1.0
+        self._probes = 0
+        self._credit = 0.0
+        self._saved = 0
+        self._skipped = 0
+        self._reasons: dict[str, int] = {}
+        self._report_every = max(
+            1, int(_env_float("OFFLOAD_ADMISSION_REPORT_EVERY", 256, 1, 1e6))
+        )
+        self._lock = threading.Lock()
+
+    def record_load_decision(self, reason: str) -> None:
+        """Fold one load verdict into the payoff estimate."""
+        paid_off = 1.0 if reason == _LOAD_PAID_OFF else 0.0
+        report = None
+        with self._lock:
+            self._probes += 1
+            self._reasons[reason] = self._reasons.get(reason, 0) + 1
+            self._payoff += self._alpha * (paid_off - self._payoff)
+            if self._probes % self._report_every == 0:
+                report = self._stats_locked()
+        if report is not None:
+            # INFO because this is the only place the slow tier's payoff is
+            # visible, and it is one line per few hundred requests -- well under
+            # the LMCache Stored/Retrieved records already on this path.
+            logger.info("[OFFLOAD-ADMISSION] %s", report)
+
+    def admit_save(self) -> bool:
+        """Whether to hand this request to the slow tier.
+
+        Deterministic rather than random: a credit accumulator admits exactly
+        the intended fraction, which keeps a short benchmark window from
+        sampling a different rate than a long one.
+        """
+        with self._lock:
+            if not self._enabled or self._probes < self._warmup:
+                self._saved += 1
+                return True
+            share = 1.0 if self._target <= 0 else self._payoff / self._target
+            share = min(1.0, max(self._floor, share))
+            self._credit += share
+            if self._credit >= 1.0:
+                self._credit -= 1.0
+                self._saved += 1
+                return True
+            self._skipped += 1
+            return False
+
+    def stats(self) -> dict:
+        with self._lock:
+            return self._stats_locked()
+
+    def _stats_locked(self) -> dict:
+        """Snapshot the counters. The caller already holds the lock."""
+        total = self._saved + self._skipped
+        return {
+            "enabled": self._enabled,
+            "probes": self._probes,
+            "payoff": round(self._payoff, 5),
+            "saved": self._saved,
+            "skipped": self._skipped,
+            "save_share": round(self._saved / total, 4) if total else 1.0,
+            "reasons": dict(self._reasons),
+        }
+
+
 def validated_kv_role(kvc: dict) -> str:
     role = kvc.get("kv_role", "offload")
     if role not in _VALID_KV_ROLES:
@@ -135,6 +280,28 @@ class OffloadWorkerMixin:
     """
 
     is_producer = False
+
+    def save_admission(self) -> SlowTierAdmission:
+        """This worker's admission state, created on first use.
+
+        It lives on the worker rather than the scheduler because the two run in
+        different processes: the scheduler reaches its own load verdict in the
+        EngineCore process, while the save this feeds happens here. The worker
+        sees the same two numbers the verdict is made from, so the loop closes
+        locally. Loads and saves run on separate executors, so the first-use
+        race is real. The guard is a module lock rather than the connector's
+        own ``_lock``, so this stays callable on a partially built connector --
+        the load path reaches it before some families finish wiring themselves
+        up, and a missing ``_lock`` there would surface as a load failure.
+        """
+        admission = getattr(self, "_admission", None)
+        if admission is None:
+            with _ADMISSION_INIT_LOCK:
+                admission = getattr(self, "_admission", None)
+                if admission is None:
+                    admission = SlowTierAdmission()
+                    self._admission = admission
+        return admission
 
     def _init_worker_common(
         self,
