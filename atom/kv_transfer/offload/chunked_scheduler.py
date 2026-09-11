@@ -331,6 +331,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             should_load, reason, hbm, lmc, need, chunk = self._decide_load_after_alloc(
                 seq, ls
             )
+            meta.slow_tier_probes += 1
+            meta.slow_tier_paid_off += int(should_load)
             if not should_load:
                 self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
                 self._clear_pending_load(sid)

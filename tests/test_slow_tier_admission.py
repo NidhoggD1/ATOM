@@ -152,3 +152,64 @@ def test_a_bad_env_value_falls_back_instead_of_crashing(admission):
     _feed(policy, WASTED, 100)
     admitted = _admitted(policy, 400)
     assert admitted == pytest.approx(100, abs=1)  # the 0.25 default floor
+
+
+def test_batching_converges_to_the_reported_rate(admission):
+    """A step's verdicts are folded as a uniform rate, not replayed in order.
+
+    EWMA is order-sensitive, and the order of a handful of verdicts inside one
+    engine step is arbitrary, so the closed form deliberately does not
+    reproduce a particular interleaving. What has to hold is that the estimate
+    still converges on the rate the scheduler is reporting, whatever the step
+    boundaries happen to be.
+    """
+    steady = admission(warmup=0, alpha=0.05)
+    for _ in range(200):
+        steady.record_load_batch(3, 20)  # 15%, twenty verdicts per step
+    assert steady.stats()["payoff"] == pytest.approx(0.15, abs=0.01)
+    assert steady.stats()["probes"] == 4000
+
+    # Same rate, different step sizes: the estimate must land in the same place.
+    lumpy = admission(warmup=0, alpha=0.05)
+    for _ in range(40):
+        lumpy.record_load_batch(15, 100)
+    assert lumpy.stats()["payoff"] == pytest.approx(0.15, abs=0.01)
+
+
+def test_the_estimate_starts_optimistic(admission):
+    """Nothing has been observed yet, so the tier gets the benefit of the doubt.
+
+    Starting at zero would throttle a cold cache on its first step, before it
+    has had any chance to be read.
+    """
+    assert admission(warmup=0).stats()["payoff"] == pytest.approx(1.0)
+
+
+def test_batch_of_unused_verdicts_reaches_the_floor(admission):
+    policy = admission(warmup=10, floor=0.25, alpha=0.5)
+    policy.record_load_batch(0, 400)
+    assert _admitted(policy, 400) == pytest.approx(100, abs=1)
+
+
+def test_batch_counts_both_outcomes(admission):
+    policy = admission(warmup=0)
+    policy.record_load_batch(2, 10)
+    reasons = policy.stats()["reasons"]
+    assert reasons[PAID_OFF] == 2
+    assert reasons["slow_tier_unused"] == 8
+
+
+def test_an_empty_step_changes_nothing(admission):
+    policy = admission(warmup=0, alpha=0.5)
+    policy.record_load_batch(0, 400)
+    before = policy.stats()["payoff"]
+    policy.record_load_batch(0, 0)
+    assert policy.stats()["payoff"] == before
+    assert policy.stats()["probes"] == 400
+
+
+def test_a_batch_cannot_claim_more_wins_than_verdicts(admission):
+    policy = admission(warmup=0, alpha=1.0)
+    policy.record_load_batch(99, 10)
+    assert policy.stats()["reasons"][PAID_OFF] == 10
+    assert policy.stats()["payoff"] == pytest.approx(1.0)

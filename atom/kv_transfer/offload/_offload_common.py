@@ -164,6 +164,34 @@ class SlowTierAdmission:
             # the LMCache Stored/Retrieved records already on this path.
             logger.info("[OFFLOAD-ADMISSION] %s", report)
 
+    def record_load_batch(self, paid_off: int, total: int) -> None:
+        """Fold one step's worth of scheduler verdicts into the estimate.
+
+        The scheduler tallies rather than naming each request, because only the
+        ratio matters and a count costs nothing to carry across the process
+        boundary.
+        """
+        if total <= 0:
+            return
+        paid_off = max(0, min(paid_off, total))
+        report = None
+        with self._lock:
+            self._probes += total
+            self._reasons[_LOAD_PAID_OFF] = (
+                self._reasons.get(_LOAD_PAID_OFF, 0) + paid_off
+            )
+            self._reasons["slow_tier_unused"] = self._reasons.get(
+                "slow_tier_unused", 0
+            ) + (total - paid_off)
+            # One decay per verdict, folded in closed form so a busy step costs
+            # the same as a quiet one.
+            keep = (1.0 - self._alpha) ** total
+            self._payoff = self._payoff * keep + (paid_off / total) * (1.0 - keep)
+            if self._probes % self._report_every < total:
+                report = self._stats_locked()
+        if report is not None:
+            logger.info("[OFFLOAD-ADMISSION] %s", report)
+
     def admit_save(self) -> bool:
         """Whether to hand this request to the slow tier.
 

@@ -630,6 +630,11 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     def start_load_kv(self, metadata) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):
             return
+        probes = getattr(metadata, "slow_tier_probes", 0)
+        if probes:
+            self.save_admission().record_load_batch(
+                getattr(metadata, "slow_tier_paid_off", 0), probes
+            )
         load_requests = [
             req
             for req in metadata.requests
@@ -1189,23 +1194,9 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         lmc = int(ls.lmcache_cached_tokens)
         toks = req.token_ids[:lmc]
         t_total0 = time.perf_counter()
-        # Whether the slow tier earned its keep on this request, from the same
-        # two numbers the branches below already turn on. Recorded before them
-        # so a request the tier could not serve still counts against it -- the
-        # save side needs the failures, not just the wins.
-        # getattr, not attribute access: this now runs before the early
-        # returns that used to guard it, and a worker can reach the load
-        # path before chunk_size is wired up.
-        chunk_size = int(getattr(self, "chunk_size", None) or 256)
-        if lmc <= hbm:
-            payoff_reason = "hbm_satisfies_after_alloc"
-        elif hbm % chunk_size != 0:
-            payoff_reason = "unaligned_hbm_prefill"
-        else:
-            payoff_reason = "aligned_large_hit"
-        self.save_admission().record_load_decision(payoff_reason)
         if lmc <= hbm:
             return True
+        chunk_size = int(self.chunk_size or 256)
         if hbm % chunk_size != 0:
             logger.warning(
                 "LMCache offload: HBM prefix is not chunk-aligned req=%s "
@@ -2321,6 +2312,8 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             should_load, reason, hbm, lmc, need, chunk = self._decide_load_after_alloc(
                 seq, ls
             )
+            meta.slow_tier_probes += 1
+            meta.slow_tier_paid_off += int(should_load)
             if not should_load:
                 self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
                 self._clear_pending_load(sid)

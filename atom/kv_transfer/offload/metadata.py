@@ -189,6 +189,15 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         # generation) is what the source-release and index reports carry back to
         # settle the pin and index the hash.
         self.state_stores: list[tuple] = []
+        # The scheduler's verdicts on whether the slow tier beat HBM, tallied
+        # over this step. They have to travel: the verdict is reached in the
+        # EngineCore process, a declined load never becomes a worker task, and
+        # the save that would act on it runs in the worker. Measuring on the
+        # worker alone samples only the loads that survived -- a payoff near 1
+        # exactly when the tier is useless. Only the ratio is needed, so a
+        # count is enough and no per-request field is added.
+        self.slow_tier_probes: int = 0
+        self.slow_tier_paid_off: int = 0
 
     def add_request(self, meta: LMCacheReqMeta) -> None:
         self.requests.append(meta)
