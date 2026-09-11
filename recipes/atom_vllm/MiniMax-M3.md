@@ -35,6 +35,8 @@ python3 -m pip install -e . --no-build-isolation -v
 ```bash
 git clone -b main git@github.com:zejunchen-zejun/aiter-m3.git aiter
 cd aiter
+git checkout fc75cf998
+git submodule sync && git submodule update --init --recursive
 PREBUILD_KERNELS=0 python3 -m pip install -e . --no-build-isolation --no-deps -v
 ```
 
@@ -48,7 +50,13 @@ python3 -m pip install -e . --no-build-isolation --no-deps -v
 python3 -m pip install --no-deps pybind11 zmq msgspec xxhash setproctitle openpyxl
 ```
 
-### 1.4 lm-eval
+### 1.4 install triton
+```bash
+pip install --no-deps --force-reinstall \
+  "https://pypi.amd.com/triton/release/rocm-7.2.0/packages/triton/triton-3.7.0+amd.rocm7.2.0.git89002410-cp312-cp312-linux_x86_64.whl"
+```
+
+### 1.5 lm-eval
 
 ```bash
 python3 -m pip install "lm_eval[api]"
@@ -80,8 +88,8 @@ prefixes, prefix-cache dominated).
 
 | Draft | Index sharing | Accept len<br>configured / **engine** / client | Device KV pool | Host KV pool | GPU hit | CPU hit | Total hit | TPM/GPU | Extend TPM | Decode TPS | TTFT p50 | TPOT p50 |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| MTP (NextN head), dummy weights | **on**, `index_topk_freq=4` | 4.0 / **4.000** / 4.06 | **5,891,590** tok<br>(engine default) | **0** | **92.39%** | 0.00% | **92.39%** | **2,754,716** | **832,937** | **1,160.2** | **345 ms** | **11.5 ms** |
-| MTP (NextN head), dummy weights | off (freq=1) | 4.0 / **4.000** / 3.97 | **5,891,590** tok<br>(engine default) | **0** | **91.70%** | 0.00% | **91.70%** | **2,367,584** | **781,357** | **1,005.4** | **378 ms** | **14.0 ms** |
+| MTP (NextN head), dummy weights | **on**, `index_topk_freq=4` | 4.0 / **4.000** / 4.05 | **5,891,462** | **0** | **92.07%** | **0.00%** | **92.07%** | **2,581,097** | **813,577** | **1,084.4** | **337 ms** | **12.9 ms** |
+| MTP (NextN head), dummy weights | off (freq=1) | 4.0 / **4.000** / 4.11 | **5,891,590** | **0** | **92.80%** | **0.00%** | **92.80%** | **3,074,679** | **879,870** | **1,253.2** | **330 ms** | **10.5 ms** |
 
 Four things about that table:
 
