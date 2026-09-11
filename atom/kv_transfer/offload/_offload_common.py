@@ -71,6 +71,19 @@ def _env_float(name: str, default: float, lo: float, hi: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int, minimum: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        logger.warning(
+            "LMCache offload: %s=%r is not an integer; using %s", name, raw, default
+        )
+        return default
+
+
 # Outcome names produced by ``_decide_load_after_alloc``. Only the first means
 # the slow tier beat what vLLM's own HBM prefix cache already held.
 _LOAD_PAID_OFF = "aligned_large_hit"
@@ -1041,6 +1054,39 @@ class OffloadSchedulerMixin(ABC):
         return (
             getattr(self, "_slow_tier_paid_off", 0),
             getattr(self, "_slow_tier_probes", 0),
+        )
+
+    def _note_lookup_cost(self, seconds: float, tokens: int) -> None:
+        """Tally one synchronous LMCache lookup against the scheduler loop.
+
+        The lookup hashes the whole prompt in this process and then blocks on a
+        round trip to every lookup rank, so its cost lands on the scheduler,
+        not on a copy stream, and admission cannot reach it: a request pays it
+        whether or not anything is ever saved. Counting it is the only way to
+        tell whether the remaining loss lives here or in the save path.
+
+        ``perf_counter`` is nanoseconds against a round trip measured in
+        hundreds of microseconds, so this stays on by default.
+        """
+        count = getattr(self, "_lookup_calls", 0) + 1
+        self._lookup_calls = count
+        self._lookup_seconds = getattr(self, "_lookup_seconds", 0.0) + seconds
+        self._lookup_tokens = getattr(self, "_lookup_tokens", 0) + int(tokens)
+        every = int(getattr(self, "_lookup_report_every", 0) or 0)
+        if every <= 0:
+            every = _env_int("OFFLOAD_LOOKUP_REPORT_EVERY", 256, minimum=1)
+            self._lookup_report_every = every
+        if count % every:
+            return
+        total = self._lookup_seconds
+        logger.info(
+            "[OFFLOAD-LOOKUP-COST] lookups=%d total_s=%.3f mean_ms=%.3f "
+            "tokens=%d mean_tokens=%d",
+            count,
+            total,
+            1000.0 * total / count,
+            self._lookup_tokens,
+            self._lookup_tokens // count,
         )
 
     def _mark_load_skip(

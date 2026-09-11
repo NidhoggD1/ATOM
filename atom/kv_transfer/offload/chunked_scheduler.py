@@ -161,7 +161,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if self._repeat_load_suppressed(seq, sid):
             return 0, False
         num_prompt = seq.num_prompt_tokens
-        token_ids = list(seq.token_ids[:num_prompt])
         pending = self._lookup_results.get(sid)
         if pending is not None and pending[0] is not seq:
             # An older lifecycle still owns this worker-side pin. Its cleanup
@@ -172,7 +171,15 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 if sid not in self._lookup_in_step:
                     self._lookup_in_step.append(sid)
                 self._lookup_results[sid] = (seq, 0)
+                # The scheduler re-examines a queued request every step until
+                # it is admitted, but only the first examination reaches a
+                # lookup. Copying the prompt outside this branch pays for every
+                # other examination too. Slicing a ConstantList already yields a
+                # list, so wrapping it in `list()` only copies it a second time.
+                token_ids = seq.token_ids[:num_prompt]
+                lookup_started = time.perf_counter()
                 hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
+                self._note_lookup_cost(time.perf_counter() - lookup_started, num_prompt)
                 if hit is None:
                     self._lookup_results.pop(sid, None)
                 else:
@@ -190,7 +197,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                     _lh = [
                         k
                         for (_s, _e, k) in list(
-                            tdb.process_tokens(token_ids, make_key=False)
+                            tdb.process_tokens(
+                                seq.token_ids[:num_prompt], make_key=False
+                            )
                         )[:3]
                     ]
             except Exception as e:  # noqa: BLE001  # debug-only introspection
@@ -384,7 +393,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
-                    token_ids=list(seq.token_ids[:transfer_end]),
+                    token_ids=seq.token_ids[:transfer_end],
                     block_ids=list(seq.block_table),
                     load_spec=ls,
                     load_operation=load_operation,
@@ -445,7 +454,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
-                    token_ids=list(seq.token_ids[:aligned]),
+                    token_ids=seq.token_ids[:aligned],
                     block_ids=block_ids,
                     save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
                     is_last_prefill=is_last_prefill,

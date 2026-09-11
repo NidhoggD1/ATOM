@@ -1987,11 +1987,15 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if self._repeat_load_suppressed(seq, sid):
             return 0, False
         num_prompt = seq.num_prompt_tokens
-        token_ids = list(seq.token_ids[:num_prompt])
+        # Slicing a ConstantList already yields a list; `list()` copies it
+        # a second time, and the prompt can run to tens of thousands of tokens.
+        token_ids = seq.token_ids[:num_prompt]
         if sid not in self._lookup_in_step:
             self._lookup_in_step.append(sid)
         try:
+            lookup_started = time.perf_counter()
             hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
+            self._note_lookup_cost(time.perf_counter() - lookup_started, num_prompt)
         except Exception:
             logger.exception("LMCache offload lookup failed for seq %s", seq.id)
             self._clear_lookup_retry_state(sid)
@@ -2390,7 +2394,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
-                    token_ids=list(seq.token_ids[:lmc]),
+                    token_ids=seq.token_ids[:lmc],
                     block_ids=list(seq.block_table),
                     load_spec=ls,
                     slot_load_spec=slot_load_spec,
@@ -2456,7 +2460,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
-                    token_ids=list(seq.token_ids[:token_end]),
+                    token_ids=seq.token_ids[:token_end],
                     block_ids=list(seq.block_table),
                     save_spec=(
                         SaveSpec(skip_leading_tokens=saved, can_save=True)

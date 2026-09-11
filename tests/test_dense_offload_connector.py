@@ -846,3 +846,38 @@ def test_dense_request_finished_releases_the_failed_load_mark(monkeypatch):
 
     sched.request_finished(seq)
     assert sched._load_failed_seqs == {}
+
+
+def test_dense_repeat_examination_issues_one_lookup(monkeypatch):
+    """A queued request is re-examined every step; only the first may look up.
+
+    The scheduler calls this hook for every waiting request whose
+    ``num_computed_tokens`` is still zero, so a request that loses the budget
+    race comes back next step. The lookup itself is memoised, and the prompt
+    copy it needs belongs inside that same branch -- outside it, every losing
+    examination pays to copy a prompt nobody reads.
+    """
+    sched = _lookup_scheduler(monkeypatch, hit=16)
+    seq = _load_seq(945, num_prompt_tokens=24)
+
+    first = sched.get_num_new_matched_tokens(seq)
+    second = sched.get_num_new_matched_tokens(seq)
+
+    assert first == second == (16, True)
+    assert sched._lookup_client.calls == 1
+    assert sched._lookup_calls == 1
+
+
+def test_dense_lookup_cost_is_tallied(monkeypatch):
+    """The synchronous lookup is timed, because admission cannot reach it.
+
+    Save admission throttles bytes; this call is paid by every request that is
+    examined, saved or not, so it needs its own number.
+    """
+    sched = _lookup_scheduler(monkeypatch, hit=16)
+    sched.get_num_new_matched_tokens(_load_seq(946, num_prompt_tokens=24))
+    sched.get_num_new_matched_tokens(_load_seq(947, num_prompt_tokens=32))
+
+    assert sched._lookup_calls == 2
+    assert sched._lookup_seconds > 0.0
+    assert sched._lookup_tokens == 24 + 32
