@@ -2044,6 +2044,10 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
 
         need = hit - int(seq.num_cached_tokens)
         if need <= 0:
+            # LMCache had this prefix and HBM had it too: the save that put it
+            # there bought nothing. This is the gate that fires when the KV pool
+            # is large, so it is the one admission is really listening to.
+            self.note_slow_tier_verdict(False)
             self._clear_lookup_retry_state(sid)
             return 0, False
         self._load_specs[sid] = LoadSpec(
@@ -2312,8 +2316,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             should_load, reason, hbm, lmc, need, chunk = self._decide_load_after_alloc(
                 seq, ls
             )
-            meta.slow_tier_probes += 1
-            meta.slow_tier_paid_off += int(should_load)
+            self.note_slow_tier_verdict(should_load)
             if not should_load:
                 self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
                 self._clear_pending_load(sid)
@@ -2469,6 +2472,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             sid for sid in self._lookup_in_step if sid not in dispatched
         ]
         self._reqs_need_recv.clear()
+        meta.slow_tier_paid_off, meta.slow_tier_probes = self.drain_slow_tier_verdicts()
         return meta
 
     def _has_pending_sidecar_save(self, seq) -> bool:

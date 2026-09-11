@@ -209,6 +209,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._hit_save_floors[sid] = hit
         need = hit - int(seq.num_cached_tokens)
         if need <= 0:
+            # LMCache had this prefix and HBM had it too: the save that put it
+            # there bought nothing. This is the gate that fires when the KV pool
+            # is large, so it is the one admission is really listening to.
+            self.note_slow_tier_verdict(False)
             self._clear_pending_load(sid)
             self._hit_save_floors[sid] = self._chunk_floor(hit)
             return 0, False
@@ -331,8 +335,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             should_load, reason, hbm, lmc, need, chunk = self._decide_load_after_alloc(
                 seq, ls
             )
-            meta.slow_tier_probes += 1
-            meta.slow_tier_paid_off += int(should_load)
+            self.note_slow_tier_verdict(should_load)
             if not should_load:
                 self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
                 self._clear_pending_load(sid)
@@ -457,6 +460,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             sid for sid in self._lookup_in_step if sid not in dispatched
         ]
         self._reqs_need_recv.clear()
+        meta.slow_tier_paid_off, meta.slow_tier_probes = self.drain_slow_tier_verdicts()
         return meta
 
     def should_defer_free(self, seq) -> bool:

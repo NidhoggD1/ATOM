@@ -132,11 +132,15 @@ class SlowTierAdmission:
         # falls off linearly to the floor.
         self._target = _env_float("OFFLOAD_ADMISSION_TARGET", 0.10, 0.0, 1.0)
         self._floor = _env_float("OFFLOAD_ADMISSION_FLOOR", 0.25, 0.0, 1.0)
-        self._alpha = _env_float("OFFLOAD_ADMISSION_ALPHA", 1.0 / 64.0, 1e-4, 1.0)
+        # 1/16 converges in about 40 verdicts. The scheduler reaches roughly
+        # three per second on M3 at concurrency 25, so the estimate tracks a
+        # change in workload within a minute rather than spending most of a
+        # ten-minute window still climbing down from its optimistic start.
+        self._alpha = _env_float("OFFLOAD_ADMISSION_ALPHA", 1.0 / 16.0, 1e-4, 1.0)
         # Save everything until the payoff estimate is built from real traffic.
         # A cold tier necessarily reports zero payoff, and throttling on that
         # would be throttling on the absence of evidence.
-        self._warmup = int(_env_float("OFFLOAD_ADMISSION_WARMUP", 128, 0, 1e6))
+        self._warmup = int(_env_float("OFFLOAD_ADMISSION_WARMUP", 64, 0, 1e6))
         self._payoff = 1.0
         self._probes = 0
         self._credit = 0.0
@@ -986,6 +990,34 @@ class OffloadSchedulerMixin(ABC):
             need,
         )
         return True
+
+    def note_slow_tier_verdict(self, paid_off: bool) -> None:
+        """Record whether the slow tier had anything HBM did not, for one request.
+
+        Only requests LMCache actually reported a hit for are counted. A miss on
+        a novel prefix says nothing about whether saving pays -- counting it
+        would bias a cold workload toward throttling itself.
+
+        The verdict is reached in two places, because the load is abandoned at
+        whichever gate first proves it pointless: ``need <= 0`` in
+        ``get_num_new_matched_tokens`` (HBM already covers the hit, so no
+        LoadSpec is ever built) and ``_decide_load_after_alloc`` for the ones
+        that get that far. The first gate is the common case exactly when
+        admission matters, which is why counting only the second measured
+        nothing at all.
+        """
+        self._slow_tier_probes = getattr(self, "_slow_tier_probes", 0) + 1
+        self._slow_tier_paid_off = getattr(self, "_slow_tier_paid_off", 0) + int(
+            paid_off
+        )
+
+    def drain_slow_tier_verdicts(self) -> tuple[int, int]:
+        """Take the tally accumulated since the last step and reset it."""
+        probes = getattr(self, "_slow_tier_probes", 0)
+        paid_off = getattr(self, "_slow_tier_paid_off", 0)
+        self._slow_tier_probes = 0
+        self._slow_tier_paid_off = 0
+        return paid_off, probes
 
     def _mark_load_skip(
         self,
