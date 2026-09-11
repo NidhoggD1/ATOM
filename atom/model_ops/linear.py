@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+from collections.abc import Callable
 from functools import partial as functools_partial
-from typing import Callable, Optional
 
 import torch
 from aiter import (
@@ -57,7 +57,7 @@ def use_fp4_non_shuffle_triton_gemm() -> bool:
 
 if use_fp4_non_shuffle_triton_gemm():
     try:
-        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4  # noqa: E402
+        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
     except ImportError as e:
         logger.warning(f"Triton FP4 GEMM not available: {e}")
         gemm_afp4wfp4 = None
@@ -69,7 +69,7 @@ if use_triton_gemm():
     try:
         from aiter.ops.triton.gemm_afp4wfp4 import (
             gemm_afp4wfp4_preshuffle,
-        )  # noqa: E402
+        )
     except ImportError as e:
         logger.warning(f"Triton FP4 GEMM not available: {e}")
         gemm_afp4wfp4_preshuffle = None
@@ -80,7 +80,7 @@ if use_triton_gemm():
     try:
         from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
             gemm_a8w8_blockscale as gemm_a8w8_blockscale_triton,
-        )  # noqa: E402
+        )
     except ImportError as e:
         logger.warning(f"Triton w8a8 blockscale GEMM not available: {e}")
         gemm_a8w8_blockscale_triton = None
@@ -89,7 +89,7 @@ if use_triton_gemm():
     try:
         from aiter.ops.triton.gemm.basic.gemm_a8w8 import (
             gemm_a8w8 as gemm_a8w8_triton,
-        )  # noqa: E402
+        )
     except ImportError as e:
         logger.warning(f"Triton a8w8 GEMM not available: {e}")
         gemm_a8w8_triton = None
@@ -97,7 +97,7 @@ else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_triton = None
     gemm_a8w8_triton = None
-from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
+from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE
 
 
 def divide(numerator, denominator):
@@ -349,7 +349,7 @@ def gemm_a8w8_per_tensor_fake(
     weight: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
@@ -361,7 +361,7 @@ def gemm_a8w8_per_tensor_impl(
     weight: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     # The triton a8w8 kernel applies a per-row (activation) and per-column
@@ -387,7 +387,7 @@ def gemm_a8w8_per_token_fake(
     weight: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
@@ -399,7 +399,7 @@ def gemm_a8w8_per_token_impl(
     weight: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     # The triton a8w8 kernel natively applies a per-row (activation) and
@@ -969,7 +969,7 @@ class LinearBase(nn.Module):
     def get_trace_prefix(
         self,
         x: torch.Tensor,
-        x_scale: Optional[torch.Tensor] = None,
+        x_scale: torch.Tensor | None = None,
         otype=dtypes.bf16,
     ) -> str:
         k = x.shape[-1]
@@ -1293,7 +1293,7 @@ class MergedColumnParallelLinear(LinearBase):
         input_size: int,
         output_sizes: list[int],
         bias: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
         **kwargs,
@@ -1434,7 +1434,7 @@ class QKVZBAParallelLinear(ColumnParallelLinear):
         num_k_heads: int,
         num_v_heads: int,
         bias: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
         **kwargs,
@@ -1616,7 +1616,7 @@ class QKVZParallelLinear(ColumnParallelLinear):
         num_k_heads: int,
         num_v_heads: int,
         bias: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
         **kwargs,
@@ -1726,7 +1726,7 @@ class BAParallelLinear(ColumnParallelLinear):
         num_k_heads: int,
         num_v_heads: int,
         bias: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
         **kwargs,
@@ -1776,7 +1776,7 @@ class QKVGParallelLinear(ColumnParallelLinear):
         total_num_heads: int,
         total_num_kv_heads: int | None = None,
         bias: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype | None = None,
         prefix: str = "",
         **kwargs,
@@ -1917,7 +1917,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         total_num_heads: int,
         total_num_kv_heads: int | None = None,
         bias: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
         v_head_size: int | None = None,
@@ -2009,7 +2009,7 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         total_num_index_heads: int,
         index_head_size: int,
         bias: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
         **kwargs,
@@ -2035,7 +2035,16 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         else:
             self.num_kv_heads = 1
             self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
-        self.num_index_heads = self.num_kv_heads
+        # Indexer-only CP scores every index head on every rank, so index_q is
+        # replicated at full width instead of following the KV-head sharding --
+        # the same treatment index_k already gets. index_k, q, k and v are
+        # untouched, so this widens the GEMM by 3 head-columns and nothing else.
+        from atom.distributed.indexer_cp import indexer_cp_enabled
+
+        self.indexer_cp = indexer_cp_enabled()
+        self.num_index_heads = (
+            self.total_num_index_heads if self.indexer_cp else self.num_kv_heads
+        )
 
         output_sizes = [
             self.num_heads * self.head_size * tp_size,
@@ -2099,7 +2108,11 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
 
         if loaded_shard_id == "q":
             shard_rank = self.tp_rank
-        elif loaded_shard_id == "index_k":
+        elif loaded_shard_id == "index_k" or (
+            loaded_shard_id == "index_q" and self.indexer_cp
+        ):
+            # Replicated: shard_size already spans every index head, so there is
+            # only one shard to take.
             shard_rank = 0
         else:
             shard_rank = self.tp_rank // self.num_kv_head_replicas
@@ -2172,7 +2185,7 @@ class MergedReplicatedLinear(ReplicatedLinear):
         input_size: int,
         output_size: list[int],
         bias: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
         **kwargs,
@@ -2191,7 +2204,7 @@ class MergedReplicatedLinear(ReplicatedLinear):
         self,
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
-        loaded_shard_id: Optional[int] = None,
+        loaded_shard_id: int | None = None,
     ):  # ？
         param_data = param.data
         assert loaded_shard_id is not None

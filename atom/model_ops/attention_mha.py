@@ -25,6 +25,30 @@ from atom.model_ops.base_attention import (
     run_pa_fwd_asm,
 )
 
+# What aiter's gluon paged-decode kernel bounds is the QUERY TILE one program
+# builds -- the first dimension of its `attention_accumulator` -- at 64 rows.
+#
+# That tile is `query_length * query_group_size` on most paths, but NOT on the
+# one a MiniMax-M3 rank takes. With a single KV head and a group of 16 or more,
+# the launcher puts the query tokens on the grid's middle axis instead
+# (`grid = (num_sequences, query_seq_len * num_kv_heads, num_splits)` with
+# `QUERY_SEQ_LEN_POW2 = 1`, pa_decode_gluon.py), so each program carries one
+# query token and the tile stays `query_group_size` rows however long the query
+# is. Speculative decoding is unbounded there.
+#
+# M3 hands MHAImpl SHARDED head counts (minimax_m3.py:515-518): at TP4 a rank
+# runs num_heads = 64/4 = 16 over num_kv_heads = max(1, 4/4) = 1, i.e. group 16
+# on one KV head -- the grid-expanded path. The global 64/4 shape is what the
+# config file says and what a per-rank bound must NOT be computed from.
+#
+# aiter ships two launch-side asserts, `query_length <= 4` and
+# `equivalent_query_group_size <= 64`, that are evaluated before the launcher
+# picks a grid, so they reject query_length 8 on a path whose tile never grows.
+# ROCm/aiter is fixing that (zejunchen-zejun/aiter-m3#1 replaces both with a
+# check on the resolved tile). Until that lands, this file must not add a bound
+# of its own on top -- the condition below is the tile rule, not the product.
+_GLUON_PA_MAX_QUERY_TILE_ROWS = 64
+
 
 @cache
 def use_pa_decode_bf16_asm() -> bool:
@@ -487,14 +511,40 @@ class PagedAttentionImpl(nn.Module):
 
         attn_metadata = fwd_ctx.attn_metadata
 
-        if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
+        # Route to unified attention when a query tile would not fit gluon's
+        # 64-row maximum, rather than letting its assert kill the rank
+        # mid-CUDA-graph-capture. The condition mirrors how the launcher shapes
+        # the tile (see _GLUON_PA_MAX_QUERY_TILE_ROWS above): one KV head with a
+        # group of 16 or more spreads the query tokens across the grid and its
+        # tile is `query_group_size` rows for any query_length, so speculative
+        # decoding of any depth stays on gluon there. Everywhere else the tile
+        # holds every query token and the product is the right bound.
+        #
+        # Sending this path to unified when it does fit is not free: measured on
+        # a TP4 rank's real shape (16 q / 1 kv), gluon beats unified at qlen 8 in
+        # 9 of 10 batch x context points, by 1.16-2.34x. The one loss is batch 8
+        # at ctx 16k. unified stays the fallback for the shapes gluon rejects --
+        # it tiles the query by BLOCK_Q and handles either KV layout via
+        # shuffled_kv_cache.
+        use_unified = envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout
+        if not use_unified:
+            qlen = int(attn_metadata.max_seqlen_q)
+            query_group_size = self.num_heads // self.num_kv_heads
+            spreads_query_over_grid = self.num_kv_heads == 1 and query_group_size >= 16
+            tile_rows = (
+                query_group_size if spreads_query_over_grid else qlen * query_group_size
+            )
+            if tile_rows > _GLUON_PA_MAX_QUERY_TILE_ROWS:
+                use_unified = True
+
+        if use_unified and self.kv_cache_dtype.startswith("fp8"):
             o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
         else:
             o = torch.empty_like(q)
 
         num_seqs = attn_metadata.context_lens.shape[0]
 
-        if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
+        if use_unified:
             # print(q.shape, k_cache.shape, v_cache.shape)
             sliding_window = (
                 (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
@@ -998,10 +1048,33 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         self.index_rotary_emb = (
             index_rotary_emb if index_rotary_emb is not None else rotary_emb
         )
-        self.index_q_size = index_q_size
         self.index_head_dim = index_head_dim
-        # M3 has one index head per kv head (num_idx_heads == num_kv_heads).
-        self.num_idx_heads = num_kv_heads
+        # Under TP, M3 has one index head per kv head. Under indexer-only CP
+        # every rank projects ALL index heads and shards the CONTEXT instead, so
+        # the group's world size is the full index-head count. Resolved once
+        # here so no per-forward branch reaches the compiled model.
+        from atom.distributed.indexer_cp import (
+            get_indexer_cp_group,
+            get_indexer_cp_rank,
+            get_indexer_cp_world_size,
+            indexer_cp_enabled,
+        )
+
+        self.indexer_cp_group = None
+        self.indexer_cp_rank = 0
+        self.indexer_cp_world = 1
+        if indexer_cp_enabled():
+            self.indexer_cp_group = get_indexer_cp_group()
+            self.indexer_cp_rank = get_indexer_cp_rank()
+            self.indexer_cp_world = get_indexer_cp_world_size()
+        self.num_idx_heads = (
+            self.indexer_cp_world if self.indexer_cp_group is not None else num_kv_heads
+        )
+        self.index_q_size = (
+            self.num_idx_heads * index_head_dim
+            if self.indexer_cp_group is not None
+            else index_q_size
+        )
         self.topk = topk
         self.init_blocks = init_blocks
         self.local_blocks = local_blocks
@@ -1266,6 +1339,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.num_kv_heads,
             max_query_len,
             max_seq_len,
+            # index_q_shape already separates CP (T,4,128) from TP (T,1,128),
+            # but the arm is what decides the value's meaning; keep it explicit.
+            self.indexer_cp_group is not None,
         )
 
     def _load_cached_topk(self, sparse_metadata, key: tuple):
@@ -1319,6 +1395,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         if cached_topk is None:
             if index_q is None:
                 raise RuntimeError("MiniMax-M3 index cache miss on a skip-index layer")
+            if self.indexer_cp_group is not None:
+                # Prefill stays TP: its scorer is causal-tiled over ragged
+                # chunks with per-token prefix_lens, which the decode-shaped CP
+                # kernels do not model. Head r of the replicated projection is
+                # exactly the head this rank would have projected alone, so the
+                # slice is an identity, not an approximation.
+                index_q = index_q[:, self.indexer_cp_rank : self.indexer_cp_rank + 1]
             topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk(
                 index_q,
                 self.index_cache,
@@ -1371,6 +1454,63 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             tbo_yield()
         return output
 
+    def _cp_index_topk_decode(
+        self, index_q, block_table, seq_lens, max_seq_len, max_query_len
+    ):
+        """Decode top-k with the context sharded across the indexer-CP group.
+
+        Score all index heads over this rank's 1/P of the blocks, reduce to this
+        shard's own top-k, exchange, then merge to the global top-k for the one
+        head this rank owns. The result is bit-identical to the TP path, so this
+        is an exact swap and not an approximation.
+
+        Only the shard's own top-k crosses the wire, so the payload is
+        world*topk keys per token at any context length.
+        """
+        from atom.distributed.indexer_cp import exchange_candidates
+        from atom.model_ops.minimax_m3.indexer_candidate_exchange import (
+            local_candidate_keys,
+            merge_candidate_keys,
+        )
+        from atom.model_ops.minimax_m3.indexer_context_parallel import (
+            indexer_context_scores,
+        )
+
+        global_blocks = block_table.shape[1]
+        scores = indexer_context_scores(
+            index_q,
+            self.index_cache,
+            block_table,
+            seq_lens,
+            max_seq_len,
+            self.indexer_cp_rank,
+            self.indexer_cp_world,
+            max_query_len,
+            self.scale,
+        )
+        # Forced blocks are pinned in BOTH passes on purpose: one that lost its
+        # owner shard's top-k would never arrive at the merge to be pinned.
+        keys = local_candidate_keys(
+            scores,
+            seq_lens,
+            self.topk,
+            self.indexer_cp_rank,
+            self.indexer_cp_world,
+            max_query_len,
+            global_blocks,
+            self.init_blocks,
+            self.local_blocks,
+        )
+        return merge_candidate_keys(
+            exchange_candidates(keys),
+            block_table,
+            seq_lens,
+            self.topk,
+            self.init_blocks,
+            self.local_blocks,
+            max_query_len,
+        )
+
     @mark_trace(prefix="sparse_attention_decode", torch_compile=False)
     def _sparse_decode(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
@@ -1398,20 +1538,29 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         if cached_topk is None:
             if index_q is None:
                 raise RuntimeError("MiniMax-M3 index cache miss on a skip-index layer")
-            topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk_decode(
-                index_q,
-                self.index_cache,
-                decode_md.block_table,
-                decode_md.seq_lens,
-                sparse_metadata.max_seq_len,
-                self.topk,
-                self.init_blocks,
-                self.local_blocks,
-                self.num_kv_heads,
-                self.scale,
-                emit_sparse_block_table=True,
-                max_query_len=max_query_len,
-            )
+            if self.indexer_cp_group is not None:
+                topk_idx, sparse_bt, sparse_ctx = self._cp_index_topk_decode(
+                    index_q,
+                    decode_md.block_table,
+                    decode_md.seq_lens,
+                    sparse_metadata.max_seq_len,
+                    max_query_len,
+                )
+            else:
+                topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk_decode(
+                    index_q,
+                    self.index_cache,
+                    decode_md.block_table,
+                    decode_md.seq_lens,
+                    sparse_metadata.max_seq_len,
+                    self.topk,
+                    self.init_blocks,
+                    self.local_blocks,
+                    self.num_kv_heads,
+                    self.scale,
+                    emit_sparse_block_table=True,
+                    max_query_len=max_query_len,
+                )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
             )
