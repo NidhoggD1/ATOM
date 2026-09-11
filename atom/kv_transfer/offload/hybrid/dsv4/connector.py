@@ -630,11 +630,10 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     def start_load_kv(self, metadata) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):
             return
-        probes = getattr(metadata, "slow_tier_probes", 0)
-        if probes:
-            self.save_admission().record_load_batch(
-                getattr(metadata, "slow_tier_paid_off", 0), probes
-            )
+        self.save_admission().observe_totals(
+            getattr(metadata, "slow_tier_paid_off", 0),
+            getattr(metadata, "slow_tier_probes", 0),
+        )
         load_requests = [
             req
             for req in metadata.requests
@@ -2472,7 +2471,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             sid for sid in self._lookup_in_step if sid not in dispatched
         ]
         self._reqs_need_recv.clear()
-        meta.slow_tier_paid_off, meta.slow_tier_probes = self.drain_slow_tier_verdicts()
+        meta.slow_tier_paid_off, meta.slow_tier_probes = self.slow_tier_verdict_totals()
         return meta
 
     def _has_pending_sidecar_save(self, seq) -> bool:

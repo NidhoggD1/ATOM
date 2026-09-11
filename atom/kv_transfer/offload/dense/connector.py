@@ -170,11 +170,10 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     def start_load_kv(self, metadata) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):
             return
-        probes = getattr(metadata, "slow_tier_probes", 0)
-        if probes:
-            self.save_admission().record_load_batch(
-                getattr(metadata, "slow_tier_paid_off", 0), probes
-            )
+        self.save_admission().observe_totals(
+            getattr(metadata, "slow_tier_paid_off", 0),
+            getattr(metadata, "slow_tier_probes", 0),
+        )
         load_requests = [
             req
             for req in metadata.requests

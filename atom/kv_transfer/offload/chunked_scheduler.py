@@ -460,7 +460,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             sid for sid in self._lookup_in_step if sid not in dispatched
         ]
         self._reqs_need_recv.clear()
-        meta.slow_tier_paid_off, meta.slow_tier_probes = self.drain_slow_tier_verdicts()
+        meta.slow_tier_paid_off, meta.slow_tier_probes = self.slow_tier_verdict_totals()
         return meta
 
     def should_defer_free(self, seq) -> bool:

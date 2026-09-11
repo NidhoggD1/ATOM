@@ -213,3 +213,43 @@ def test_a_batch_cannot_claim_more_wins_than_verdicts(admission):
     policy.record_load_batch(99, 10)
     assert policy.stats()["reasons"][PAID_OFF] == 10
     assert policy.stats()["payoff"] == pytest.approx(1.0)
+
+
+def test_totals_fold_only_what_is_new(admission):
+    policy = admission(warmup=0, alpha=0.5)
+    policy.observe_totals(1, 10)
+    policy.observe_totals(2, 20)
+    assert policy.stats()["probes"] == 20
+    assert policy.stats()["reasons"][PAID_OFF] == 2
+
+
+def test_a_dropped_step_loses_no_verdicts(admission):
+    """Not every metadata object reaches the worker.
+
+    Totals are cumulative precisely so a step that never arrives costs latency
+    and nothing else -- a per-step delta would have silently dropped it, which
+    is what lost seven verdicts in eight in the first measured build.
+    """
+    every_step = admission(warmup=0, alpha=0.5)
+    for i in range(1, 21):
+        every_step.observe_totals(i, i * 10)
+
+    lossy = admission(warmup=0, alpha=0.5)
+    for i in (3, 7, 20):  # the same totals, most steps missing
+        lossy.observe_totals(i, i * 10)
+
+    assert every_step.stats()["probes"] == lossy.stats()["probes"] == 200
+    assert (
+        every_step.stats()["reasons"][PAID_OFF]
+        == lossy.stats()["reasons"][PAID_OFF]
+        == 20
+    )
+
+
+def test_a_restarted_scheduler_resynchronises(admission):
+    """Totals going backwards means new counters, not negative traffic."""
+    policy = admission(warmup=0, alpha=0.5)
+    policy.observe_totals(5, 50)
+    policy.observe_totals(1, 10)  # counters restarted
+    assert policy.stats()["probes"] == 60
+    assert policy.stats()["reasons"][PAID_OFF] == 6

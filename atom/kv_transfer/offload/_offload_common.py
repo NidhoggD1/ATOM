@@ -116,6 +116,8 @@ class SlowTierAdmission:
         "_reasons",
         "_report_every",
         "_saved",
+        "_seen_paid_off",
+        "_seen_probes",
         "_skipped",
         "_target",
         "_warmup",
@@ -146,6 +148,8 @@ class SlowTierAdmission:
         self._credit = 0.0
         self._saved = 0
         self._skipped = 0
+        self._seen_probes = 0
+        self._seen_paid_off = 0
         self._reasons: dict[str, int] = {}
         self._report_every = max(
             1, int(_env_float("OFFLOAD_ADMISSION_REPORT_EVERY", 256, 1, 1e6))
@@ -167,6 +171,19 @@ class SlowTierAdmission:
             # visible, and it is one line per few hundred requests -- well under
             # the LMCache Stored/Retrieved records already on this path.
             logger.info("[OFFLOAD-ADMISSION] %s", report)
+
+    def observe_totals(self, paid_off_total: int, probes_total: int) -> None:
+        """Fold whatever is new since the last totals this worker saw."""
+        with self._lock:
+            last_probes = self._seen_probes
+            last_paid = self._seen_paid_off
+            if probes_total < last_probes:
+                # The scheduler restarted its counters; resynchronise rather
+                # than folding a negative delta.
+                last_probes = last_paid = 0
+            self._seen_probes = probes_total
+            self._seen_paid_off = paid_off_total
+        self.record_load_batch(paid_off_total - last_paid, probes_total - last_probes)
 
     def record_load_batch(self, paid_off: int, total: int) -> None:
         """Fold one step's worth of scheduler verdicts into the estimate.
@@ -1011,13 +1028,20 @@ class OffloadSchedulerMixin(ABC):
             paid_off
         )
 
-    def drain_slow_tier_verdicts(self) -> tuple[int, int]:
-        """Take the tally accumulated since the last step and reset it."""
-        probes = getattr(self, "_slow_tier_probes", 0)
-        paid_off = getattr(self, "_slow_tier_paid_off", 0)
-        self._slow_tier_probes = 0
-        self._slow_tier_paid_off = 0
-        return paid_off, probes
+    def slow_tier_verdict_totals(self) -> tuple[int, int]:
+        """The running totals, which is what gets shipped -- never a delta.
+
+        Not every metadata object reaches the worker: the plugin forwards only
+        the steps that carry inner metadata, and a per-step tally that reset
+        itself lost every verdict on the steps it did not. Measured, about
+        seven in eight went missing that way. Cumulative counters are immune --
+        the worker subtracts what it saw last time, so a dropped step costs
+        nothing but a little latency.
+        """
+        return (
+            getattr(self, "_slow_tier_paid_off", 0),
+            getattr(self, "_slow_tier_probes", 0),
+        )
 
     def _mark_load_skip(
         self,
