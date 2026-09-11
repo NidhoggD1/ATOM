@@ -4,7 +4,6 @@ import aiter
 import torch
 from aiter import dtypes, fused_qk_norm_rope_cache_quant_shuffle
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
-from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from torch import nn
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
@@ -13,6 +12,7 @@ from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import (
     PA_ASM_MAX_QUERY_GROUP_SIZE,
     cp_mha_gather_cache,
+    dense_decode_splits,
     gluon_decode_over_limit,
     run_pa_decode_gluon,
     run_pa_fwd_asm,
@@ -441,9 +441,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
 
         use_ps = True
         if use_ps:
-            max_context_partition_num = get_recommended_splits(
-                num_decodes, num_kv_heads
-            )
+            max_context_partition_num = dense_decode_splits(num_decodes, num_kv_heads)
         else:
             max_context_partition_num = _NO_PS_FIXED_SPLITS
 

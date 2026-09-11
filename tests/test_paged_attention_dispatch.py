@@ -17,6 +17,7 @@ bound -- a Triton compile error with nothing in it about speculative length.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -26,6 +27,7 @@ pytest.importorskip("aiter", reason="base_attention imports the AITER runtime")
 
 from aiter.ops.triton.gluon import pa_decode_gluon
 
+import atom
 from atom.model_ops.base_attention import (
     PA_ASM_MAX_QUERY_GROUP_SIZE,
     PA_DENSE_SPLIT_MAX,
@@ -224,6 +226,61 @@ class TestDenseDecodeSplits:
         )
         assert dense_decode_splits(4, 4) == dense_decode_splits(16, 1)
         assert dense_decode_splits(4, 4) == PA_DENSE_SPLIT_TARGET_WG // 16
+
+
+ATOM_ROOT = Path(atom.__file__).resolve().parent
+
+# The dense paged decode is dispatched from two places -- the server backend and
+# the vLLM bridge, whose own comment says it mirrors the former. They have to
+# agree, or the same kernel runs two launch policies depending on how the model
+# was served.
+DENSE_DECODE_CALL_SITES = (
+    "model_ops/attention_mha.py",
+    "plugin/vllm/attention/layer_mha.py",
+)
+
+# The MiniMax-M3 sparse decode is deliberately left on aiter's heuristic: it
+# reads a fixed topk window, so extra splits buy nothing and only add reduce
+# work. Pinned so that "make them consistent" does not quietly include it.
+SPARSE_DECODE_CALL_SITE = "model_ops/minimax_m3/sparse_attn.py"
+
+
+def _source(relpath: str) -> str:
+    path = ATOM_ROOT / relpath
+    assert path.exists(), f"call site moved: {relpath}"
+    return path.read_text()
+
+
+class TestDenseCallSitesAgree:
+    """Which call sites route through the shared rule, and which do not.
+
+    Read as source rather than imported: the vLLM bridge needs vLLM installed,
+    and the whole point is that nothing else watches these two stay together.
+    """
+
+    @pytest.mark.parametrize("relpath", DENSE_DECODE_CALL_SITES)
+    def test_a_dense_call_site_uses_the_shared_rule(self, relpath):
+        """Red on either call site reverting to the bare aiter heuristic."""
+        assert "dense_decode_splits(" in _source(relpath)
+
+    @pytest.mark.parametrize("relpath", DENSE_DECODE_CALL_SITES)
+    def test_a_dense_call_site_does_not_also_reach_for_the_heuristic(self, relpath):
+        """The rule already calls it. A second, direct call would be a fork.
+
+        Red if a later edit reintroduces the aiter import beside the rule, which
+        is how the two paths drifted apart in the first place.
+        """
+        assert "get_recommended_splits" not in _source(relpath)
+
+    def test_the_sparse_call_sites_are_left_on_the_heuristic(self):
+        """The exclusion is a decision, not an oversight -- so it gets a test.
+
+        Red in both directions: if sparse is switched to the dense rule, or if
+        its call to the heuristic disappears.
+        """
+        src = _source(SPARSE_DECODE_CALL_SITE)
+        assert "get_recommended_splits(" in src
+        assert "dense_decode_splits" not in src
 
 
 class _Layer:

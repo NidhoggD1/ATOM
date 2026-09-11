@@ -51,11 +51,19 @@ PA_ASM_MAX_QUERY_GROUP_SIZE = 16
 
 # Both are fits on a 256-CU gfx950 and do not scale with the machine, unlike the
 # heuristic they bound. TARGET_WG: past it the extra splits only add reduce work.
-# MAX is two separate bounds that happen to agree on a number no larger than 32:
-# temporary_output is bf16, so each split adds a round trip through the PS
-# combine, and the worst shape measured drifts 20pp further from an fp32
-# reference at 64 than at 8; and 64 is where the C++ PS reduce stops being built
-# at all, with no working fallback under it (see the test that pins this).
+#
+# MAX is what aiter can serve correctly today, not where the curve stops paying.
+# Measured on the production shape (batch 1, 315K context, qlen 4) the dense call
+# costs 386.8 / 110.1 / 68.4 / 65.5 us at 8 / 32 / 64 / 128 splits, so 32 -> 64
+# would be another 38%. It is not taken because at exactly 64 the C++ PS reduce
+# computes wrong numbers -- ds_swizzle's xor_mask is 5 bits, so the cross-row
+# step of a 64-lane reduction is a different swizzle mode entirely -- and past 64
+# the launch declines to a flydsl path that is not the default. Both are aiter
+# side; raising this constant is a follow-up gated on that work, not on us.
+#
+# Not 128 in any case: at batch 24 it regresses 683.6 -> 716.9 us on the same
+# context and +37% on a 32K one, and bf16 temporary_output drifts further from an
+# fp32 reference with every split (4.1% -> 4.6% at 315K, 7.7% -> 12.6% at 32K).
 PA_DENSE_SPLIT_TARGET_WG = 128
 PA_DENSE_SPLIT_MAX = 32
 
@@ -71,10 +79,11 @@ def dense_decode_splits(num_seqs: int, num_kv_heads: int) -> int:
     real length, so a context term is inert in production and would only over-split
     short requests (+114% measured on a 2K one).
 
-    Only the dense path is routed here. The two MiniMax-M3 sparse call sites are
-    excluded on purpose -- their context is a fixed topk window and their num_seqs
-    already folds the query tokens in -- as is the vLLM bridge's own copy of this
-    dispatch, which is untested against this.
+    Both dense call sites route here -- the server backend and the vLLM bridge --
+    so the same kernel does not run two launch policies depending on how the model
+    was served. The two MiniMax-M3 sparse call sites are excluded on purpose:
+    their context is a fixed topk window, and their num_seqs already folds the
+    query tokens in.
     """
     from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
