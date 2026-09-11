@@ -778,7 +778,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
             self._save_tracker.pop(str(seq.id), None)
 
     # -- joint boundary ----------------------------------------------------
-    def _decide_load_after_alloc(self, seq, ls):
+    def _classify_load_after_alloc(self, seq, ls):
         """Clamp a hybrid's KV leg to the boundary the state leg is aimed at.
 
         A hybrid's per-request state is the compressed history of exactly
@@ -789,7 +789,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         KV leg down to it.
         """
         if not getattr(seq, "has_per_req_cache", False):
-            return super()._decide_load_after_alloc(seq, ls)
+            return super()._classify_load_after_alloc(seq, ls)
 
         hbm = int(seq.num_cached_tokens)
         lmc = int(ls.lmcache_cached_tokens)

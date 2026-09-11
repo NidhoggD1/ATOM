@@ -276,6 +276,22 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     def _decide_load_after_alloc(
         self, seq, ls: LoadSpec
     ) -> tuple[bool, str, int, int, int, int]:
+        """Classify this load, and count the verdict for save admission.
+
+        There are four call sites -- two in the scheduler mixin's own parking
+        and free paths, two in build_connector_meta -- and instrumenting only
+        the ones in build_connector_meta measured seven verdicts where the run
+        actually produced two hundred. Counting inside the decision is the only
+        placement that cannot miss one, which is also why the hybrid families
+        override ``_classify_load_after_alloc`` rather than this method.
+        """
+        decision = self._classify_load_after_alloc(seq, ls)
+        self.note_slow_tier_verdict(decision[0])
+        return decision
+
+    def _classify_load_after_alloc(
+        self, seq, ls: LoadSpec
+    ) -> tuple[bool, str, int, int, int, int]:
         hbm = int(getattr(seq, "num_cached_tokens", ls.hbm_cached_tokens))
         lmc = int(ls.lmcache_cached_tokens)
         ls.hbm_cached_tokens = hbm
@@ -335,7 +351,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             should_load, reason, hbm, lmc, need, chunk = self._decide_load_after_alloc(
                 seq, ls
             )
-            self.note_slow_tier_verdict(should_load)
             if not should_load:
                 self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
                 self._clear_pending_load(sid)
