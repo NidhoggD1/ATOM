@@ -176,6 +176,11 @@ def register_platform() -> str | None:
 
     apply_vllm_v4_block_reuse_patch()
 
+    from atom.plugin.vllm.deepseek_v4_lmcache_connector import (
+        apply_vllm_dsv4_lmcache_connector_patch,
+    )
+
+    apply_vllm_dsv4_lmcache_connector_patch()
     _register_kv_connectors()
 
     # return the ATOM platform to vllm
@@ -301,6 +306,12 @@ def register_model() -> None:
     )
 
     apply_vllm_v4_block_reuse_patch()
+
+    from atom.plugin.vllm.deepseek_v4_lmcache_connector import (
+        apply_vllm_dsv4_lmcache_connector_patch,
+    )
+
+    apply_vllm_dsv4_lmcache_connector_patch()
 
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 
