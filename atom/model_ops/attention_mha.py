@@ -260,6 +260,14 @@ class PagedAttentionImpl(nn.Module):
                     v_cache_shuffle = v_cache.view(n, nh, bs // x, hd, x)
                 else:
                     v_cache_shuffle = v_cache
+                if envs.ATOM_PER_TENSOR_KV and self.kv_cache_dtype == "fp8":
+                    # Hand the writer one scale for the layer instead of a
+                    # per-token output buffer, and record it: _dispatch_decode
+                    # reads per_token_quant to decide whether unified_attention
+                    # can serve this layer, and paged_attention_unified passes
+                    # this same self.kv_scale down as the descale.
+                    k_scale = v_scale = self.kv_scale
+                    self.per_token_quant = False
                 q, k = triton_fused_norm_rope_cache(
                     q_raw,
                     k_raw,
@@ -930,6 +938,12 @@ class PagedAttentionImpl(nn.Module):
             return self.paged_attention_unified
 
         if wants_unified:
+            return self.paged_attention_unified
+        # A layer whose cache carries one scale for the whole tensor is exactly
+        # what unified wants, and rope_cache has already recorded which those
+        # are. Gated so the default keeps the EAGLE3 draft -- per-tensor since
+        # long before this switch -- on the path it has always taken.
+        if envs.ATOM_PER_TENSOR_KV and not self.per_token_quant:
             return self.paged_attention_unified
         if self.use_triton_attn:
             return self.paged_attention_triton

@@ -80,6 +80,14 @@ def _fused_qkv_norm_rope_cache_kernel(
     MROPE_S0: tl.constexpr = 0,
     MROPE_S1: tl.constexpr = 0,
     IS_MROPE: tl.constexpr = False,
+    # One scale for the whole cache instead of one per token. The scale is then
+    # an input, not an output: nothing is written back to k_scale/v_scale. This
+    # is what unified_attention needs -- it folds a single descale into qk_scale
+    # outside its tile loop and cannot index one per token.
+    PER_TENSOR_SCALE: tl.constexpr = False,
+    # Saturation bound for the per-tensor path, which unlike per-token has no
+    # structural guarantee that the quotient lands in range.
+    FP8_MAX: tl.constexpr = 448.0,
 ):
     # Grid: (num_tokens * (num_heads + num_kv_heads),)
     pid = tl.program_id(0)
@@ -242,19 +250,28 @@ def _fused_qkv_norm_rope_cache_kernel(
             slot_in_block = slot % BLOCK_SIZE
 
             if IS_FP8:
-                # FP8 per-token quantization for k
-                k_abs_max = tl.max(tl.abs(k_roped), axis=0)
-                k_scale = k_abs_max / 240.0
-                k_scale = tl.where(k_scale == 0.0, 1.0, k_scale)
-                k_quant = (k_roped / k_scale).to(k_cache_ptr.dtype.element_ty)
+                if PER_TENSOR_SCALE:
+                    k_scale = tl.load(k_scale_ptr)
+                    k_quant = tl.clamp(k_roped / k_scale, -FP8_MAX, FP8_MAX).to(
+                        k_cache_ptr.dtype.element_ty
+                    )
+                else:
+                    # FP8 per-token quantization for k. 240 is e4m3fnuz's max and
+                    # stays even where the cache is e4m3fn: it costs nothing (a
+                    # float only shifts its exponent) and changing it would move
+                    # the numerics of every model already on this path.
+                    k_abs_max = tl.max(tl.abs(k_roped), axis=0)
+                    k_scale = k_abs_max / 240.0
+                    k_scale = tl.where(k_scale == 0.0, 1.0, k_scale)
+                    k_quant = (k_roped / k_scale).to(k_cache_ptr.dtype.element_ty)
 
-                tl.store(
-                    k_scale_ptr
-                    + block_idx * ks_stride_block
-                    + kv_h * ks_stride_head
-                    + slot_in_block,
-                    k_scale,
-                )
+                    tl.store(
+                        k_scale_ptr
+                        + block_idx * ks_stride_block
+                        + kv_h * ks_stride_head
+                        + slot_in_block,
+                        k_scale,
+                    )
             else:
                 k_quant = k_roped.to(k_cache_ptr.dtype.element_ty)
 
@@ -273,20 +290,26 @@ def _fused_qkv_norm_rope_cache_kernel(
             tl.store(k_cache_ptrs, k_quant_2d)
 
             if IS_FP8:
-                # FP8 per-token quantization for v
                 v_f32 = v.to(tl.float32)
-                v_abs_max = tl.max(tl.abs(v_f32), axis=0)
-                v_scale = v_abs_max / 240.0
-                v_scale = tl.where(v_scale == 0.0, 1.0, v_scale)
-                v_quant = (v_f32 / v_scale).to(v_cache_ptr.dtype.element_ty)
+                if PER_TENSOR_SCALE:
+                    v_scale = tl.load(v_scale_ptr)
+                    v_quant = tl.clamp(v_f32 / v_scale, -FP8_MAX, FP8_MAX).to(
+                        v_cache_ptr.dtype.element_ty
+                    )
+                else:
+                    # FP8 per-token quantization for v (see the k branch on 240).
+                    v_abs_max = tl.max(tl.abs(v_f32), axis=0)
+                    v_scale = v_abs_max / 240.0
+                    v_scale = tl.where(v_scale == 0.0, 1.0, v_scale)
+                    v_quant = (v_f32 / v_scale).to(v_cache_ptr.dtype.element_ty)
 
-                tl.store(
-                    v_scale_ptr
-                    + block_idx * vs_stride_block
-                    + kv_h * vs_stride_head
-                    + slot_in_block,
-                    v_scale,
-                )
+                    tl.store(
+                        v_scale_ptr
+                        + block_idx * vs_stride_block
+                        + kv_h * vs_stride_head
+                        + slot_in_block,
+                        v_scale,
+                    )
             else:
                 v_quant = v.to(v_cache_ptr.dtype.element_ty)
 
@@ -342,6 +365,17 @@ def triton_fused_norm_rope_cache(
     sin_cache = rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
 
     is_fp8 = kv_cache_dtype == "fp8"
+
+    # A single-element scale means the caller has already decided this layer is
+    # per-tensor and is handing the value in; anything wider is the per-token
+    # output buffer. The two cannot be mixed on one layer -- the reader picks its
+    # descale by the same shape -- so k and v have to agree.
+    per_tensor_scale = is_fp8 and k_scale is not None and k_scale.numel() == 1
+    if per_tensor_scale and (v_scale is None or v_scale.numel() != 1):
+        raise ValueError(
+            "per-tensor KV needs a single-element v_scale to match k_scale; "
+            f"got {None if v_scale is None else tuple(v_scale.shape)}"
+        )
 
     block_size = k_cache.shape[3]  # k_cache: [B, H, D//X, block_size, X]
     x_size = k_cache.shape[4]
@@ -413,6 +447,8 @@ def triton_fused_norm_rope_cache(
         MROPE_S0=s0,
         MROPE_S1=s1,
         IS_MROPE=is_mrope,
+        PER_TENSOR_SCALE=per_tensor_scale,
+        FP8_MAX=float(torch.finfo(k_cache.dtype).max) if is_fp8 else 448.0,
     )
 
     return q_out, k_out

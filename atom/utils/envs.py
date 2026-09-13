@@ -395,6 +395,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Force Triton attention fallbacks where available. Set to 1 to bypass
     # optional ASM/OPUS fast paths during debugging.
     "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
+    # Quantize the full-context layers' KV against one scale per tensor instead
+    # of one per token, which is the condition unified_attention imposes: it
+    # folds a single descale into qk_scale outside its tile loop. Measured cost
+    # on MiniMax-M3 at 350K context is ~2.65% relative on K and V, indistinguish-
+    # able from e4m3's own rounding, because the per-token amax spread is only
+    # 2-3x (K) and a float spends that on the exponent, not the mantissa.
+    "ATOM_PER_TENSOR_KV": lambda: (os.getenv("ATOM_PER_TENSOR_KV", "0") == "1"),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
