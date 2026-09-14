@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 """Unit tests for the engram host path.
 
 The load-bearing test is `test_head_vocab_sizes_match_checkpoint`: the derived
@@ -18,6 +20,7 @@ from atom.model_ops.engram import (
     NgramHashMapping,
     _is_prime,
     _next_prime,
+    decode_block_scale,
 )
 from atom.model_ops.engram_layer import EngramOp
 
@@ -247,6 +250,17 @@ def test_cache_drop_forgets_every_layer_of_a_request():
     cache.drop(5)
     assert cache.take(5, 0) is None and cache.take(5, 2) is None
     assert cache.take(6, 0) is not None
+
+
+def test_decode_block_scale_uint8_and_float():
+    # Raw uint8 E8M0 codes are biased exponents: value = 2**(code - 127).
+    codes = torch.tensor([127, 128, 126, 130], dtype=torch.uint8)
+    got = decode_block_scale(codes, torch.float32)
+    torch.testing.assert_close(got, torch.tensor([1.0, 2.0, 0.5, 8.0]))
+    assert got.dtype == torch.float32
+    # A floating dtype (already decoded) passes through via .to().
+    f = torch.tensor([1.5, 2.5], dtype=torch.float32)
+    torch.testing.assert_close(decode_block_scale(f, torch.float32), f)
 
 
 def make_prefetcher() -> EngramPrefetcher:
@@ -518,6 +532,18 @@ def test_runtime_drop_requests_clears_cache_and_window():
     rt.drop_requests([91])
     assert 91 not in rt.prefetcher._window
     assert not rt.prefetcher.cache.contains(91, rt.layer_ids[0])
+    rt.shutdown()
+
+
+def test_runtime_stage_padded_rows_below_batch_stages_full_batch():
+    rt = make_runtime()
+    seq_ids = [31, 32]
+    tokens = np.array([[5], [6]], dtype=np.int64)
+    rt.prefetch_next(seq_ids, tokens)
+    # padded_rows below the batch size must not silently drop rows.
+    assert rt.stage_embeddings(seq_ids, tokens, padded_rows=1) == 2
+    for layer_id in rt.layer_ids:
+        assert rt.embeddings(layer_id).shape[0] == 2
     rt.shutdown()
 
 

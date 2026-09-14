@@ -816,12 +816,9 @@ class ModelRunner:
     def _config_declares_engram(config) -> bool:
         """Whether the model config declares engram layers, read without mapping
         the ~200 GB host tables (detection must precede model construction)."""
-        tc = getattr(config.hf_config, "text_config", None) or config.hf_config
-        return (
-            tc.get("engram_layer_ids") is not None
-            if isinstance(tc, dict)
-            else getattr(tc, "engram_layer_ids", None) is not None
-        )
+        from atom.model_ops.engram import config_declares_engram
+
+        return config_declares_engram(config.hf_config)
 
     def _build_and_load_model(self, model_class):
         """Construct the model and load its weights from disk.
@@ -830,18 +827,47 @@ class ModelRunner:
         construct on the meta device and import weights via IPC instead.
         """
         config = self.config
-        # Reject engram + speculative decoding BEFORE constructing the model,
-        # which memory-maps ~200 GB of host tables: the host prefetch keys on one
-        # sampled token per sequence per step and cannot carry a spec step's
-        # candidates or n-gram context. Detected from the config so we never map
-        # the tables just to raise afterwards.
-        if config.speculative_config is not None and self._config_declares_engram(
-            config
-        ):
-            raise NotImplementedError(
-                "engram is not supported with speculative decoding; serve "
-                "engram models without a speculative_config"
-            )
+        # Reject unsupported engram combinations BEFORE constructing the model,
+        # which memory-maps ~200 GB of host tables (detected from the config so we
+        # never map the tables just to raise afterwards):
+        if self._config_declares_engram(config):
+            # Speculative decoding / MTP: the host prefetch keys on one sampled
+            # token per sequence per step and cannot carry a spec step's
+            # candidates or n-gram context.
+            if config.speculative_config is not None:
+                raise NotImplementedError(
+                    "engram is not supported with speculative decoding / MTP; "
+                    "serve engram models without a speculative_config"
+                )
+            # Two-batch overlap / context or pipeline parallel: staging covers the
+            # whole batch and waits on the caller's stream, but these modes run the
+            # model on a sliced/round-robined subset of rows (and, for TBO, on
+            # per-ubatch streams), so the staged rows would not line up with the
+            # local hidden states. Pipeline parallel also returns before
+            # postprocess on non-last ranks, so the prefetch never runs.
+            if config.enable_tbo or config.enable_tbo_decode:
+                raise NotImplementedError(
+                    "engram is not supported with two-batch overlap (TBO); serve "
+                    "engram models without --enable-tbo/--enable-tbo-decode"
+                )
+            if (
+                config.pipeline_parallel_size > 1
+                or config.prefill_context_parallel_size > 1
+                or config.decode_context_parallel_size > 1
+            ):
+                raise NotImplementedError(
+                    "engram is not supported with pipeline or context parallelism; "
+                    "serve engram models with pipeline/context parallel size 1"
+                )
+            # KV-transfer disaggregation: the decode consumer is marked
+            # is_first_decode without a local prefill, so no prefill_context is
+            # populated and the n-gram window is never seeded -- the first decode
+            # would pad every multi-token n-gram instead of using the prompt tail.
+            if config.kv_transfer_config:
+                raise NotImplementedError(
+                    "engram is not supported with KV-transfer disaggregation; the "
+                    "decode consumer runs no local prefill to seed the n-gram context"
+                )
         self.model = model_class(config)
         fused_shared_expert_load_fn = None
         if hasattr(self.model, "load_fused_expert_weights"):

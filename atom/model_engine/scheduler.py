@@ -519,13 +519,10 @@ class Scheduler:
         # Engram models need each prefill batch to carry the tokens preceding a
         # chunk (see ScheduledBatch.prefill_context). Read max_ngram_size once;
         # None for non-engram models so the batch build stays free.
+        from atom.model_ops.engram import config_declares_engram
+
         tc = getattr(config.hf_config, "text_config", None) or config.hf_config
-        _engram_declared = (
-            tc.get("engram_layer_ids") is not None
-            if isinstance(tc, dict)
-            else getattr(tc, "engram_layer_ids", None) is not None
-        )
-        if _engram_declared:
+        if config_declares_engram(config.hf_config):
             self._engram_ngram = int(
                 tc["engram_max_ngram_size"]
                 if isinstance(tc, dict)
@@ -1679,7 +1676,9 @@ class Scheduler:
                 next_token_ids=next_token_ids,
                 state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
                 engram_ngram=self._engram_ngram,
-                engram_dropped=self._drain_engram_dropped(),
+                engram_dropped=(
+                    self._drain_engram_dropped() if scheduled_seqs else None
+                ),
             )
             self._consume_state_forks(scheduled_seqs)
 
@@ -2429,7 +2428,9 @@ class Scheduler:
         and clear them, so each is dropped from the engram host exactly once."""
         if not self._engram_drop_pending:
             return None
-        dropped = self._engram_drop_pending
+        # Dedup (a seq can be appended twice, e.g. preempted then finished) so
+        # each id is dropped exactly once, in order.
+        dropped = list(dict.fromkeys(self._engram_drop_pending))
         self._engram_drop_pending = []
         return dropped
 

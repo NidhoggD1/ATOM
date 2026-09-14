@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 """Device-side Engram op and the module that attaches it to a model.
 
 `EngramOp` is the per-layer device compute; `EngramModules` builds one op per
@@ -160,6 +162,10 @@ class EngramOp(nn.Module):
                 )
         if wkv_scale is not None:
             rows, cols = wkv.shape
+            if rows % block or cols % block:
+                raise ValueError(
+                    f"wkv {(rows, cols)} is not divisible by block size {block}"
+                )
             if tuple(wkv_scale.shape) != (rows // block, cols // block):
                 raise ValueError(
                     f"wkv scale is {tuple(wkv_scale.shape)}, expected "

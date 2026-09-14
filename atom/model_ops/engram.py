@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 """Engram: n-gram hash -> multi-head embedding lookup, computed on the host.
 
 DeepSeek's Engram (https://github.com/deepseek-ai/Engram) augments a few decoder
@@ -17,10 +19,12 @@ import hashlib
 import logging
 import os
 import threading
+import uuid
 import zipfile
 from collections import OrderedDict, deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +36,17 @@ logger = logging.getLogger(__name__)
 # Matches the reference: layer seeds are spaced by this prime so two layers
 # never draw the same multiplier sequence.
 _LAYER_SEED_STRIDE = 10007
+
+
+def config_declares_engram(hf_config) -> bool:
+    """Whether a HF config declares engram layers (in `text_config` or at root),
+    read without constructing the model or mapping the tables."""
+    tc = getattr(hf_config, "text_config", None) or hf_config
+    return (
+        tc.get("engram_layer_ids") is not None
+        if isinstance(tc, dict)
+        else getattr(tc, "engram_layer_ids", None) is not None
+    )
 
 
 def _is_prime(n: int) -> bool:
@@ -137,20 +152,35 @@ class CompressedTokenizer:
         return self.num_new_token
 
     def _cache_key(self) -> str:
-        # `_build` keys the compressed table on the full id->token mapping, so
-        # the cache key must cover all of it: hashing only the vocab length and
-        # the first 1024 token strings lets two tokenizers that share a prefix
-        # but assign different ids reuse each other's table (a silently wrong
-        # lookup). Hash every (token, id) pair instead.
-        vocab = self._tokenizer.get_vocab()
+        # `_build` keys the compressed table on decode() / convert_ids_to_tokens()
+        # over the whole vocab, so the cache key must capture the tokenizer's full
+        # behavior, not just get_vocab(): two tokenizers can share a vocab mapping
+        # yet differ in decoder, normalizer, or added tokens and produce different
+        # compressed ids. A fast tokenizer serializes to a string that covers all
+        # of that; otherwise fall back to the id->token mapping plus added tokens.
         h = hashlib.sha256()
         h.update(str(self._CACHE_VERSION).encode())
-        h.update(str(len(vocab)).encode())
-        for tok, tid in sorted(vocab.items()):
-            h.update(tok.encode("utf-8", "replace"))
-            h.update(b"\x00")
-            h.update(str(tid).encode())
-            h.update(b"\x00")
+        backend = getattr(self._tokenizer, "backend_tokenizer", None)
+        serialized = (
+            backend.to_str()
+            if backend is not None and hasattr(backend, "to_str")
+            else None
+        )
+        if serialized is not None:
+            h.update(serialized.encode("utf-8"))
+        else:
+            vocab = self._tokenizer.get_vocab()
+            h.update(str(len(vocab)).encode())
+            for tok, tid in sorted(vocab.items()):
+                h.update(tok.encode("utf-8", "replace"))
+                h.update(b"\x00")
+                h.update(str(tid).encode())
+                h.update(b"\x00")
+            added = getattr(self._tokenizer, "get_added_vocab", dict)()
+            for tok, tid in sorted(added.items()):
+                h.update(b"+")
+                h.update(tok.encode("utf-8", "replace"))
+                h.update(str(tid).encode())
         return h.hexdigest()[:16]
 
     def _load_or_build(self, cache_dir: str | None) -> tuple[np.ndarray, int]:
@@ -160,9 +190,9 @@ class CompressedTokenizer:
         path = Path(cache_dir) / f"compressed_vocab_{self._cache_key()}.npz"
         if path.is_file():
             try:
-                blob = np.load(path)
-                logger.info("engram: loaded compressed-vocab table from %s", path)
-                return blob["lookup"], int(blob["num_new_token"])
+                with np.load(path) as blob:
+                    logger.info("engram: loaded compressed-vocab table from %s", path)
+                    return blob["lookup"], int(blob["num_new_token"])
             except (OSError, ValueError, KeyError, zipfile.BadZipFile):
                 # A truncated or stale cache must not take the server down; the
                 # table is reproducible, so fall through and rebuild it. These
@@ -173,7 +203,11 @@ class CompressedTokenizer:
         lookup, num_new_token = self._build()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".tmp.npz")
+            # A unique temp per writer: every rank builds the same <key> table, so
+            # a shared temp name lets concurrent np.savez calls corrupt each
+            # other's file. uuid4 is unique across processes and threads; os.replace
+            # is atomic, so racing writers just overwrite the final path harmlessly.
+            tmp = path.with_name(f"{path.stem}.{uuid.uuid4().hex}.tmp.npz")
             np.savez(tmp, lookup=lookup, num_new_token=num_new_token)
             os.replace(tmp, path)
         except OSError as exc:
@@ -506,9 +540,11 @@ class EngramPrefetcher:
     which release the GIL, and an unbounded thread-per-step (as in the reference)
     both races with its own consumer and contends with the runner for the GIL.
 
-    `submit` returns a Future so the consumer can wait for a specific step rather
-    than hoping the daemon finished. When the result is not ready in time the
-    caller computes it inline -- correctness never depends on the race.
+    `submit_compute` returns a Future so the consumer waits for the queued
+    prefetch before reading the cache; a genuine cache miss (an evicted or
+    just-admitted row) is then recomputed inline. The prefetch only decides
+    whether the work was already done, never the answer -- it is not a bounded
+    no-stall policy: `stage_embeddings` waits for the worker.
     """
 
     def __init__(
@@ -627,9 +663,11 @@ class EngramPrefetcher:
         for layer_id in self.layer_ids:
             hashes = self._hash_mapping.hash_layer(compressed, layer_id, compress=False)
             rows = self._hash_mapping.to_row_indices(hashes, layer_id)
-            gathered = self._tables[layer_id].gather(rows)
+            # Only the last position is used, so gather just its rows -- gathering
+            # the whole window would multiply the host table reads by ngram size.
+            gathered = self._tables[layer_id].gather(rows[:, -1])
             for i, seq_id in enumerate(seq_ids):
-                results[(seq_id, layer_id)] = gathered[i][-1]
+                results[(seq_id, layer_id)] = gathered[i]
         return results
 
     def compute_prefill(
@@ -679,11 +717,20 @@ class EngramPrefetcher:
         directly.
         """
 
+        if (token_ids is None) == (token_source is None):
+            raise ValueError(
+                "submit_compute needs exactly one of token_ids/token_source"
+            )
+
+        # Admit on the SUBMIT thread, not in `_run`: these seqs are being
+        # prefetched now, so clear any stale drop-mark synchronously. If a drop
+        # then lands before the worker's `put`, the put is correctly skipped --
+        # doing the admit inside `_run` (after the async token read) would let it
+        # clear a fresh drop and resurrect a finished request's rows.
+        self.cache.admit(seq_ids)
+
         def _run() -> None:
             toks = token_source() if token_source is not None else token_ids
-            # These seqs are being prefetched now, so clear any stale drop-mark
-            # (a reused seq id) before the results land.
-            self.cache.admit(seq_ids)
             windows = self.advance(seq_ids, toks)
             for key, value in self.compute(seq_ids, windows).items():
                 self.cache.put(key[0], key[1], value)
@@ -698,7 +745,7 @@ class EngramPrefetcher:
         try:
             self._inflight.result(timeout=timeout)
             return True
-        except TimeoutError:
+        except FuturesTimeoutError:
             return False
 
     def drop_requests(self, seq_ids: list[int]) -> None:
@@ -729,9 +776,10 @@ class EngramHost:
       3. `wait_for_embeddings` makes the compute stream wait on that event, so the
          engram layers read staged rows rather than racing the copy.
 
-    A sequence whose prefetch has not landed is computed inline in `stage_embeddings`. The
-    result is identical either way -- the prefetch only decides whether the work
-    was already done, never what the answer is.
+    `stage_embeddings` waits for the queued prefetch, then recomputes any cache
+    miss (an evicted or just-admitted row) inline. The result is identical either
+    way -- the prefetch only decides whether the work was already done, never the
+    answer.
     """
 
     def __init__(
@@ -791,14 +839,30 @@ class EngramHost:
             self.copy_done = [torch.cuda.Event() for _ in range(self._n_slots)]
             for event in self.copy_done:
                 event.record(self.copy_stream)  # so the first reuse can wait it
+            # Double-buffer the token D2H (like the staging ring): prefill/warmup
+            # steps do not wait the worker, so a later prefetch's copy could
+            # overwrite a buffer the worker has not read yet. Two slots let
+            # consecutive prefetches use different buffers; the per-slot read-done
+            # signal is what guarantees correctness (reuse waits until the worker
+            # copied the buffer out), so the slot count only trades blocking
+            # frequency, not safety.
             self._token_d2h_stream = torch.cuda.Stream(device)
-            self._token_event = torch.cuda.Event()
-            self._token_host = torch.empty(
-                max_num_tokens, dtype=torch.int64
-            ).pin_memory()
+            self._n_token_slots = self._n_slots
+            self._token_slot = 0
+            self._token_event = [torch.cuda.Event() for _ in range(self._n_token_slots)]
+            self._token_host = [
+                torch.empty(max_num_tokens, dtype=torch.int64).pin_memory()
+                for _ in range(self._n_token_slots)
+            ]
+            self._token_read_done = [
+                threading.Event() for _ in range(self._n_token_slots)
+            ]
+            for done in self._token_read_done:
+                done.set()  # free until first use
         else:
             self.copy_stream = self.copy_done = None
             self._token_d2h_stream = self._token_event = self._token_host = None
+            self._token_read_done = None
         self._staged_rows = 0
 
     def _next_slot(self) -> None:
@@ -839,8 +903,12 @@ class EngramHost:
             raise ValueError(
                 f"{num_rows} rows exceeds staging capacity {self.max_num_tokens}"
             )
+        # Never below num_rows: padded_rows is a bucket height (>= scheduled
+        # rows); a smaller value would stage fewer rows than there are sequences.
         staged_rows = (
-            num_rows if padded_rows is None else min(padded_rows, self.max_num_tokens)
+            num_rows
+            if padded_rows is None
+            else max(num_rows, min(padded_rows, self.max_num_tokens))
         )
         self.prefetcher.wait(timeout=None)
 
@@ -886,10 +954,10 @@ class EngramHost:
             if staged_rows > num_rows:
                 cpu[num_rows:staged_rows].zero_()
 
-        self._issue_h2d(staged_rows)
+        self._embeddings_h2d(staged_rows)
         return staged_rows
 
-    def _issue_h2d(self, rows: int) -> None:
+    def _embeddings_h2d(self, rows: int) -> None:
         """Copy `rows` staged rows from the current host slot to every layer's
         device buffer and record the slot's completion event, which
         `wait_for_embeddings` and the slot's next reuse order against."""
@@ -956,7 +1024,7 @@ class EngramHost:
                     ctx = np.asarray(context_tails[i]).reshape(-1)
                     tail = np.concatenate([ctx, chunk])[-need:]
                 self.seed_context(seq_id, tail)
-        self._issue_h2d(total)
+        self._embeddings_h2d(total)
         return total
 
     def stage_dummy(self, num_rows: int) -> int:
@@ -971,7 +1039,7 @@ class EngramHost:
         self._next_slot()
         for layer_id in self.layer_ids:
             self._host_slots[layer_id][self._slot][:num_rows].zero_()
-        self._issue_h2d(num_rows)
+        self._embeddings_h2d(num_rows)
         return num_rows
 
     def wait_for_embeddings(self) -> None:
@@ -1001,19 +1069,32 @@ class EngramHost:
         if not n:
             return
         if torch.is_tensor(tokens) and tokens.is_cuda:
+            # Take this prefetch's own ring slot; wait until the worker has read
+            # the slot's previous occupant before reusing its buffer (a no-op
+            # unless several prefetches are outstanding without a drain).
+            slot = self._token_slot
+            self._token_slot = (slot + 1) % self._n_token_slots
+            self._token_read_done[slot].wait()
+            self._token_read_done[slot].clear()
+            host, event, read_done = (
+                self._token_host[slot],
+                self._token_event[slot],
+                self._token_read_done[slot],
+            )
             col = tokens.detach().reshape(n, -1)[:, -1].to(torch.int64)
             self._token_d2h_stream.wait_stream(torch.cuda.current_stream(self.device))
             with torch.cuda.stream(self._token_d2h_stream):
-                self._token_host[:n].copy_(col, non_blocking=True)
+                host[:n].copy_(col, non_blocking=True)
             # Keep `col` from being recycled by the allocator until the side
             # stream's copy has consumed it.
             col.record_stream(self._token_d2h_stream)
-            self._token_event.record(self._token_d2h_stream)
-            event, host = self._token_event, self._token_host
+            event.record(self._token_d2h_stream)
 
             def _read() -> np.ndarray:
                 event.synchronize()
-                return np.array(host[:n]).reshape(n, 1)
+                out = np.array(host[:n]).reshape(n, 1)
+                read_done.set()  # buffer is free to reuse
+                return out
 
             self.prefetcher.submit_compute(seq_ids, token_source=_read)
         else:
