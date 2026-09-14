@@ -1089,6 +1089,70 @@ class OffloadSchedulerMixin(ABC):
             self._lookup_tokens // count,
         )
 
+    def _skip_unloadable_lookup(self, num_prompt: int, hbm_cached: int) -> bool:
+        """Whether this request's lookup can be answered without asking.
+
+        A lookup costs a ZMQ round trip to every worker rank, and the ranks are
+        busy running the model: measured on M3 at 46647 blocks, a lookup blocks
+        the scheduler for 4.4 ms early in a run and 14-17 ms once prompts grow,
+        22.4 s of an 853 s window -- 2.6% of wall clock -- while the hashing it
+        nominally pays for is 0.4 ms of that. The cost is queueing behind the
+        forward pass for the GIL, so the lever is the number of lookups, not
+        their size.
+
+        Most of those lookups cannot change anything. A load is emitted only if
+        ``_decide_load_after_alloc`` clears it, and that needs at least
+        ``_min_load_tokens`` beyond the chunk boundary above the HBM frontier.
+        The slow tier can never offer more than the prompt itself, and a
+        full-prompt hit is trimmed by one token so the last one is recomputed,
+        so ``num_prompt - 1 - hbm_cached`` bounds what any answer could be worth.
+        When that bound is under the floor, the answer is irrelevant: the
+        request prefills from HBM plus recompute whatever LMCache says.
+
+        The bound stays valid as the request runs, which is why it is safe to
+        decide this early. ``hbm_cached`` is vLLM's prefix-cache frontier pushed
+        in by the plugin before the lookup, and a frontier only moves forward,
+        so the margin only shrinks. On ATOM's native scheduler the frontier is
+        not known yet (it is set by ``block_manager.allocate``, which runs
+        after), so the bound degenerates to ``num_prompt - 1`` and this fires
+        only for prompts too short to load in the first place -- correct there
+        too, just rarely useful.
+
+        Off by default, like save admission: it trades a cache hit that the
+        current floor would have refused anyway for the round trip, which is
+        the right trade only once the floor is trusted.
+        """
+        enabled = getattr(self, "_lookup_skip_unloadable", None)
+        if enabled is None:
+            enabled = os.environ.get(
+                "OFFLOAD_LOOKUP_SKIP_UNLOADABLE", "0"
+            ).lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
+            self._lookup_skip_unloadable = enabled
+        if not enabled:
+            return False
+        min_load = int(getattr(self, "_min_load_tokens", 8192))
+        if num_prompt - 1 - int(hbm_cached) >= min_load:
+            return False
+        skipped = getattr(self, "_lookup_skipped", 0) + 1
+        self._lookup_skipped = skipped
+        every = int(getattr(self, "_lookup_report_every", 0) or 0)
+        if every <= 0:
+            every = _env_int("OFFLOAD_LOOKUP_REPORT_EVERY", 256, minimum=1)
+            self._lookup_report_every = every
+        if skipped % every == 0:
+            logger.info(
+                "[OFFLOAD-LOOKUP-SKIP] skipped=%d issued=%d min_load=%d",
+                skipped,
+                getattr(self, "_lookup_calls", 0),
+                min_load,
+            )
+        return True
+
     def _mark_load_skip(
         self,
         seq,

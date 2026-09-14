@@ -166,6 +166,16 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             # An older lifecycle still owns this worker-side pin. Its cleanup
             # must be dispatched before the ID can acquire a new lease.
             return 0, False
+        hbm_cached = int(seq.num_cached_tokens)
+        if pending is None and self._skip_unloadable_lookup(num_prompt, hbm_cached):
+            # HBM already covers all but a sub-floor tail, so no answer the slow
+            # tier could give would clear `_decide_load_after_alloc`. Leave the
+            # save floor a hit would have left: those tokens came out of the HBM
+            # prefix cache, so this request never computed them and has nothing
+            # new to write there. No lookup was issued, so there is no
+            # worker-side pin to release either.
+            self._hit_save_floors[sid] = self._chunk_floor(hbm_cached)
+            return 0, False
         try:
             if pending is None:
                 if sid not in self._lookup_in_step:

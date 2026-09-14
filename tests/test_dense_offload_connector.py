@@ -881,3 +881,54 @@ def test_dense_lookup_cost_is_tallied(monkeypatch):
     assert sched._lookup_calls == 2
     assert sched._lookup_seconds > 0.0
     assert sched._lookup_tokens == 24 + 32
+
+
+def _skip_scheduler(monkeypatch, *, enabled):
+    if enabled:
+        monkeypatch.setenv("OFFLOAD_LOOKUP_SKIP_UNLOADABLE", "1")
+    else:
+        monkeypatch.delenv("OFFLOAD_LOOKUP_SKIP_UNLOADABLE", raising=False)
+    sched = _lookup_scheduler(monkeypatch, hit=20000)
+    sched._min_load_tokens = 8192
+    return sched
+
+
+def _cached_seq(req_id, *, num_prompt_tokens, num_cached_tokens):
+    seq = _load_seq(req_id, num_prompt_tokens=num_prompt_tokens)
+    seq.num_cached_tokens = num_cached_tokens
+    return seq
+
+
+def test_dense_lookup_skipped_when_hbm_leaves_no_room_to_load(monkeypatch):
+    """HBM covers all but a sub-floor tail, so no answer could be acted on."""
+    sched = _skip_scheduler(monkeypatch, enabled=True)
+    seq = _cached_seq(948, num_prompt_tokens=20000, num_cached_tokens=16000)
+
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    assert sched._lookup_client.calls == 0
+    # The prefix came out of HBM, so this request has nothing new to save there.
+    assert sched._hit_save_floors["948"] == 16000
+
+    sched.update_state_after_alloc(seq)
+    assert sched._save_tracker["948"][1] == 16000
+
+
+def test_dense_lookup_still_issued_when_the_tail_could_be_loaded(monkeypatch):
+    sched = _skip_scheduler(monkeypatch, enabled=True)
+    seq = _cached_seq(949, num_prompt_tokens=20000, num_cached_tokens=0)
+
+    need, park = sched.get_num_new_matched_tokens(seq)
+
+    assert sched._lookup_client.calls == 1
+    # Full-prompt hit: one token back so something is left to compute, then
+    # floored to a chunk the tier can actually serve.
+    assert (need, park) == (19992, True)
+
+
+def test_dense_lookup_skip_is_off_by_default(monkeypatch):
+    sched = _skip_scheduler(monkeypatch, enabled=False)
+    seq = _cached_seq(950, num_prompt_tokens=20000, num_cached_tokens=16000)
+
+    sched.get_num_new_matched_tokens(seq)
+
+    assert sched._lookup_client.calls == 1
