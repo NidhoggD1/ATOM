@@ -38,7 +38,7 @@ V4_ATTN = (
 
 def _view_source() -> str:
     src = V4_ATTN.read_text()
-    m = re.search(r"class _MixedDecodeView.*?(?=\nclass )", src, re.S)
+    m = re.search(r"class _MixedDecodeView.*?(?=\nclass )", src, re.DOTALL)
     assert m, "_MixedDecodeView not found"
     return m.group(0)
 

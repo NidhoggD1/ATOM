@@ -87,8 +87,13 @@ def _probe_step_budget(
     mixed = sum(1 for r in rows if r[0] > 0 and r[1] > 0)
     pref_only = sum(1 for r in rows if r[0] > 0 and r[1] == 0)
     dec_only = sum(1 for r in rows if r[0] == 0 and r[1] > 0)
-    avg = lambda i: sum(r[i] for r in rows) / n  # noqa: E731
-    mx = lambda i: max(r[i] for r in rows)  # noqa: E731
+
+    def avg(i):
+        return sum(r[i] for r in rows) / n
+
+    def mx(i):
+        return max(r[i] for r in rows)
+
     logger.warning(
         "[probe] step budget over %d steps: mixed=%d prefill_only=%d "
         "decode_only=%d | reserve avg=%.1f max=%d | prefill_budget avg=%.1f | "
