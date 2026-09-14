@@ -1945,7 +1945,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         slot_d = [
             bt[-1] * self.model_runner.block_size + lbt - 1
-            for bt, lbt in zip(d_block_tables, d_last_block)
+            for bt, lbt in zip(d_block_tables, d_last_block, strict=True)
         ]
         positions_d = (d_ctx - 1).astype(np.int32)
 
