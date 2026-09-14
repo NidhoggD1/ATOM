@@ -11,6 +11,7 @@ from atom.kv_transfer.disaggregation.types import (
     LoadOperationId,
     SaveOperationId,
 )
+from atom.kv_transfer.offload import _offload_common
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
@@ -906,7 +907,8 @@ def test_dense_lookup_skipped_when_hbm_leaves_no_room_to_load(monkeypatch):
 
     assert sched.get_num_new_matched_tokens(seq) == (0, False)
     assert sched._lookup_client.calls == 0
-    # The prefix came out of HBM, so this request has nothing new to save there.
+    # The floor a hit would have left. It is the connector's only record of
+    # what LMCache holds; without it the next examination re-saves everything.
     assert sched._hit_save_floors["948"] == 16000
 
     sched.update_state_after_alloc(seq)
@@ -931,4 +933,149 @@ def test_dense_lookup_skip_is_off_by_default(monkeypatch):
 
     sched.get_num_new_matched_tokens(seq)
 
+    assert sched._lookup_client.calls == 1
+
+
+def _measure_actionable(sched, actionable, lookups=64):
+    """Feed the estimator as `lookups` real lookups would.
+
+    Driving whole requests through `get_num_new_matched_tokens` would measure
+    the same thing but would also have to dodge the skip under test, so the two
+    accounting calls a lookup makes are invoked directly. `min_load` is 8192
+    here, so a hit 20000 past the HBM frontier is actionable and one level with
+    it is not.
+    """
+    hit, hbm = (28192, 20000) if actionable else (20000, 20000)
+    for _ in range(lookups):
+        sched._lookup_calls = getattr(sched, "_lookup_calls", 0) + 1
+        sched._note_lookup_actionable(hit, hbm)
+
+
+def test_dense_skip_stands_down_when_slow_tier_is_load_bearing(monkeypatch):
+    """A tier whose answers are actionable must not be starved of writes.
+
+    The bound still says no answer could produce a load *for this request*.
+    But skipping also leaves the save floor at the HBM frontier, and where the
+    tier is really serving, that suppressed write is a hit somebody loses
+    later -- measured at 16612 blocks as 3.8 points of throughput.
+    """
+    sched = _skip_scheduler(monkeypatch, enabled=True)
+    _measure_actionable(sched, True)
+    seq = _cached_seq(951, num_prompt_tokens=20000, num_cached_tokens=16000)
+
+    sched.get_num_new_matched_tokens(seq)
+    assert sched._lookup_client.calls == 1
+
+
+def test_dense_skip_fires_when_answers_are_never_actionable(monkeypatch):
+    """The 46647-block case: LMCache answers nearly every lookup, and HBM
+    already held all of it -- 2301 of 2305 hits discarded. The round trip buys
+    nothing, so a hit rate would have kept it; an actionable rate drops it."""
+    sched = _skip_scheduler(monkeypatch, enabled=True)
+    _measure_actionable(sched, False)
+    seq = _cached_seq(952, num_prompt_tokens=20000, num_cached_tokens=16000)
+
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    assert sched._lookup_client.calls == 0
+    assert sched._hit_save_floors["952"] == 16000
+
+
+def test_dense_unmeasured_slow_tier_does_not_block_the_skip(monkeypatch):
+    """Before the warmup there is no estimate, and no estimate allows the skip.
+
+    Safe in that direction: the skip's bound needs HBM to cover all but a
+    sub-floor tail, which a cold pool does not, so lookups run and feed the
+    estimator before the skip can fire in a real run.
+    """
+    sched = _skip_scheduler(monkeypatch, enabled=True)
+    _measure_actionable(sched, True, lookups=8)
+    seq = _cached_seq(953, num_prompt_tokens=20000, num_cached_tokens=16000)
+
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    assert sched._lookup_client.calls == 0
+
+
+def test_dense_skipped_lookup_still_records_a_negative_verdict(monkeypatch):
+    """A skip must not hide from save admission what it already knows.
+
+    The skip fires only when no slow-tier answer could clear
+    `_decide_load_after_alloc`, which is the same thing `paid_off=False`
+    records -- so the verdict is owed whether or not the lookup ran.
+    """
+    sched = _skip_scheduler(monkeypatch, enabled=True)
+    seq = _cached_seq(954, num_prompt_tokens=20000, num_cached_tokens=16000)
+    before = sched.slow_tier_verdict_totals()
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    assert sched._lookup_client.calls == 0
+    paid_off, probes = sched.slow_tier_verdict_totals()
+    assert probes == before[1] + 1
+    assert paid_off == before[0]
+
+
+def _feed_actionable_every(sched, every, lookups):
+    """Feed `lookups` samples of which every `every`-th is actionable.
+
+    Reproduces a measured trajectory rather than a corner: 46647 blocks
+    returned 4 actionable answers in 2048 probes (every=512), and a cold 16612
+    tier trickles a few percent per block long before it becomes properly
+    useful (every=32). The gate has to separate those two, and they differ by
+    an order of magnitude, not by the 10x margin either has to 10%.
+    """
+    for i in range(lookups):
+        hit, hbm = (28192, 20000) if i % every == 0 else (20000, 20000)
+        sched._lookup_calls = getattr(sched, "_lookup_calls", 0) + 1
+        sched._note_lookup_actionable(hit, hbm)
+
+
+def test_dense_cold_tier_trickle_holds_the_gate_shut(monkeypatch):
+    """A filling tier must keep its writes even while it looks useless.
+
+    At 16612 blocks the tier needs ~1536 probes before its answers are worth
+    loading, and for all of that time its actionable rate reads 0-17%. A 10%
+    cut opened here and starved the fill -- 1280 skips, -1.91% against the
+    never-skip control. A trickle of one usable answer in 32 settles the EMA
+    near 0.039, so a 1% cut keeps paying for the round trip.
+    """
+    sched = _skip_scheduler(monkeypatch, enabled=True)
+    _feed_actionable_every(sched, every=32, lookups=256)
+    assert sched._lookup_actionable_ema > 0.01
+    seq = _cached_seq(955, num_prompt_tokens=20000, num_cached_tokens=16000)
+
+    sched.get_num_new_matched_tokens(seq)
+    assert sched._lookup_client.calls == 1
+
+
+def test_dense_steady_redundant_tier_stays_below_the_cut(monkeypatch):
+    """The 46647 rate, at the measured density: 4 usable answers in 2048.
+
+    Same side of a 10% cut as the trickle above, opposite side of a 1% one --
+    which is the whole reason the cut moved.
+    """
+    sched = _skip_scheduler(monkeypatch, enabled=True)
+    _feed_actionable_every(sched, every=512, lookups=2048)
+    assert sched._lookup_actionable_ema < 0.01
+    seq = _cached_seq(956, num_prompt_tokens=20000, num_cached_tokens=16000)
+
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    assert sched._lookup_client.calls == 0
+
+
+def test_dense_forced_probe_samples_the_tier_the_gate_is_ignoring(monkeypatch):
+    """An open gate must not blind the estimator that opens it.
+
+    Every skipped request is one the estimator never hears about, so a gate
+    fed only by issued lookups can never learn that the tier has become
+    useful. One skippable request in `_LOOKUP_ACT_PROBE_EVERY` pays anyway.
+    """
+    sched = _skip_scheduler(monkeypatch, enabled=True)
+    _measure_actionable(sched, False)
+    every = _offload_common._LOOKUP_ACT_PROBE_EVERY
+
+    for i in range(1, every):
+        seq = _cached_seq(f"p{i}", num_prompt_tokens=20000, num_cached_tokens=16000)
+        assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    assert sched._lookup_client.calls == 0
+
+    seq = _cached_seq(f"p{every}", num_prompt_tokens=20000, num_cached_tokens=16000)
+    sched.get_num_new_matched_tokens(seq)
     assert sched._lookup_client.calls == 1

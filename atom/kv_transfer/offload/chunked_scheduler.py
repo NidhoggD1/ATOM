@@ -168,12 +168,34 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return 0, False
         hbm_cached = int(seq.num_cached_tokens)
         if pending is None and self._skip_unloadable_lookup(num_prompt, hbm_cached):
-            # HBM already covers all but a sub-floor tail, so no answer the slow
-            # tier could give would clear `_decide_load_after_alloc`. Leave the
-            # save floor a hit would have left: those tokens came out of the HBM
-            # prefix cache, so this request never computed them and has nothing
-            # new to write there. No lookup was issued, so there is no
-            # worker-side pin to release either.
+            # HBM already covers all but a sub-floor tail, so no answer the
+            # slow tier could give would clear `_decide_load_after_alloc`.
+            #
+            # Leave the save floor a hit would have left. That asserts
+            # LMCache already holds the HBM-resident prefix, which nothing
+            # checked -- and it is worth 20% of stored bandwidth where HBM
+            # covers nearly everything. `_skip_unloadable_lookup` refuses to
+            # fire where that assertion would starve a working tier, which is
+            # what makes it safe to make here.
+            #
+            # The floor is not optional. It is the only record the connector
+            # keeps of what LMCache holds, so dropping it does not mean "write
+            # the prefix once", it means rewrite the whole prompt on every
+            # request: measured, stored bandwidth 0.272 -> 2.448 GB/s and
+            # throughput -44.7%.
+            #
+            # No lookup was issued, so there is no worker-side pin to release.
+            #
+            # The verdict still has to be recorded. Save admission listens to
+            # `_decide_load_after_alloc`, and `paid_off` means that gate emitted
+            # a load; the skip fires precisely when no answer could make it do
+            # so, which makes False the verdict this request provably would
+            # have reached. Dropping it does not just lose a sample, it loses a
+            # biased one: the skipped requests are the ones HBM already covers,
+            # so what survives over-reports payoff. Measured at 16612 blocks,
+            # `slow_tier_unused` falls 1779 -> 226 while `aligned_large_hit`
+            # holds at 1293 -> 1313, doubling the estimate the controller sees.
+            self.note_slow_tier_verdict(False)
             self._hit_save_floors[sid] = self._chunk_floor(hbm_cached)
             return 0, False
         try:
@@ -190,6 +212,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 lookup_started = time.perf_counter()
                 hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
                 self._note_lookup_cost(time.perf_counter() - lookup_started, num_prompt)
+                self._note_lookup_actionable(int(hit or 0), hbm_cached)
                 if hit is None:
                     self._lookup_results.pop(sid, None)
                 else:

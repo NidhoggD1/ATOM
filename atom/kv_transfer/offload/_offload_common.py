@@ -671,6 +671,45 @@ class StateOffloadFace(ABC):
     def take_state_source_releases(self) -> set: ...
 
 
+# How often a lookup must come back with something HBM did not already have
+# before the round trip is worth paying for.
+#
+# The cut sits at 1% because a cold tier and a redundant one are not separated
+# by a generous threshold. Differencing `[OFFLOAD-ADMISSION]` per 256 probes,
+# the actionable rate reads
+#
+#     16612 blocks  .000 .016 .070 .055 .008 .172 | .980 .961 .930 ...
+#     46647 blocks  .000 .000 .000 .008 .000 .000   .000 .008
+#
+# -- the 16612 tier needs ~1536 probes to become useful, and for all of that
+# time a 10% cut cannot tell it apart from 46647's steady state. A gate at 10%
+# opens during the fill and starves the tier it was filling: measured as
+# 1280 skips and -1.91% against the never-skip control. What does separate them
+# is that 46647 returns 4 actionable answers in 2048 probes while 16612
+# trickles 1.6-7% from its second block on, so the cut goes below the trickle.
+#
+# One actionable answer lifts the EMA by `_LOOKUP_ACT_ALPHA` = 1/64 = 0.0156,
+# on its own enough to shut the gate for ~40 lookups. That is the safe
+# direction: paying a round trip that buys nothing costs 12 ms, skipping one
+# that was feeding the tier costs throughput for the rest of the run.
+#
+# `_LOOKUP_ACT_ALPHA` and `_LOOKUP_ACT_WARMUP` count lookups, so their
+# wall-clock time constants move with the request rate: fine for a quantity
+# that is a property of the pool size, but not for anything that has to react
+# on a deadline.
+_LOOKUP_ACT_MIN_RATE = 0.01
+_LOOKUP_ACT_ALPHA = 1.0 / 64.0
+_LOOKUP_ACT_WARMUP = 64
+
+# While the gate is open every skippable request is answered without asking,
+# so the estimator sees nothing and cannot ever change its mind. One in this
+# many skippable requests pays for its lookup anyway to keep a live sample.
+# At 46647 blocks that is ~48 extra lookups in a 600 s window, under 0.1% of
+# throughput, against an estimator that would otherwise be blind exactly while
+# its answer is being acted on.
+_LOOKUP_ACT_PROBE_EVERY = 32
+
+
 class OffloadSchedulerMixin(ABC):
     """Layout-independent scheduler policy shared by dense and DSV4 offload.
 
@@ -1081,13 +1120,68 @@ class OffloadSchedulerMixin(ABC):
         total = self._lookup_seconds
         logger.info(
             "[OFFLOAD-LOOKUP-COST] lookups=%d total_s=%.3f mean_ms=%.3f "
-            "tokens=%d mean_tokens=%d",
+            "tokens=%d mean_tokens=%d act_ema=%.4f load_bearing=%d",
             count,
             total,
             1000.0 * total / count,
             self._lookup_tokens,
             self._lookup_tokens // count,
+            float(getattr(self, "_lookup_actionable_ema", 0.0) or 0.0),
+            int(self._slow_tier_is_load_bearing()),
         )
+
+    def _note_lookup_actionable(self, hit: int, hbm_cached: int) -> None:
+        """Record whether this lookup's answer could have produced a load.
+
+        Not whether LMCache had the prefix -- it usually does. Measured at
+        46647 blocks, 2305 of 2304 issued lookups came back with a hit, and
+        2301 of them were discarded because HBM held the same tokens. A tier
+        whose every answer is redundant looks identical to a full one until you
+        ask what the answer was worth, which is this predicate and not
+        `hit / num_prompt`.
+
+        Fed only from the lookup path plus the forced probe, never from a
+        request the gate waved through. That is what keeps the gate below from
+        moving itself: a skip that recorded its own foregone verdict would push
+        the rate down, open the gate wider, and skip more.
+
+        Restricted that way the *steady-state* rate is stable at both settings
+        and at both pool sizes -- 46647: 0.17% with the gate shut, 1.6% with it
+        open; 16612: 42% shut, 85% open, because the requests a skip removes
+        are exactly the unusable ones. Steady state is not the whole story: a
+        cold 16612 tier spends its first ~1536 lookups reading 0-17%, which is
+        why `_LOOKUP_ACT_MIN_RATE` is cut below that transient rather than
+        between the two steady states.
+        """
+        min_load = int(getattr(self, "_min_load_tokens", 8192))
+        usable = 1.0 if int(hit) - int(hbm_cached) >= min_load else 0.0
+        prev = getattr(self, "_lookup_actionable_ema", None)
+        if prev is None:
+            self._lookup_actionable_ema = usable
+        else:
+            self._lookup_actionable_ema = prev + _LOOKUP_ACT_ALPHA * (usable - prev)
+
+    def _slow_tier_is_load_bearing(self) -> bool:
+        """Whether the slow tier is answering usefully often enough to feed.
+
+        A skipped lookup is not just a round trip saved. It also leaves the
+        save floor at the HBM frontier, which asserts "LMCache already holds
+        this prefix" -- an assertion nothing checked, because nothing asked.
+        Where the tier's answers are never actionable the assertion costs
+        nothing and the suppressed write is pure savings. Where they are, it
+        starves the tier: measured at 16612 blocks, skipping cut stored
+        bandwidth 0.215 -> 0.185 GB/s and 3.8 points of throughput, while the
+        same switch at 46647 won 6.1.
+
+        Undecided until `_LOOKUP_ACT_WARMUP` lookups have run, and undecided
+        allows the skip. Safe in that direction because the skip's bound needs
+        HBM to cover all but a sub-floor tail, which a cold pool does not, so
+        lookups run and feed this before the skip can fire.
+        """
+        if getattr(self, "_lookup_calls", 0) < _LOOKUP_ACT_WARMUP:
+            return False
+        ema = getattr(self, "_lookup_actionable_ema", None)
+        return ema is not None and ema >= _LOOKUP_ACT_MIN_RATE
 
     def _skip_unloadable_lookup(self, num_prompt: int, hbm_cached: int) -> bool:
         """Whether this request's lookup can be answered without asking.
@@ -1137,6 +1231,18 @@ class OffloadSchedulerMixin(ABC):
             return False
         min_load = int(getattr(self, "_min_load_tokens", 8192))
         if num_prompt - 1 - int(hbm_cached) >= min_load:
+            return False
+        skippable = getattr(self, "_lookup_skippable", 0) + 1
+        self._lookup_skippable = skippable
+        if self._slow_tier_is_load_bearing():
+            # The bound still holds -- no answer could produce a load -- but
+            # the skip's side effect would starve a tier that is feeding real
+            # hits. Pay the round trip; see `_slow_tier_is_load_bearing`.
+            return False
+        if skippable % _LOOKUP_ACT_PROBE_EVERY == 0:
+            # Sample the tier the gate is currently ignoring. Counted over
+            # skippable requests rather than all of them so the estimator sees
+            # the same population in both gate states.
             return False
         skipped = getattr(self, "_lookup_skipped", 0) + 1
         self._lookup_skipped = skipped
