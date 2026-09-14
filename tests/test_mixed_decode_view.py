@@ -21,6 +21,7 @@ Two guards, because they fail at different times:
     batch, for anything the source scan cannot see
 """
 
+import importlib.util
 import re
 from pathlib import Path
 
@@ -80,6 +81,21 @@ def test_every_per_row_read_is_sliced_by_the_view():
     )
 
 
+# `deepseek_v4_attn` imports aiter at module scope, and CI has no aiter -- so
+# the two behavioural tests below can only run on a machine that does. They are
+# marked rather than `importorskip`ed at module level so the STATIC test above
+# keeps running everywhere: that one reads the file as text, needs no import,
+# and is the one that catches a renamed or newly-added per-row read.
+#
+# Worth being explicit about, because a skip that never runs anywhere is worth
+# less than no test at all -- see the note in conftest.atom_config_double about
+# four tests that stayed red for exactly this reason and nobody was told.
+requires_aiter = pytest.mark.skipif(
+    importlib.util.find_spec("aiter") is None,
+    reason="deepseek_v4_attn imports aiter at module scope; CI has none",
+)
+
+
 class _FakeBatch:
     """Minimal stand-in: one per-row array and one batch-wide scalar."""
 
@@ -90,6 +106,7 @@ class _FakeBatch:
         self.a_short_list = [1, 2]
 
 
+@requires_aiter
 def test_unsliced_per_row_field_raises_instead_of_falling_through():
     """The failure mode that cost 13 points must now be loud."""
     from atom.model_ops.attentions.deepseek_v4_attn import _MixedDecodeView
@@ -102,6 +119,7 @@ def test_unsliced_per_row_field_raises_instead_of_falling_through():
         _ = view.per_row_thing
 
 
+@requires_aiter
 def test_batch_wide_values_still_delegate():
     """Only per-row arrays are refused; everything else passes through."""
     from atom.model_ops.attentions.deepseek_v4_attn import _MixedDecodeView
