@@ -915,11 +915,20 @@ class ModelRunner:
             device=self.device,
             max_num_tokens=self.config.max_num_batched_tokens,
         )
-        if self.engram is not None:
-            logger.info(
-                f"[{self.rank_name}] engram host path active on layers "
-                f"{list(self.engram.layer_ids)}"
-            )
+        if self.engram is None:
+            # build_engram_host may return None; fail closed when the config still
+            # declares engram, so the base model is not served without it.
+            if self._config_declares_engram(self.config):
+                raise NotImplementedError(
+                    f"{type(self.model).__name__} declares engram layers but "
+                    "build_engram_host returned None; serving would silently "
+                    "ignore the engram weights"
+                )
+            return
+        logger.info(
+            f"[{self.rank_name}] engram host path active on layers "
+            f"{list(self.engram.layer_ids)}"
+        )
 
     def _stage_engram(self, batch: ScheduledBatch) -> None:
         """Stage this step's engram embeddings to the device before the forward.
