@@ -87,13 +87,24 @@ runs:
           DEVICE_FLAG="--device /dev/dri"
         fi
 
+        IMAGE_TAG="${RESOLVED_ATOM_BASE_IMAGE:-$ATOM_BASE_IMAGE}"
+
         MODEL_HOST_ROOT=""
-        for d in /share_nfs/models /shared_nfs/huggingface_models /models /data/models; do
-          if [ -d "$d" ]; then
-            MODEL_HOST_ROOT="$d"
-            break
+        if [ "${RUNNER_LABEL}" = "linux-atom-do-mi350x-8.test" ]; then
+          if [ ! -d "/models" ]; then
+            echo "PITT runner requested local /models, but /models does not exist on this host. Creating it with Docker root."
+            docker run --rm -u 0:0 -v /models:/models "$IMAGE_TAG" bash -lc \
+              'mkdir -p /models && chmod 2777 /models && ls -ld /models'
           fi
-        done
+          MODEL_HOST_ROOT="/models"
+        else
+          for d in /shared_nfs/huggingface_models /models /data/models; do
+            if [ -d "$d" ]; then
+              MODEL_HOST_ROOT="$d"
+              break
+            fi
+          done
+        fi
 
         MODEL_MOUNT=""
         if [ -n "$MODEL_HOST_ROOT" ]; then
@@ -109,7 +120,6 @@ runs:
         ENV_FILE="/tmp/atom_${CONTAINER_NAME}_env.txt"
         printenv MODEL_ENV_VARS | grep -v '^$' > "$ENV_FILE" || true
 
-        IMAGE_TAG="${RESOLVED_ATOM_BASE_IMAGE:-$ATOM_BASE_IMAGE}"
         echo "Starting container with image: $IMAGE_TAG"
         echo "Model-specific environment variables:"
         cat "$ENV_FILE"
