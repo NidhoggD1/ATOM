@@ -109,6 +109,7 @@ def _probe_step_budget(
         avg(1),
     )
 
+
 # How often the stalled-save reconciler actually scans deferred_free_blocks. The
 # engine polls KV progress every millisecond (KV_IDLE_DRAIN_INTERVAL_S), so the
 # reconciler no-ops until this interval has passed.

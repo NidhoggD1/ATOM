@@ -2661,7 +2661,8 @@ class MLAAttention(nn.Module):
             if prefill_meta.has_cached:
                 chunk_meta = getattr(prefill_meta, "mla_chunk_meta", None)
                 if chunk_meta is not None:
-                    # Cached prefill has no out= path yet; copy its result into the slice.
+                    # Cached prefill has no out= path yet; copy its
+                    # result into the slice.
                     out_prefill.copy_(
                         self._forward_prefill_cached_chunked(
                             prefill_q,

@@ -2259,6 +2259,7 @@ class TestTheTierSplitPartitionsServedReuse:
             s._log_pools()
         assert not any("[Cache Tiers]" in r.getMessage() for r in caplog.records)
 
+
 # ── mixed prefill+decode batch (Phase 2) ───────────────────────────────────
 
 
