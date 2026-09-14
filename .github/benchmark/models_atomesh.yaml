@@ -184,6 +184,7 @@ models:
       common:
         AITER_QUICK_REDUCE_QUANTIZATION: INT4
         AITER_USE_FLYDSL_MOE_SORTING: "1"
+        # GLM-5.2 needs 192/256 head dims; the FlyDSL gather supports only 128/128.
         ATOM_USE_FLYDSL_GATHER_KV_B_PROJ: "0"
       prefill: {}
       decode: {}
