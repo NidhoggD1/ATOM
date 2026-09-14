@@ -274,7 +274,7 @@ jobs:
 
     steps:
       - name: Prune stale Docker data on TW runners
-        if: matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'linux-atom-do-mi350x-8.test'
         run: |
           set -euo pipefail
 
@@ -311,25 +311,29 @@ jobs:
           df -h / "${docker_root}" || true
 
       - name: Kill all Docker containers and clean up workspace
-        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8.test'
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
           containers=$(docker ps -q)
           if [ -n "$containers" ]; then
             docker kill $containers || true
           fi
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true 
+          privileged_flag="--privileged"
+          if [ "${{ matrix.runner }}" = "linux-atom-do-mi350x-8.test" ]; then
+            privileged_flag=""
+          fi
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace $privileged_flag rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
 
       - name: Show Docker containers
-        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8.test'
         run: docker ps -a
 
       - name: Show ROCm memory usage
-        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8.test'
         run: rocm-smi --showmemuse
 
       - name: Show ROCm GPU processes
-        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8.test'
         run: rocm-smi --showpidgpus
 
       - name: Checkout ATOM repo
@@ -419,7 +423,7 @@ jobs:
         run: bash .github/scripts/download_aiter_wheel.sh
 
       - name: Set HF token for predownload runner
-        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8.test'
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
       - name: Start CI container
@@ -439,7 +443,7 @@ jobs:
           docker exec "$CONTAINER_NAME" df -h /dev/shm
 
       - name: GPU preflight check
-        if: matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'linux-atom-do-mi350x-8.test'
         timeout-minutes: 5
         env:
           GPU_PREFLIGHT_ALLOCATION_MB: "8"
@@ -448,7 +452,7 @@ jobs:
       - name: Collect GPU info (inside container)
         id: gpu-info
         env:
-          COLLECT_VERBOSE_GPU_INFO: ${{ matrix.runner == 'linux-atom-do-mi350x-8' && '1' || '0' }}
+          COLLECT_VERBOSE_GPU_INFO: ${{ matrix.runner == 'linux-atom-do-mi350x-8.test' && '1' || '0' }}
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
 
       - name: Install aiter from wheel
@@ -478,9 +482,9 @@ jobs:
         timeout-minutes: 150
         run: |
           set -euo pipefail
-          if [ -d "/models" ]; then
+          if [ -n "${MODEL_HOST_ROOT:-}" ] && docker exec "$CONTAINER_NAME" test -d /models; then
             model_dir="/models/${{ matrix.model_path }}"
-            echo "/models directory found, checking cache and lock-protected download for ${model_dir}"
+            echo "Model cache mounted from ${MODEL_HOST_ROOT} to /models, checking cache and lock-protected download for ${model_dir}"
             if ! docker exec \
               -e HF_TOKEN="${HF_TOKEN:-}" \
               -e MODEL_ID="${{ matrix.model_path }}" \
@@ -494,7 +498,7 @@ jobs:
               exit 1
             fi
           else
-            echo "/models directory not found, skipping model download"
+            echo "Model cache directory not mounted, skipping model download"
           fi
         env:
           MODEL_DOWNLOAD_TIMEOUT: "30m"
@@ -513,7 +517,7 @@ jobs:
           echo ""
           echo "========== Running test =========="
 
-          if [ -d "/models" ]; then
+          if [ -n "${MODEL_HOST_ROOT:-}" ] && docker exec "$CONTAINER_NAME" test -d /models; then
             model_path="/models/${{ matrix.model_path }}"
           else
             model_path="${{ matrix.model_path }}"
@@ -560,12 +564,12 @@ jobs:
         env:
           MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
           CLIENT_COMMAND: ${{ matrix.client_command || '' }}
-          ATOM_DEBUG_DEVICE_MAPPING: ${{ matrix.runner == 'linux-atom-do-mi350x-8' && '1' || '0' }}
+          ATOM_DEBUG_DEVICE_MAPPING: ${{ matrix.runner == 'linux-atom-do-mi350x-8.test' && '1' || '0' }}
         run: |
           set -euo pipefail
           echo ""
           echo "========== Launching ATOM server =========="
-          if [ -d "/models" ]; then
+          if [ -n "${MODEL_HOST_ROOT:-}" ] && docker exec "$CONTAINER_NAME" test -d /models; then
             model_path="/models/${{ matrix.model_path }}"
           else
             model_path="${{ matrix.model_path }}"
@@ -708,8 +712,8 @@ jobs:
           set -x
           echo "========== Cleaning up workspace =========="
           runner_label="${{ matrix.runner }}"
-          if [[ "${runner_label}" == "linux-atom-do-mi350x-8" ]]; then
-            docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
+          if [[ "${runner_label}" == "linux-atom-do-mi350x-8.test" ]]; then
+            docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
           fi
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
