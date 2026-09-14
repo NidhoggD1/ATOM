@@ -143,24 +143,52 @@ jobs:
       - id: load
         env:
           EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
         run: |
           python3 << 'PY'
           import json, os
           event = os.environ["EVENT_NAME"]
+          pr_number = os.environ.get("PR_NUMBER", "")
           # pr → pr models only; push to main → pr+main; schedule/dispatch → all
           level_map = {"schedule": "nightly", "workflow_dispatch": "nightly", "push": "main"}
           current = level_map.get(event, "pr")
           allowed = {"pr": {"pr"}, "main": {"pr", "main"}, "nightly": {"pr", "main", "nightly"}}[current]
           models = json.load(open(".github/benchmark/models_accuracy.json", encoding="utf-8"))
           filtered = [m for m in models if m.get("test_level", "nightly") in allowed]
+          if pr_number == "2225":
+              # Keep this storage diagnostic focused: compare one cached model
+              # on the PITT .test pool against the original MIA label.
+              filtered = [m for m in filtered if m.get("model_name") == "DeepSeek-V4-Pro"]
+          expanded = []
+          for m in filtered:
+              item = dict(m)
+              if item.get("runner") == "linux-atom-do-mi350x-8.test":
+                  item["runner_variant"] = "PITT"
+              else:
+                  item["runner_variant"] = item.get("runner", "")
+              expanded.append(item)
+
+              # PR #2225 compares the new PITT .test pool with the original
+              # non-.test label in the same workflow run.
+              if pr_number == "2225" and m.get("runner") == "linux-atom-do-mi350x-8.test":
+                  twin = dict(m)
+                  twin["runner"] = "linux-atom-do-mi350x-8"
+                  twin["runner_variant"] = "MIA"
+                  expanded.append(twin)
+
+          filtered = expanded
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"models_json={json.dumps(filtered)}\n")
           print(f"Event={event} level={current}: {len(filtered)}/{len(models)} models")
-          print(f"{'Model':<45} {'Level':<10} {'Runner'}")
-          print("-" * 80)
+          print(f"{'Model':<45} {'Level':<10} {'Variant':<8} {'Runner'}")
+          print("-" * 96)
           for m in models:
-              enabled = "✓" if m in filtered else "·"
-              print(f"  {enabled} {m['model_name']:<43} {m.get('test_level','?'):<10} {m['runner']}")
+              copies = [x for x in filtered if x.get("model_name") == m.get("model_name") and x.get("model_path") == m.get("model_path")]
+              if not copies:
+                  print(f"  · {m['model_name']:<43} {m.get('test_level','?'):<10} {'':<8} {m['runner']}")
+                  continue
+              for copy in copies:
+                  print(f"  ✓ {copy['model_name']:<43} {copy.get('test_level','?'):<10} {copy.get('runner_variant',''):<8} {copy['runner']}")
           PY
 
   offline-smoke-test:
@@ -258,7 +286,7 @@ jobs:
 
   atom-test:
     needs: [ci-gate, download_aiter_wheel, load-test-models]
-    name: Accuracy
+    name: Accuracy (${{ matrix.model_name }}, ${{ matrix.runner_variant || matrix.runner }})
     strategy:
       fail-fast: false
       matrix:
@@ -442,6 +470,29 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" df -h /dev/shm
 
+      - name: Diagnose model storage mount
+        if: startsWith(matrix.runner, 'linux-atom-do-mi350x-8')
+        timeout-minutes: 5
+        run: |
+          set -u
+          echo "=== Host model mount ==="
+          echo "MODEL_HOST_ROOT=${MODEL_HOST_ROOT:-}"
+          if [ -n "${MODEL_HOST_ROOT:-}" ]; then
+            findmnt -T "${MODEL_HOST_ROOT}" || true
+            df -hT "${MODEL_HOST_ROOT}" || true
+            stat -f -c 'fs_type=%T path=%n' "${MODEL_HOST_ROOT}" || true
+          else
+            echo "MODEL_HOST_ROOT is not set"
+          fi
+
+          echo "=== Container model mount ==="
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -u
+            findmnt -T /models || true
+            df -hT /models || true
+            stat -f -c "fs_type=%T path=%n" /models || true
+          ' || true
+
       - name: GPU preflight check
         if: matrix.runner == 'linux-atom-do-mi350x-8.test'
         timeout-minutes: 5
@@ -506,6 +557,39 @@ jobs:
           MODEL_LOCK_POLL_INTERVAL: "30"
           MODEL_PROGRESS_INTERVAL: "60"
 
+      - name: Benchmark model storage after download
+        if: startsWith(matrix.runner, 'linux-atom-do-mi350x-8')
+        timeout-minutes: 10
+        env:
+          MODEL_PATH: ${{ matrix.model_path }}
+        run: |
+          set -u
+          if [ -z "${MODEL_HOST_ROOT:-}" ]; then
+            echo "MODEL_HOST_ROOT is not set; skipping storage benchmark"
+            exit 0
+          fi
+
+          model_dir="${MODEL_HOST_ROOT}/${MODEL_PATH}"
+          echo "=== Model storage benchmark ==="
+          echo "model_dir=${model_dir}"
+          findmnt -T "${model_dir}" || true
+          df -hT "${model_dir}" || true
+          stat -f -c 'fs_type=%T path=%n' "${model_dir}" || true
+
+          echo "=== Cache markers ==="
+          ls -lh "${model_dir}/.atom_download_complete" "${model_dir}/.download-complete" "${model_dir}/.hf-revision" 2>/dev/null || true
+
+          echo "=== Metadata latency ==="
+          time timeout 120s find "${model_dir}" -maxdepth 1 \( -type f -o -type l \) 2>/dev/null | wc -l || true
+          time timeout 120s du -sh "${model_dir}" || true
+
+          echo "=== Sample read latency ==="
+          sample_file="$(find "${model_dir}" -name '*.safetensors' -type f 2>/dev/null | head -n 1 || true)"
+          echo "sample_file=${sample_file}"
+          if [ -n "${sample_file}" ]; then
+            time timeout 120s dd if="${sample_file}" of=/dev/null bs=64M count=4 status=progress || true
+          fi
+
       - name: Run ATOM simple inference
         # Skip simple inference; accuracy test already validates correctness
         if: false
@@ -558,6 +642,39 @@ jobs:
           else
             echo "Success: Output matches golden outputs."
           fi
+
+      - name: Start model storage monitor
+        if: startsWith(matrix.runner, 'linux-atom-do-mi350x-8')
+        run: |
+          set -u
+          if [ -z "${MODEL_HOST_ROOT:-}" ]; then
+            echo "MODEL_HOST_ROOT is not set; skipping storage monitor"
+            exit 0
+          fi
+
+          model_dir="${MODEL_HOST_ROOT}/${{ matrix.model_path }}"
+          cat > storage-monitor.sh <<'MONITOR'
+          #!/usr/bin/env bash
+          set -u
+          model_dir="$1"
+          container_name="$2"
+          while true; do
+            echo "===== $(date -Is) ====="
+            echo "model_dir=${model_dir}"
+            findmnt -T "${model_dir}" || true
+            df -hT "${model_dir}" || true
+            nfsstat -c 2>/dev/null || true
+            nfsiostat 1 1 2>/dev/null || true
+            iostat -xz 1 1 2>/dev/null || true
+            ps -eo pid,stat,wchan:32,comm,args | grep -E 'python|atom|safetensors|snapshot|download' | grep -v grep || true
+            docker exec "${container_name}" bash -lc "ps -eo pid,stat,wchan:32,comm,args | grep -E 'python|atom|safetensors|snapshot|download' | grep -v grep || true" 2>/dev/null || true
+            sleep 30
+          done
+          MONITOR
+          chmod +x storage-monitor.sh
+          nohup ./storage-monitor.sh "${model_dir}" "$CONTAINER_NAME" > storage-monitor.log 2>&1 &
+          echo $! > storage-monitor.pid
+          echo "Started storage monitor for ${model_dir}"
       
       - name: Run ATOM accuracy test
         timeout-minutes: 30
@@ -600,6 +717,21 @@ jobs:
         if: always()
         run: |
           docker exec "$CONTAINER_NAME" cat /tmp/atom_client.log 2>/dev/null || true
+
+      - name: Stop model storage monitor
+        if: always()
+        run: |
+          if [ -f storage-monitor.pid ]; then
+            kill "$(cat storage-monitor.pid)" 2>/dev/null || true
+          fi
+
+      - name: Upload model storage monitor
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: storage-monitor-${{ strategy.job-index }}-${{ matrix.runner_variant || matrix.runner }}
+          path: storage-monitor.log
+          if-no-files-found: ignore
 
       - name: Check accuracy test results
         if: success()
@@ -693,14 +825,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.model_name }}_atom_test_output.txt
+          name: ${{ matrix.runner_variant || matrix.runner }}-${{ matrix.model_name }}_atom_test_output.txt
           path: atom_test_output.txt
 
       - name: Upload accuracy results
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: accuracy-${{ matrix.model_name }}
+          name: accuracy-${{ matrix.runner_variant || matrix.runner }}-${{ matrix.model_name }}
           path: accuracy_test_results/*.json
           if-no-files-found: ignore
 
