@@ -29,6 +29,9 @@ def _fused_qkv_norm_rope_cache_kernel(
     v_stride_t,
     # Contiguous output pointers
     q_out_ptr,
+    # Optional fp8 copy of the rotated query, written in the same pass.
+    q_fp8_ptr,
+    q_fp8_inv_scale,
     k_out_ptr,
     # Norm weights
     qw_ptr,
@@ -84,6 +87,8 @@ def _fused_qkv_norm_rope_cache_kernel(
     # an input, not an output: nothing is written back to k_scale/v_scale. This
     # is what unified_attention needs -- it folds a single descale into qk_scale
     # outside its tile loop and cannot index one per token.
+    WRITE_Q_FP8: tl.constexpr = False,
+    Q_FP8_MAX: tl.constexpr = 448.0,
     PER_TENSOR_SCALE: tl.constexpr = False,
     # Saturation bound for the per-tensor path, which unlike per-token has no
     # structural guarantee that the quotient lands in range.
@@ -169,6 +174,17 @@ def _fused_qkv_norm_rope_cache_kernel(
             q_out_ptr + q_out_offset + d_offs,
             q_roped.to(q_out_ptr.dtype.element_ty),
         )
+        if WRITE_Q_FP8:
+            # Second output, same kernel. Doing this as torch ops outside costs
+            # four launches per attention call on an 8K-element tensor, which
+            # measured at +238 us/step -- more than the 169 us the fp8 query
+            # saves in the attention kernel itself.
+            tl.store(
+                q_fp8_ptr + q_out_offset + d_offs,
+                tl.clamp(q_roped * q_fp8_inv_scale, -Q_FP8_MAX, Q_FP8_MAX).to(
+                    q_fp8_ptr.dtype.element_ty
+                ),
+            )
     else:
         # ============ KV head processing ============
         kv_h = head_id - num_heads
@@ -344,6 +360,8 @@ def triton_fused_norm_rope_cache(
     v_scale: Tensor | None,
     slot_mapping: Tensor,
     kv_cache_dtype: str,
+    q_fp8_out: Tensor | None = None,
+    q_fp8_inv_scale: float = 1.0,
 ) -> tuple[Tensor, Tensor]:
     """GemmaRMSNorm + RoPE + KV cache write for Qwen3-Next.
 
@@ -408,6 +426,8 @@ def triton_fused_norm_rope_cache(
         v,
         v.stride(0),
         q_out,
+        q_fp8_out if q_fp8_out is not None else q_out,  # dummy when unused
+        q_fp8_inv_scale,
         k_out,
         q_norm.weight,
         k_norm.weight,
@@ -449,6 +469,10 @@ def triton_fused_norm_rope_cache(
         IS_MROPE=is_mrope,
         PER_TENSOR_SCALE=per_tensor_scale,
         FP8_MAX=float(torch.finfo(k_cache.dtype).max) if is_fp8 else 448.0,
+        WRITE_Q_FP8=q_fp8_out is not None,
+        Q_FP8_MAX=(
+            float(torch.finfo(q_fp8_out.dtype).max) if q_fp8_out is not None else 448.0
+        ),
     )
 
     return q_out, k_out

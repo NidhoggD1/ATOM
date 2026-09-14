@@ -402,6 +402,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # able from e4m3's own rounding, because the per-token amax spread is only
     # 2-3x (K) and a float spends that on the exponent, not the mantissa.
     "ATOM_PER_TENSOR_KV": lambda: (os.getenv("ATOM_PER_TENSOR_KV", "0") == "1"),
+    # Hand unified_attention an fp8 query. Measured -39% on the dense decode call
+    # at a 350K context and -2.0% end to end; it is the whole of the gap to vLLM,
+    # which ships IS_Q_FP8=1. The error lands in the logit, which is
+    # exponentiated, so one key's softmax weight moves ~11% at p99 -- more
+    # exposure than the KV switch, whose error softmax averages away. gsm8k
+    # (n-shot 5 and 20) stays inside the noise band of a repeated same-config
+    # arm. Do NOT screen this on the speculative acceptance rate: the benchmark
+    # pins it with --spec-decode-acceptance-length, so it cannot move.
+    "ATOM_Q_FP8": lambda: (os.getenv("ATOM_Q_FP8", "0") == "1"),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"

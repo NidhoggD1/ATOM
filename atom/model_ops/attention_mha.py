@@ -89,6 +89,18 @@ class PagedAttentionImpl(nn.Module):
         self._pa_decode_bf16_asm_scale = torch.full(
             (1,), self.kv_scale_float, dtype=torch.float32, device=self.device
         )
+        # Descale for the fp8 query path. A constant, not a per-call amax: the
+        # reduction plus the ops around it cost more than the fp8 query saves,
+        # and vLLM does not compute one either -- its _q_scale comes from the
+        # checkpoint and falls back to k_scale, itself 1.0 when no calibration
+        # ships, which is the case for MiniMax-M3. Pre-allocated so graph
+        # capture sees neither an allocation nor a reduction.
+        self._q_fp8_descale = torch.full(
+            (1,), 1.0, dtype=torch.float32, device=self.device
+        )
+        # Set by rope_cache when it writes the fp8 copy of the rotated query;
+        # read by paged_attention_unified in the same forward.
+        self._q_fp8 = None
         self.per_token_quant = True
         self.sinks = sinks
         self.sliding_window = sliding_window if sliding_window is not None else -1
@@ -225,6 +237,9 @@ class PagedAttentionImpl(nn.Module):
         v_cache = kv_cache_data[f"layer_{self.layer_num}"].v_cache
         k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
+        # Cleared for every branch, not just the one that sets it: a stale fp8
+        # query from the previous forward would be silently wrong, not an error.
+        self._q_fp8 = None
 
         # Fall back to Triton/Gluon for layouts unsupported by AITer PA ASM.
         use_triton_attn = (
@@ -268,6 +283,14 @@ class PagedAttentionImpl(nn.Module):
                     # this same self.kv_scale down as the descale.
                     k_scale = v_scale = self.kv_scale
                     self.per_token_quant = False
+                # The fp8 query rides out of the same kernel as a second output.
+                self._q_fp8 = None
+                if envs.ATOM_Q_FP8 and self.kv_cache_dtype == "fp8":
+                    self._q_fp8 = torch.empty(
+                        (q_raw.shape[0], self.num_heads * self.head_dim),
+                        dtype=aiter.dtypes.fp8,
+                        device=q_raw.device,
+                    )
                 q, k = triton_fused_norm_rope_cache(
                     q_raw,
                     k_raw,
@@ -285,10 +308,13 @@ class PagedAttentionImpl(nn.Module):
                     v_scale=v_scale,
                     slot_mapping=attn_metadata.slot_mapping,
                     kv_cache_dtype=self.kv_cache_dtype,
+                    q_fp8_out=self._q_fp8,
                 )
                 q = q.view(-1, self.num_heads, self.head_dim)
                 k = k.view(-1, self.num_kv_heads, self.head_dim)
                 v = v_raw.view(-1, self.num_kv_heads, self.head_dim)
+                if self._q_fp8 is not None:
+                    self._q_fp8 = self._q_fp8.view(-1, self.num_heads, self.head_dim)
             else:
                 # Standard RMSNorm — use existing aiter kernel
                 # fused_qk_norm_rope_cache_quant_shuffle expects V cache layout
@@ -330,14 +356,25 @@ class PagedAttentionImpl(nn.Module):
         elif use_triton_attn and self.rotary_emb is not None:
             self.per_token_quant = False
             k_scale = v_scale = self.kv_scale
-            if (
-                envs.ATOM_USE_UNIFIED_ATTN
-                and self.kv_cache_dtype.startswith("fp8")
-                and not self._can_attempt_prefill_sink_asm(fwd_ctx)
-            ):
+            # The aiter op writes q_out with a plain dtype cast and no scaling, so
+            # an fp8 q_out is an fp8 query at descale 1.0 -- the same constant the
+            # dense path uses. Our arm is decode-only and also requires
+            # ATOM_PER_TENSOR_KV, because that is exactly when _dispatch_decode
+            # sends this layer to unified; the gluon kernel would read an fp8
+            # query as bf16 and quietly compute nonsense.
+            want_q_fp8 = self.kv_cache_dtype.startswith(
+                "fp8"
+            ) and not self._can_attempt_prefill_sink_asm(fwd_ctx)
+            ours = (
+                envs.ATOM_Q_FP8
+                and envs.ATOM_PER_TENSOR_KV
+                and not fwd_ctx.context.is_prefill
+            )
+            if want_q_fp8 and (envs.ATOM_USE_UNIFIED_ATTN or ours):
                 q_out = torch.empty(*q.shape, dtype=k_cache.dtype, device=q.device)
             else:
                 q_out = q
+                ours = False
             q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
                 q,
                 k,
@@ -358,6 +395,10 @@ class PagedAttentionImpl(nn.Module):
                 k_out=k,
                 output_zeros=False,
             )
+            if ours:
+                # q is already the fp8 buffer; paged_attention_unified reads the
+                # stash to know it may pass a descale rather than a bf16 query.
+                self._q_fp8 = q
             self._cache_format = "NHD"
         else:
             # for asm paged attention
@@ -515,7 +556,14 @@ class PagedAttentionImpl(nn.Module):
         attn_metadata = fwd_ctx.attn_metadata
         self._reject_per_token_scales_on_unified(k_scale, v_scale, "decode")
 
-        if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
+        # Keyed on the cache dtype, not on an env: the query arriving here may
+        # already be fp8 (the draft's writer emits it that way), and empty_like
+        # would then hand the kernel an fp8 output buffer -- one more lossy
+        # rounding of the attention result, plus a conversion back to bf16 for
+        # o_proj. That cost 3 elementwise kernels a step and raised no error
+        # anywhere -- it showed up only as a bf16 cast firing exactly 3 times per
+        # step in a trace.
+        if self.kv_cache_dtype.startswith("fp8"):
             o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
         else:
             o = torch.empty_like(q)
@@ -523,6 +571,18 @@ class PagedAttentionImpl(nn.Module):
         sliding_window = (
             (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
         )
+        # fp8 query, produced upstream by the writer that already had the rotated
+        # q in registers. Quantizing here instead costs 4-5 elementwise kernels
+        # per call on an 8K-element tensor -- measured at +238 us/step against
+        # the 169 us the fp8 query saves, i.e. a net loss.
+        #
+        # The kernel picks IS_Q_FP8 off q's dtype alone and folds q_descale into
+        # qk_scale outside the tile loop, so one scale for the tensor is all it
+        # can carry. That is also all it needs: per-token was 2.55% relative
+        # error against per-tensor's 2.65%, measured at 350K.
+        q_descale = None
+        if self._q_fp8 is not None:
+            q, q_descale = self._q_fp8, self._q_fp8_descale
         unified_attention(
             q,
             k_cache,
@@ -538,7 +598,7 @@ class PagedAttentionImpl(nn.Module):
             window_size=sliding_window,
             block_table=attn_metadata.block_tables,
             softcap=0,
-            q_descale=None,
+            q_descale=q_descale,
             k_descale=self.kv_scale,
             v_descale=self.kv_scale,
             sinks=self.sinks,
