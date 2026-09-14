@@ -52,14 +52,23 @@ def _sliced_fields() -> set[str]:
 
 
 def _per_row_reads() -> set[str]:
-    """Fields the V4 builder indexes by row count, `batch.x[:scheduled_bs]`."""
-    return set(
-        re.findall(
-            r"batch\.([a-z_][a-z0-9_]*)\[\s*:\s*"
-            r"(?:scheduled_bs|bs|n_d_seqs|running_bs)\s*\]",
-            V4_ATTN.read_text(),
-        )
+    """Fields ANY attention file indexes by row count, `batch.x[:bs]`.
+
+    Scans the whole package, not just the V4 builder. Scanning one file is how
+    `num_scheduled_tokens` was missed: the read lives in `decode_spans` in
+    backends.py, a file over from the view, and the decode view served it
+    unsliced -- prefill rows' token counts paired with a cu_seqlens built from
+    the real batch. The runtime guard caught that one; this makes the static
+    check catch the next.
+    """
+    pat = re.compile(
+        r"batch\.([a-z_][a-z0-9_]*)\[\s*:\s*"
+        r"(?:scheduled_bs|bs|n_d_seqs|running_bs)\s*\]"
     )
+    found: set[str] = set()
+    for f in V4_ATTN.parent.glob("*.py"):
+        found |= set(pat.findall(f.read_text()))
+    return found
 
 
 def test_every_per_row_read_is_sliced_by_the_view():

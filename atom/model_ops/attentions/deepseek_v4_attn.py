@@ -411,6 +411,21 @@ class _MixedDecodeView:
             "rows; the positional decode slice below would misalign"
         )
         self.state_slots_committed = _slots[n_prefill_seqs:]
+        # Per-row arrays the decode consumers index by the DECODE row count.
+        # `decode_spans` (backends.py) does `num_scheduled_tokens[:bs]` with
+        # `bs = total_seqs_num_decode`, so an unsliced array hands it the
+        # PREFILL rows' token counts -- and pairs them with a cu_seqlens built
+        # from the real batch, which is how a length vector and its cumsum come
+        # to disagree. Found by the __getattr__ guard, not by the static scan:
+        # that scan only read this file and the consumer is a file over.
+        # Written out one by one rather than in a loop so the static scan --
+        # which looks for `self.<name> =` -- can see them.
+        _nst = getattr(batch, "num_scheduled_tokens", None)
+        self.num_scheduled_tokens = _nst[n_prefill_seqs:] if _nst is not None else _nst
+        _nct = getattr(batch, "num_cached_tokens", None)
+        self.num_cached_tokens = _nct[n_prefill_seqs:] if _nct is not None else _nct
+        _lbn = getattr(batch, "last_block_num_tokens", None)
+        self.last_block_num_tokens = _lbn[n_prefill_seqs:] if _lbn is not None else _lbn
         self.total_seqs_num_decode = batch.total_seqs_num_decode
         self.total_tokens_num_decode = batch.total_tokens_num_decode
         self.total_seqs_num_prefill = 0
