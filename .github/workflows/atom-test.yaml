@@ -465,10 +465,8 @@ jobs:
           set -euo pipefail
 
           gpu_count="$(
-            docker exec "$CONTAINER_NAME" python3 - <<'PY'
-          import torch
-          print(torch.cuda.device_count() if torch.cuda.is_available() else 0)
-          PY
+            docker exec "$CONTAINER_NAME" python3 -c \
+              'import torch; print(torch.cuda.device_count() if torch.cuda.is_available() else 0)'
           )"
           if ! [[ "${gpu_count}" =~ ^[0-9]+$ ]] || [ "${gpu_count}" -lt 1 ]; then
             echo "::error::No GPU is visible to torch inside ${CONTAINER_NAME}"

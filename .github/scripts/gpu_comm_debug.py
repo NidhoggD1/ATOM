@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Lightweight GPU communication smoke test for CI runners."""
 
 from __future__ import annotations
@@ -25,8 +24,12 @@ def _env_int(name: str, default: int) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", default="nccl")
-    parser.add_argument("--device-mib", type=int, default=_env_int("GPU_COMM_DEBUG_DEVICE_MIB", 16))
-    parser.add_argument("--iters", type=int, default=_env_int("GPU_COMM_DEBUG_ITERS", 3))
+    parser.add_argument(
+        "--device-mib", type=int, default=_env_int("GPU_COMM_DEBUG_DEVICE_MIB", 16)
+    )
+    parser.add_argument(
+        "--iters", type=int, default=_env_int("GPU_COMM_DEBUG_ITERS", 3)
+    )
     args = parser.parse_args()
 
     rank = _env_int("RANK", 0)
@@ -51,7 +54,10 @@ def main() -> None:
     device_index = local_rank % torch.cuda.device_count()
     torch.cuda.set_device(device_index)
     device = torch.device("cuda", device_index)
-    print(f"[comm-debug] rank={rank} device={device} name={torch.cuda.get_device_name(device)}", flush=True)
+    print(
+        f"[comm-debug] rank={rank} device={device} name={torch.cuda.get_device_name(device)}",
+        flush=True,
+    )
 
     dist.init_process_group(backend=args.backend)
     try:
@@ -59,9 +65,18 @@ def main() -> None:
         init_started = time.monotonic()
         dist.barrier()
         torch.cuda.synchronize(device)
-        print(f"[comm-debug] rank={rank} barrier_seconds={time.monotonic() - init_started:.3f}", flush=True)
+        print(
+            f"[comm-debug] rank={rank} barrier_seconds={time.monotonic() - init_started:.3f}",
+            flush=True,
+        )
 
-        elements = max(1, args.device_mib * 1024 * 1024 // torch.tensor([], dtype=torch.float32).element_size())
+        elements = max(
+            1,
+            args.device_mib
+            * 1024
+            * 1024
+            // torch.tensor([], dtype=torch.float32).element_size(),
+        )
         expected = world_size * (world_size + 1) / 2
         tensor = torch.empty(elements, dtype=torch.float32, device=device)
 
