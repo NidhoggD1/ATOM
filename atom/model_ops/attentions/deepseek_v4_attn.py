@@ -2565,6 +2565,25 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # views into `pf_bank`, which the decode half never touches. ----
         main_var = self.model_runner.forward_vars
         pf_bank = self._get_mixed_prefill_bank()
+        # `cu_seqlens_q` is PUBLISHED upstream (`publish_cu_seqlens_q`, from
+        # `prepare_model`), not staged by the prefill path -- so unlike every
+        # other buffer here the bank's copy is not something prefill fills in,
+        # it is something prefill READS. The bank is built lazily once and never
+        # re-synced, so its copy holds whatever the real buffer had at creation.
+        #
+        # That was invisible until main's `2ce5f68f` changed `prepare_prefill`
+        # from deriving these indices to cross-checking against the published
+        # buffer; the check then read a stale clone and failed with
+        # "published cu_seqlens_q ends at 15486, not the 16298 tokens scheduled
+        # for prefill", which reads like a row-ordering bug and is not one.
+        #
+        # Synced here rather than shared by reference: the decode half
+        # overwrites the real buffer with decode-local spans further down, and
+        # sharing would make this correct only for as long as prefill keeps
+        # running first.
+        _live_cu = main_var["cu_seqlens_q"]
+        pf_bank["cu_seqlens_q"].cpu.copy_(_live_cu.cpu)
+        pf_bank["cu_seqlens_q"].gpu.copy_(_live_cu.gpu)
         self.model_runner.forward_vars = pf_bank
         try:
             # Same reasoning as the `prepare_decode` call below: a mixed batch is
