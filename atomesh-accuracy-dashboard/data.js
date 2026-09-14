@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789062309896,
+  "lastUpdate": 1789414284040,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -2894,6 +2894,57 @@ window.BENCHMARK_DATA = {
             "value": 0.8992,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34501149102 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609101456 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1638 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lingpeng Jin",
+            "username": "valarLip",
+            "email": "103567126+valarLip@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "c74e8ce72aa686a09ac549a2a483c292eca0db71",
+          "message": "perf(minimax-m3): route wide index rows to aiter's selector (#2227)\n\n* perf(minimax-m3): route wide index rows to aiter's selector\n\nThe lightning indexer's per-row top-k has a second implementation in aiter\n(`topk_per_row_small_k`), which narrows in one pass where the Triton kernel\nfolds `tl.topk` over `ceil(max_block / BLOCK_SIZE_K)` tiles. It pulls ahead as\nthe row widens -- 7us against 36us at a 1M context -- but it only selects,\nwhere the Triton kernel also emits the page-16 sparse block table, and it wants\neach row's causal bound as a tensor where the Triton one holds it in registers.\n\nBoth costs are paid once, not per layer:\n\n- The bound is layer-invariant, so the attention metadata builds it and\n  publishes `MiniMaxM3SparseMetadata.n_valid_column_per_row`, the way\n  `deepseek_v4_attn.csa_n_committed_per_token` does for the sibling indexer.\n  Decode fills a persistent buffer, since a captured replay reads the pointer\n  baked in at capture. The plugins, whose metadata is framework code with no\n  field to publish into, hoist onto their per-forward batch object instead.\n- Emission becomes `_emit_sparse_block_table_kernel`, which calls the same\n  compaction helper as the fused path so the two cannot drift.\n\nWhich selector serves is decided by row width, measured (device us, MI355X,\ntopk=16, rows 1..512, triton/aiter):\n\n    width        64     512    1024    2048    8192\n    emit=True   0.6x    0.7x    1.0x    1.4x    3.7x\n    emit=False  0.8x    ~1.0x   1.25x   2.0x    4.8x\n\nso aiter from 2048 columns when the call emits and 1024 when it does not.\nBelow that the fused kernel is cheaper and nothing changes. aiter's support\npredicate costs 11.4us of Python against 7-10us of device time, so its answer\nis memoized per shape.\n\naiter is an optional import: without it, or under the thresholds, the Triton\nselector runs exactly as before.\n\n* fix(minimax-m3): bound the row-bounds buffer, and stop building it on one CU\n\nTwo things were wrong with the same small launch.\n\n`build_n_valid_column_per_row` slices the caller's persistent buffer to\n`rows`, and a slice shorter than that is simply shorter -- while the kernel\nstill writes `rows` of them off the raw pointer. Measured: asking 8 rows of a\n7-row buffer returned 7 and wrote 8, with nothing said. The check is on\n`numel()`, so it is a host-side compare and no sync.\n\nThe grid was `(batch,)` with the query axis folded into a loop, so a single\nlong request was served by one compute unit. The same 32768 tokens cost 23.4us\nas one request and 10.6us split over four -- the gap was parallelism, not\nwork. Query tiles become the grid's second dimension, which puts one request\nat 11.5us and leaves every other shape on the ~11.5us launch floor. The tile\nwidth is named now, since the grid and `BLOCK_Q` have to be the same number.\n\n* perf(minimax-m3): launch the standalone emission at one warp\n\nThe compaction's widest tensor is `topk x pages_per_block` -- 16x8 -- so\ntriton's default four warps is more lanes than there is work, and the row\nhelper's cumsum crosses warp boundaries to reach them. The fused kernel\nalready arrives at one warp from the other side (`PREFILL_TOPK_NUM_WARPS`);\n`DECODE_TOPK_NUM_WARPS` is 8 for the scoring this kernel does not do.\n\nDevice time, `aiter.test_common.perftest`, `sparse_bt`/`sparse_ctx` bit-equal\nat every shape measured:\n\n    prefill 4x2048   8.03us -> 4.66us\n    prefill 1x4096   5.22us -> 3.48us\n    decode bs=256    2.63us -> 2.50us\n\nThat is the floor. A bare `fill_` over exactly the bytes this kernel writes\ncosts 4.01us at 256 rows and 4.44us at 8192, against its 2.50 and 4.66 -- the\ncompaction is already down at the cost of touching the memory once.\n\nThe docstring's `26us a call` was wall time, and is corrected: the device half\nis 2.5-4.7us and the other ~14us is the python launch, which a captured replay\ndoes not pay. Re-measured through `_launch_select` at decode bs=256,\ntriton/aiter with emission on, that leaves `_AITER_MIN_WIDTH_WITH_EMIT` room\nto come down -- 0.98x at 1024 columns, 1.26x at 1536, 1.60x at 2048 -- but\nmoving it changes what ships rather than what it costs, so it stays at 2048.\n\n* fix(minimax-m3): take the index head count's world size from the caller\n\nCI's ruff flags the blind `except Exception` this added, and narrowing it\nturns up what the catch was hiding. The fallback inside it was `tp_size = 1`,\nso an sglang whose dp-attention module is not importable did not degrade --\nit returned the full 8 heads on a tp8 rank. The row bounds then come out 8x\ntoo long, aiter's predicate declines them for the length mismatch, and the\nTriton selector serves every call at full correctness. The dispatch this PR\nexists for would have been inert, and nothing would have said so.\n\nSo the caller passes its own world size, and only the import stays guarded.\nThe call itself is safe to let raise here: this runs inside a forward, where\nthe attention group is up. `_local_kv_heads` answers the same question while\nthe memory pools are still being sized, which is why that one keeps its\nbroader catch.\n\n* style(minimax-m3): let ruff rewrite a constant-name setattr\n\nUntouched by hand -- the repo's PostToolUse `ruff --fix` applied B010 while\nthe file was open for the change above. Kept in its own commit so that one\nstays the size of its argument.",
+          "timestamp": "2026-09-14T15:20:12Z",
+          "url": "https://github.com/ROCm/ATOM/commit/c74e8ce72aa686a09ac549a2a483c292eca0db71"
+        },
+        "date": 1789414283213,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9447,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34867765396 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202609141448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9393 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9553,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34867765396 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609141448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9538 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 66.21,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34867765396 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609141448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9538 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.99,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.887,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34867765396 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609141448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1645 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
