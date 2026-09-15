@@ -651,20 +651,19 @@ class EngramPrefetcher:
     def compute(
         self, seq_ids: list[int], token_ids: np.ndarray
     ) -> dict[tuple[int, int], torch.Tensor]:
-        """Hash `token_ids` ([B, T]) and gather, for every engram layer.
+        """Hash `token_ids` ([B, T]) and gather the CURRENT token's row per layer.
 
         `token_ids` is a per-sequence n-gram window; the embedding wanted is the
-        one for the CURRENT token, i.e. the hash ending at the LAST column. Taking
-        the last position is what makes `[a, b, x]` (x in context) differ from a
-        bare `[x]`, which would pad the missing history and index the wrong rows.
+        one for the last column. Taking the last position is what makes `[a, b, x]`
+        (x in context) differ from a bare `[x]`, which would pad the missing history
+        and index the wrong rows. Only that row is gathered -- gathering the whole
+        window would multiply the host table reads by ngram size.
         """
         results: dict[tuple[int, int], torch.Tensor] = {}
         compressed = self._hash_mapping.tokenizer(token_ids)
         for layer_id in self.layer_ids:
             hashes = self._hash_mapping.hash_layer(compressed, layer_id, compress=False)
             rows = self._hash_mapping.to_row_indices(hashes, layer_id)
-            # Only the last position is used, so gather just its rows -- gathering
-            # the whole window would multiply the host table reads by ngram size.
             gathered = self._tables[layer_id].gather(rows[:, -1])
             for i, seq_id in enumerate(seq_ids):
                 results[(seq_id, layer_id)] = gathered[i]
@@ -697,8 +696,7 @@ class EngramPrefetcher:
                     compressed, layer_id, compress=False
                 )
                 rows = self._hash_mapping.to_row_indices(hashes, layer_id)
-                gathered = self._tables[layer_id].gather(rows)
-                chunk_rows = gathered[0, skip:]
+                chunk_rows = self._tables[layer_id].gather(rows)[0, skip:]
                 out[layer_id].append(chunk_rows.reshape(chunk_rows.shape[0], -1))
         return out
 
@@ -763,6 +761,26 @@ class EngramPrefetcher:
         self._pool.shutdown(wait=True, cancel_futures=True)
 
 
+class _SlotRing:
+    """A round-robin of `n_slots` reuse-guarded slots. `advance()` rotates to the
+    next slot and blocks (via `wait_slot`) until that slot's previous use has
+    finished, so a producer never overwrites a slot a consumer is still reading.
+    The slot count only trades blocking frequency, not correctness.
+
+    Both the staging H2D and the sampled-token D2H use this; they differ only in the
+    per-slot barrier (a CUDA event synchronize vs a threading.Event wait)."""
+
+    def __init__(self, n_slots: int, wait_slot: Callable[[int], None]):
+        self._n = n_slots
+        self._wait_slot = wait_slot
+        self.slot = 0
+
+    def advance(self) -> int:
+        self.slot = (self.slot + 1) % self._n
+        self._wait_slot(self.slot)
+        return self.slot
+
+
 class EngramHost:
     """Ties the host prefetch to the device step.
 
@@ -817,7 +835,6 @@ class EngramHost:
         # target stays single (graph-safe). Slot 0 reuses the CpuGpuBuffer's own
         # pinned tensor; the extra slot is a second pinned buffer.
         self._n_slots = 2 if device.type == "cuda" else 1
-        self._slot = 0
         self._host_slots = {
             layer_id: [self.buffers[layer_id].cpu]
             + [
@@ -830,14 +847,14 @@ class EngramHost:
         }
         # Streams and events exist only on device; the CPU path (unit tests) runs
         # everything synchronously and leaves them None. `copy_stream` + a per-slot
-        # `copy_done` carry the staging H2D; `_token_*` carry the async
+        # `h2d_done` carry the staging H2D; `_token_*` carry the async
         # device->host of the just-sampled token -- the main thread only launches
         # that copy on the side stream and records the event, and the worker waits
         # on it before reading, so the per-step token D2H never blocks compute.
         if device.type == "cuda":
             self.copy_stream = torch.cuda.Stream(device)
-            self.copy_done = [torch.cuda.Event() for _ in range(self._n_slots)]
-            for event in self.copy_done:
+            self.h2d_done = [torch.cuda.Event() for _ in range(self._n_slots)]
+            for event in self.h2d_done:
                 event.record(self.copy_stream)  # so the first reuse can wait it
             # Double-buffer the token D2H (like the staging ring): prefill/warmup
             # steps do not wait the worker, so a later prefetch's copy could
@@ -848,7 +865,6 @@ class EngramHost:
             # frequency, not safety.
             self._token_d2h_stream = torch.cuda.Stream(device)
             self._n_token_slots = self._n_slots
-            self._token_slot = 0
             self._token_event = [torch.cuda.Event() for _ in range(self._n_token_slots)]
             self._token_host = [
                 torch.empty(max_num_tokens, dtype=torch.int64).pin_memory()
@@ -859,21 +875,21 @@ class EngramHost:
             ]
             for done in self._token_read_done:
                 done.set()  # free until first use
+            self._token_ring = _SlotRing(
+                self._n_token_slots, lambda s: self._token_read_done[s].wait()
+            )
         else:
-            self.copy_stream = self.copy_done = None
+            self.copy_stream = self.h2d_done = None
             self._token_d2h_stream = self._token_event = self._token_host = None
-            self._token_read_done = None
+            self._token_read_done = self._token_ring = None
+        # The staging ring rotates the host slot feeding the (single) device buffer;
+        # its reuse barrier is the slot's prior H2D completion (a no-op on CPU).
+        self._stage_ring = _SlotRing(self._n_slots, self._wait_stage_slot)
         self._staged_rows = 0
 
-    def _next_slot(self) -> None:
-        """Rotate to the next host staging slot and wait for its previous H2D to
-        drain before the host refills it. With a 2-slot ring this wait is on the
-        copy from two steps back -- normally already complete -- so the next
-        step's fill still overlaps the last step's transfer."""
-        if self.copy_done is None:
-            return
-        self._slot = (self._slot + 1) % self._n_slots
-        self.copy_done[self._slot].synchronize()
+    def _wait_stage_slot(self, slot: int) -> None:
+        if self.h2d_done is not None:
+            self.h2d_done[slot].synchronize()
 
     @property
     def layer_ids(self) -> tuple[int, ...]:
@@ -937,9 +953,9 @@ class EngramHost:
             miss_windows = self.prefetcher.windows_for_recompute(miss_ids, miss_tokens)
             computed = self.prefetcher.compute(miss_ids, miss_windows)
 
-        self._next_slot()
+        self._stage_ring.advance()
         for layer_id in self.layer_ids:
-            cpu = self._host_slots[layer_id][self._slot]
+            cpu = self._host_slots[layer_id][self._stage_ring.slot]
             for row, seq_id in enumerate(seq_ids):
                 value = computed.get((seq_id, layer_id))
                 if value is None:
@@ -971,13 +987,15 @@ class EngramHost:
                 self.copy_stream.wait_stream(compute_stream)
                 for layer_id, buffer in self.buffers.items():
                     buffer.gpu[:rows].copy_(
-                        self._host_slots[layer_id][self._slot][:rows],
+                        self._host_slots[layer_id][self._stage_ring.slot][:rows],
                         non_blocking=True,
                     )
-                self.copy_done[self._slot].record(self.copy_stream)
+                self.h2d_done[self._stage_ring.slot].record(self.copy_stream)
         else:
             for layer_id, buffer in self.buffers.items():
-                buffer.gpu[:rows].copy_(self._host_slots[layer_id][self._slot][:rows])
+                buffer.gpu[:rows].copy_(
+                    self._host_slots[layer_id][self._stage_ring.slot][:rows]
+                )
         self._staged_rows = rows
 
     def stage_prefill(
@@ -1006,9 +1024,9 @@ class EngramHost:
             )
         computed = self.prefetcher.compute_prefill(context_tails, chunk_tokens)
         offsets = np.concatenate(([0], np.cumsum(lengths)))
-        self._next_slot()
+        self._stage_ring.advance()
         for layer_id in self.layer_ids:
-            cpu = self._host_slots[layer_id][self._slot]
+            cpu = self._host_slots[layer_id][self._stage_ring.slot]
             for i, rows in enumerate(computed[layer_id]):
                 base = int(offsets[i])
                 cpu[base : base + lengths[i]].copy_(rows[:, : self.embed_width])
@@ -1036,17 +1054,17 @@ class EngramHost:
         shapes honest without inventing token ids.
         """
         num_rows = min(int(num_rows), self.max_num_tokens)
-        self._next_slot()
+        self._stage_ring.advance()
         for layer_id in self.layer_ids:
-            self._host_slots[layer_id][self._slot][:num_rows].zero_()
+            self._host_slots[layer_id][self._stage_ring.slot][:num_rows].zero_()
         self._embeddings_h2d(num_rows)
         return num_rows
 
     def wait_for_embeddings(self) -> None:
         """Order the compute stream behind the current slot's staging H2D."""
-        if self.copy_done is not None:
+        if self.h2d_done is not None:
             torch.cuda.current_stream(self.device).wait_event(
-                self.copy_done[self._slot]
+                self.h2d_done[self._stage_ring.slot]
             )
 
     def embeddings(self, layer_id: int) -> torch.Tensor:
@@ -1072,9 +1090,9 @@ class EngramHost:
             # Take this prefetch's own ring slot; wait until the worker has read
             # the slot's previous occupant before reusing its buffer (a no-op
             # unless several prefetches are outstanding without a drain).
-            slot = self._token_slot
-            self._token_slot = (slot + 1) % self._n_token_slots
-            self._token_read_done[slot].wait()
+            # advance() waits until the worker has read this slot's previous
+            # occupant; clear() marks it busy until the worker sets it again.
+            slot = self._token_ring.advance()
             self._token_read_done[slot].clear()
             host, event, read_done = (
                 self._token_host[slot],
