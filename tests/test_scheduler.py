@@ -1336,6 +1336,44 @@ class TestLongPrefillTokenThreshold:
         batch2, _ = sched.schedule()
         assert list(batch2.num_scheduled_tokens) == [8]
 
+    def test_offload_resume_capped(self, seq_factory):
+        """A prefill resuming after an offload load is capped by the threshold.
+
+        The resume takes its own early-return branch in Phase 2 and `continue`s
+        past the clamp the rest of that loop applies, so it used to size the
+        chunk off `max_num_batched_tokens` alone. Under `lmcache_offload` that
+        branch is the normal way a long prefill advances -- every park/resume
+        cycle re-enters it -- which left the threshold bounding almost nothing
+        on exactly the configs that set it.
+        """
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=64,
+                long_prefill_token_threshold=8,
+                num_kvcache_blocks=100,
+            )
+        )
+        sched.kv_connector = SimpleNamespace(
+            is_offload=True,
+            build_connector_meta=lambda: None,
+        )
+
+        seq = seq_factory(list(range(40)))
+        seq.num_cached_tokens = 4
+        seq.block_table = [0]
+        seq.offload_loaded_tokens = 4
+        sched._park_for_remote_load(seq, deque())
+        sched._count_inflight_load(seq)
+        sched.finished_recving_kv_req_ids.append(seq.id)
+        assert sched._resolve_waiting_remote_kv(seq, deque()) is False
+        sched.waiting.append(seq)
+
+        batch, _ = sched.schedule()
+
+        # 8, not the 36 tokens the batch budget alone would have allowed.
+        assert list(batch.num_scheduled_tokens) == [8]
+
 
 # ── prefix caching ────────────────────────────────────────────────────────
 

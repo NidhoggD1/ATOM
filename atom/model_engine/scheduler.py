@@ -1358,6 +1358,19 @@ class Scheduler:
                 # Blocks already held from the pre-park allocate; only re-check
                 # the batch budget. No re-match / re-allocate / re-park.
                 num_new_tokens = seq.num_prompt_tokens - seq.num_cached_tokens
+                # Repeated from the Phase-2 clamp below because this branch
+                # `continue`s past it, and `_park_ready_offload_partial_prefills`
+                # sends a request back through here on every park/resume cycle:
+                # without it the threshold would bound only the chunks of a
+                # prefill that never waited on the offload tier, which under
+                # `lmcache_offload` is close to none of them. Same multimodal
+                # exemption, for the same reason (see `atomic_prefill` below).
+                if (
+                    getattr(seq, "multimodal_data", None) is None
+                    and self.enable_chunked_prefill
+                    and 0 < self.long_prefill_token_threshold < num_new_tokens
+                ):
+                    num_new_tokens = self.long_prefill_token_threshold
                 budget_remaining = self.max_num_batched_tokens - num_batched_tokens
                 chunk = self._prefill_chunk_for_budget(
                     num_new_tokens, budget_remaining, num_batched_tokens
