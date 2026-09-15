@@ -153,9 +153,6 @@ jobs:
           allowed = {"pr": {"pr"}, "main": {"pr", "main"}, "nightly": {"pr", "main", "nightly"}}[current]
           models = json.load(open(".github/benchmark/models_accuracy.json", encoding="utf-8"))
           filtered = [m for m in models if m.get("test_level", "nightly") in allowed]
-          if event == "pull_request":
-              focus_models = {"DeepSeek-V4-Pro", "DeepSeek-V4-Pro MTP"}
-              filtered = [m for m in filtered if m.get("model_name") in focus_models]
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"models_json={json.dumps(filtered)}\n")
           print(f"Event={event} level={current}: {len(filtered)}/{len(models)} models")
