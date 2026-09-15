@@ -607,6 +607,11 @@ models:
               gpu_memory_utilization: 0.90
               max_num_seqs: 64
               max_num_batched_tokens: 8192
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+            extra_args: "--long-prefill-token-threshold 4096"
           env:
             common:
               ATOM_ENABLE_REPLAYSSM: "0"
