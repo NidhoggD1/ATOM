@@ -145,13 +145,9 @@ runs:
         MMAP_FLAG=""
         [ "${DISABLE_MMAP}" = "true" ] && MMAP_FLAG="-e ATOM_DISABLE_MMAP=true"
 
-        PRIVILEGED_FLAG="--privileged"
         GROUP_ADD_FLAGS="--group-add video"
-        if [ "${RUNNER_LABEL}" = "linux-atom-do-mi350x-8.test" ]; then
-          PRIVILEGED_FLAG=""
-          if getent group render >/dev/null 2>&1; then
-            GROUP_ADD_FLAGS="${GROUP_ADD_FLAGS} --group-add $(getent group render | cut -d: -f3)"
-          fi
+        if getent group render >/dev/null 2>&1; then
+          GROUP_ADD_FLAGS="${GROUP_ADD_FLAGS} --group-add $(getent group render | cut -d: -f3)"
         fi
 
         docker run -dt $PULL_FLAG $NETWORK_FLAG --device=/dev/kfd $DEVICE_FLAG \
@@ -160,7 +156,6 @@ runs:
         -w /workspace \
         --ipc=host $GROUP_ADD_FLAGS \
         --shm-size=16G \
-        $PRIVILEGED_FLAG \
         --cap-add=SYS_PTRACE \
         -e HF_TOKEN="${HF_TOKEN:-}" \
         -e ATOM_DOCKER_IMAGE="${ATOM_DASHBOARD_DOCKER_IMAGE:-}" \

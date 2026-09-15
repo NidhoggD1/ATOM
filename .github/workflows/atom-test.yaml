@@ -318,11 +318,7 @@ jobs:
           if [ -n "$containers" ]; then
             docker kill $containers || true
           fi
-          privileged_flag="--privileged"
-          if [ "${{ matrix.runner }}" = "linux-atom-do-mi350x-8.test" ]; then
-            privileged_flag=""
-          fi
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace $privileged_flag rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
 
       - name: Show Docker containers
         if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8.test'
