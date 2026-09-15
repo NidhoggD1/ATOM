@@ -31,6 +31,14 @@ registration dict has only the caches. Restoring mantissas against the previous
 occupant's scales is silent corruption, so the layers are asked for their scales
 here and a layer that clearly owns per-block scales without a way to report them
 is a hard error rather than a quiet omission.
+
+Hybrid models (Kimi-K3: MLA full attention plus KDA recurrent layers) make vLLM
+build more than one KV cache group, and the registration dict is still flat --
+every group's layers arrive in the same ``{layer_name: tensor}``. A group's
+pages have their own geometry and their own block count, so the two groups can
+never share one codec. ``split_kv_caches_by_group`` is that separation, done
+before ``build_kv_cache_tensors`` rather than inside it, so single-group models
+(the M3 / GLM-5.2 path) keep taking the dict exactly as vLLM handed it over.
 """
 
 from typing import Any
@@ -177,4 +185,85 @@ def build_kv_cache_tensors(
                 index_cache=index_cache,
             )
         )
+
+    # One codec covers all of these layers with a single ``num_blocks``, and it
+    # derives every segment's per-block stride as ``numel // num_blocks``. A
+    # layer whose leading axis is a DIFFERENT multiple of the block count is
+    # therefore not rejected later -- it is silently sliced at the wrong
+    # granularity. Equal leading dims within a group is the real invariant, so
+    # it is checked here, where the layer names are still available to name the
+    # offender.
+    if out:
+        counts = {int(t.k_cache.shape[0]) for t in out}
+        if len(counts) != 1:
+            names = sorted(main, key=_layer_sort_key)
+            detail = ", ".join(
+                f"{name}={int(t.k_cache.shape[0])}" for name, t in zip(names, out)
+            )
+            raise ValueError(
+                "layers in one KV cache group disagree on block count "
+                f"({detail}); the byte codec strides every segment by the same "
+                "num_blocks, so this would be sliced at the wrong granularity"
+            )
     return out
+
+
+def split_kv_caches_by_group(
+    kv_caches: dict[str, torch.Tensor],
+    kv_cache_groups: list[Any],
+) -> list[dict[str, torch.Tensor]]:
+    """Split vLLM's flat registration dict into one dict per KV cache group.
+
+    vLLM registers every group's layers together, but each group has its own
+    page geometry and its own block count, so each needs its own codec.
+
+    With a single group the dict is returned unfiltered. That is not an
+    optimisation: it keeps the single-group models byte-identical to the
+    behaviour that is measured working, and it keeps entries that a group spec
+    does not name (a registration vLLM adds later, an auxiliary cache) from
+    being dropped on the one path where there is no ambiguity about where they
+    belong.
+
+    With more than one group an unmapped entry IS ambiguous, and guessing is
+    the failure this function exists to prevent, so it is an error.
+
+    Args:
+        kv_caches: vLLM's registration dict.
+        kv_cache_groups: ``kv_cache_config.kv_cache_groups``, in group order.
+            Each carries ``layer_names``.
+
+    Returns:
+        One dict per group, in group order. A group with no registered layers
+        yields an empty dict rather than being dropped, so the returned list
+        index is always the vLLM group id.
+
+    Raises:
+        ValueError: a registered layer belongs to no group (multi-group only).
+    """
+    if len(kv_cache_groups) <= 1:
+        return [dict(kv_caches)]
+
+    owner: dict[str, int] = {}
+    for group_id, group in enumerate(kv_cache_groups):
+        for layer_name in group.layer_names:
+            owner[layer_name] = group_id
+
+    per_group: list[dict[str, torch.Tensor]] = [{} for _ in kv_cache_groups]
+    unmapped: list[str] = []
+    for name, tensor in kv_caches.items():
+        # An index cache rides with the layer that owns it and is named after
+        # it; it is not a layer of its own and no group spec lists it.
+        base = name.removesuffix(INDEX_CACHE_SUFFIX)
+        group_id = owner.get(base)
+        if group_id is None:
+            unmapped.append(name)
+            continue
+        per_group[group_id][name] = tensor
+
+    if unmapped:
+        raise ValueError(
+            f"registered KV caches belong to no KV cache group: {sorted(unmapped)}; "
+            "with more than one group there is no safe default -- putting them "
+            "in the wrong group moves the wrong bytes under a valid prefix hash"
+        )
+    return per_group

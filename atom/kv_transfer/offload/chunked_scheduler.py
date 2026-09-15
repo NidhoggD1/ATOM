@@ -82,6 +82,14 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         )
         self._lookup_client = lookup_client
 
+        # Optional veto on how far a reported hit may reach, installed by a
+        # hybrid connector. A model whose recurrent state must be restored
+        # alongside the KV has a second condition this scheduler knows nothing
+        # about -- the state at the hit boundary has to exist too -- and the
+        # only safe answer to a missing state is a shorter hit. Called with
+        # ``(seq, hit)`` and returns the permitted hit.
+        self._hit_cap_hook = None
+
         # req_id -> LoadSpec (pending load decided at match time)
         self._load_specs: dict[str, LoadSpec] = {}
         # req_id -> Sequence (queued to recv this step)
@@ -152,6 +160,15 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._active_load_operations.pop(sid, None)
         self._load_lifecycles[sid] = seq
 
+    def install_hit_cap_hook(self, hook) -> None:
+        """Let a hybrid connector shorten every hit this scheduler reports.
+
+        One hook, not a list: the cap is a correctness constraint rather than a
+        policy, and two of them would raise the question of which wins for a
+        reader who has to be sure the answer is "the shortest".
+        """
+        self._hit_cap_hook = hook
+
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
         if not self._do_load or self._lookup_client is None:
             return 0, False
@@ -205,6 +222,24 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         hit = int(hit)
         if hit == num_prompt:  # full-prompt hit → recompute last token
             hit -= 1
+        if self._hit_cap_hook is not None:
+            # After the full-prompt decrement, so the hook caps the hit that
+            # will actually be requested; before the save floor is recorded, so
+            # a capped hit does not leave a floor claiming the tier already
+            # holds the part that was just refused.
+            capped = int(self._hit_cap_hook(seq, hit))
+            if capped < hit:
+                logger.debug(
+                    "[OFFLOAD-LOOKUP] seq=%s hit capped %d -> %d",
+                    seq.id,
+                    hit,
+                    capped,
+                )
+                hit = capped
+            if hit <= 0:
+                self._clear_pending_load(sid)
+                self._hit_save_floors.pop(sid, None)
+                return 0, False
         self._hit_save_floors[sid] = self._chunk_floor(hit)
         need = hit - int(seq.num_cached_tokens)
         if need <= 0:
