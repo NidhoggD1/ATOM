@@ -1,8 +1,8 @@
 # Copilot review instructions — ATOM
 
 Do not comment on anything `ruff` or `black` already enforces (formatting,
-import order, line length, naming case). CI runs both, and a pre-commit hook
-runs them locally. Report only what a linter cannot see.
+import order, line length, naming case). CI runs both in
+`.github/workflows/pre-checks.yaml`. Report only what a linter cannot see.
 
 Rank findings by severity and report at most 10. Prefer one precise finding
 with a `file:line` and a named alternative over three vague ones. If a section
@@ -14,12 +14,14 @@ below yields nothing on a diff, say nothing for it.
   every other occurrence left unfixed in the same diff.
 - Report comments and docstrings that no longer match the code, including a
   docstring that states a check the code does not perform.
-- Report `assert` used as a runtime guard on a serving path: it is stripped
-  under `python -O`, leaving silent wrong behaviour rather than an error.
+- Report `assert` used as a runtime guard on a serving path. This repo's
+  convention is `raise` for anything that must survive `python -O`; several
+  modules say so in comments where they chose `raise` deliberately.
 - Report a value snapshotted at one point and used at another without
   revalidation, especially an index, slot, or timestamp.
-- Report an exception type that a caller's `getattr(..., default)` or bare
-  `except` will silently swallow.
+- Report a raised exception that a caller will silently swallow — an
+  `AttributeError` reaching a `getattr(obj, name, default)`, or anything caught
+  by a bare `except` that then continues.
 
 ## Cleanliness
 
@@ -67,8 +69,11 @@ below yields nothing on a diff, say nothing for it.
   transport inside a file named for selection.
 - Report a new feature spread across several existing large files where a new
   module would isolate it. Name the files and the natural seam.
-- Report functions over 50 lines and files over 800 lines, and say what would
-  split out.
+- Report a function this change pushes past 50 lines, and a file it pushes past
+  800 lines or grows substantially when already past, and say what would split
+  out. Do not report size the diff did not move: roughly a tenth of this repo
+  is already over those thresholds, including most of the files that change
+  most often.
 - Report one policy decided at several scattered call sites instead of in one
   table. List the sites.
 - Report a name that stopped describing its behaviour after the change, and
