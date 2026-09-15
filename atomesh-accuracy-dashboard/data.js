@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789414284040,
+  "lastUpdate": 1789490973992,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -2945,6 +2945,57 @@ window.BENCHMARK_DATA = {
             "value": 0.887,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34867765396 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609141448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1645 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Zhiwei",
+            "username": "ZhiweiYan-96",
+            "email": "yanzhw5@mail3.sysu.edu.cn"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "e03b7f17a2e2835cc1b9b0f8121f0c54985e0b71",
+          "message": "[GLM5.2] elementwise fusion around sprase attention (#2235)\n\n* dcp: fold the per-token FP8 quant into the a2a combine\n\nThe combine wrote bf16 and a separate per-token quant launch immediately\nrequantised it for o_proj. Emit the quantised activation directly instead.\n\nOff by default (ATOM_DCP_A2A_FUSED_QUANT): it costs occupancy, and it\nquantises from the fp32 accumulator rather than a bf16 round trip, which\nshifts results by up to one bf16 step.\n\n* dcp: wire the fused combine-quant into the MLA call site\n\nHook the fused kernel up behind ATOM_DCP_A2A_FUSED_QUANT, and let o_proj\ntake the scale the combine produced.\n\n* mla: one kernel for the prefill LSE mask, not six\n\ntorch.where(isfinite(lse), o, zeros_like(o)) costs six launches: four to\ndecompose isfinite, one to fill an o-sized buffer with zeros, one to select.\nA Triton kernel does it in one, and skips o entirely for a finite row --\nwhich is nearly all of them.\n\n716 -> 281 us per layer, measured at ISL=49152 TP4/DCP4.\n\n* indexer: stop prefilling the sparse logits buffer with -inf\n\nPositions outside a row's window have no reader: top_k_per_row_prefill gets\nthe same row_starts/row_ends and offsets every access by rowStart. aiter\nexposes clean_logits for exactly this case.\n\n9.1 ms of a 1.3 s prefill. ATOM_SPARSE_INDEXER_CLEAN_LOGITS=1 restores it.\n\n* dcp: make both fusions unconditional and drop their env switches\n\nSwept under CUDA-graph replay, the fused combine-quant is faster at every\nbatch from 1 to 16384 -- the occupancy loss never catches the saved launch --\nand its quantization error is 0.998x the unfused path's against an fp64\nreference. The gsm8k gap that motivated the switches was replicate noise.\n\nRemoves ATOM_DCP_A2A_FUSED_QUANT and ATOM_SPARSE_INDEXER_CLEAN_LOGITS.\n\n* style: black\n\nFormatting only, no behaviour change.\n\n* ci: fix the Pre Checkin failures on this branch\n\nBoth new test modules drove Triton kernels with no device guard, so all 15\nof their tests failed on the non-GPU runner. Ruff also flagged four dead\n`# noqa: E402` directives and a `# noqa: PLR0124` that black had moved off\nits line, re-exposing the self-comparison it was there to exempt.\n\n* dcp: mask the padding lanes of the a2a combine load\n\nN_ROUNDED rounds the rank axis up to a power of two, so a 3-rank group has a\nlane addressing one slab past `recv`. Its factor is already zero, so this\nchanges no result -- it stops the read. Same fix in the unfused kernel, which\nhas carried the pattern since the a2a backend landed.\n\n* tests: drop the fused-quant gating matrix\n\nIt mirrored the predicate's five ifs against a stub that hard-coded the very\no_proj assumption it would need to check, so it could only confirm the code\nagreed with itself. The kernel tests cover this change on real tensors.\n\n* tests: check the device before importing triton\n\nimportorskip only catches an import error, and triton raises when no GPU\ndriver is active. Matches the guard order in test_dcp_a2a_fused_quant.py.\n\n* dcp: spell the isfinite predicate with & like the rest of the file\n\nThe `and` form compiled and ran -- `lse` is a scalar load, one program per\nrow -- but every other predicate here is bitwise, and tl.abs has no side\neffect, so nothing is lost by not short-circuiting.\n\n* dcp: make the fused quant reproduce aiter bit for bit\n\nDividing by FP8_MAX instead of multiplying by its reciprocal is 1 ulp off on\nROCm: 54% of rows got a different scale and 0.116% of elements landed on an\nadjacent FP8 code. o_proj cannot tell the two quantizers apart, so they have\nto agree. Test compares against aiter directly; the tolerance test could not\nsee this.\n\n* dcp: check the fused-quant/LSE combination before the single-rank return\n\nThe assertion sat after the world_size==1 shortcut, so that path returned\n(out, None) and dropped the requested LSE instead of rejecting the call.\n\n* dcp: fold the a2a padding lanes onto lane 0 before forming pointers\n\nThe loads were already masked, which is the documented Triton contract; this\nkeeps the addresses themselves inside `recv` as well. No result changes --\nthe bit-for-bit comparison against aiter still passes.\n\n* mla: accept both FP8 spellings and emit the layer's own\n\ndtypes.fp8 is e4m3fn here and e4m3fnuz on MI300, so matching one identity\nskipped the fusion for a layer carrying the other. Returning the constant\ninstead of the layer's dtype would also have quantized to the wrong format.\nMirrors the predicate in attention_residual.py.\n\n* dcp: keep the zero scale on empty rows, and harden the LSE-mask kernel\n\nAn all-zero row now keeps scale 0 with a zero reciprocal, which is what aiter\nstores at these shapes and what kimi_k3/quant.py mirrors; the 1e-10 floor made\nthe fused and unfused quantizers non-interchangeable. Also folds the LSE-mask\ntail lanes onto 0 before forming addresses, and asserts the head dim really is\ncontiguous -- the kernel indexes it as base + idx.\n\n* tests: check in the alignment-tail and non-power-of-two coverage\n\nThe indexer buffer's padding columns were verified by hand, not by anything a\nreviewer can rerun; this pins them, plus aiter's multi-block kernel, which\nMI355X dispatch never selects at these sizes. The LSE-mask matrix was all\nHEAD_DIM=512, so the kernel's masked tail was never exercised.",
+          "timestamp": "2026-09-15T14:20:01Z",
+          "url": "https://github.com/ROCm/ATOM/commit/e03b7f17a2e2835cc1b9b0f8121f0c54985e0b71"
+        },
+        "date": 1789490973506,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9545,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34994168854 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202609151450 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9462 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9515,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34994168854 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609151450 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9522 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 64.71,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34994168854 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609151450 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9522 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.94,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8946,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34994168854 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609151450 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1676 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
