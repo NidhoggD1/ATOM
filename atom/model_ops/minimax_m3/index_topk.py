@@ -577,6 +577,81 @@ PREFILL_TOPK_NUM_WARPS = 1
 DECODE_TOPK_BLOCK_SIZE_K = 512
 DECODE_TOPK_NUM_WARPS = 8
 
+# Chunked decode selection. One program per (query row x kv-head) walks the
+# whole row in a serial merge chain, so at conc=1/TP4 the selector is 4
+# programs on 256 CUs and the row length, not the grid, sets the latency.
+# Splitting a row across chunks needs a merge, and the merge is what decides
+# whether the split pays: done as a second launch it costs ~6 us and eats the
+# win, done with an arrival counter in the same launch it costs nothing.
+DECODE_TOPK_TARGET_GRID = 64
+DECODE_TOPK_MAX_CHUNKS = 16
+# Serial tiles the split has to remove before it is worth paying for. The split
+# costs a partial store, an arrival counter and a merge pass, about 3.5-4 us,
+# against roughly 2-3 us per tile it takes off the chain.
+#
+# The count that matters is tiles removed, not chunks used: a row cut into two
+# chunks saves one tile when it is two tiles long and three tiles when it is
+# six, and only the second pays. Gating on the chunk count instead would take
+# the wide low-chunk case down with it, which is the shape a batch of 8 lands
+# on. Measured device time, triton 3.7:
+#
+#   width 1024, 2 tiles, 1 saved   6.63 split / 6.29 unsplit   +5%, excluded
+#   width 1536, 3 tiles, 2 saved   7.59 split / 8.56 unsplit  -11%, included
+#   width 2048, 4 tiles, 3 saved   7.98 split / 10.81 unsplit -26%
+#
+# The triton version is part of the fit, not a footnote: on 3.8 the same width
+# 1024 point reads 7.68 against 6.04, a 27% regression rather than 5%, because
+# 3.8 slows the Triton kernels and leaves aiter's alone. A threshold fitted
+# there would not be this one.
+#
+# This is a microbench fit and wants a trace to confirm it: p50 of the agentic
+# workload is ~160K context = width 1250, which lands right on the boundary.
+DECODE_TOPK_MIN_TILES_SAVED = 2
+
+# Arrival counters, one persistent buffer per (device, rows). This cannot be a
+# per-call torch.zeros: that is a fill kernel inside the captured graph on
+# every replay, and it measured 4.3 us -- most of what the split saves. The
+# kernel zeroes the counter back itself once the merge is done, so a buffer
+# handed out once stays valid forever, and the cache keeps the address stable,
+# which graph capture requires.
+_DECODE_TOPK_COUNTERS: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _decode_topk_chunks(rows: int) -> int:
+    """How many chunks to split each selector row into.
+
+    Chunking trades a serial merge chain for one atomic and a merge pass, so it
+    pays only while the grid is starved. Past a full grid the extra chunks are
+    overhead, which is why this collapses to 1 as batch grows -- the same shape
+    as the row-length story in the score kernel, for the same reason.
+    """
+    target = max(
+        1, min(DECODE_TOPK_MAX_CHUNKS, DECODE_TOPK_TARGET_GRID // max(1, rows))
+    )
+    return 1 << (target.bit_length() - 1)
+
+
+def _alloc_decode_topk_chunked(rows, chunks, topk, device):
+    """Partial winners + arrival counter, as (tensors to keep, kernel args).
+
+    Mirrors _alloc_emit: the kernel dereferences both pointers whether or not
+    chunking is on, so the off case still has to hand over something valid.
+    """
+    if chunks <= 1:
+        dummy = torch.empty(1, dtype=torch.int32, device=device)
+        return None, (dummy, dummy, 0, 0)
+    partial = torch.empty(
+        (rows, chunks, triton.next_power_of_2(topk)),
+        dtype=torch.int64,
+        device=device,
+    )
+    key = (device.index if device.index is not None else -1, rows)
+    counter = _DECODE_TOPK_COUNTERS.get(key)
+    if counter is None:
+        counter = torch.zeros((rows,), dtype=torch.int32, device=device)
+        _DECODE_TOPK_COUNTERS[key] = counter
+    return partial, (partial, counter, partial.stride(0), partial.stride(1))
+
 
 @functools.cache
 def _compute_units(device_index: int) -> int:
@@ -750,6 +825,8 @@ def _launch_select(
     num_warps,
     emit,
     n_valid_column_per_row=None,
+    chunk_args=None,
+    topk_chunks=1,
 ):
     """The one selection pass, launched the same way by both phases.
 
@@ -757,6 +834,12 @@ def _launch_select(
     rows are ragged so it hands (query starts, keys behind each request) and
     picks its tile from the shape, decode's are dense so both index arrays
     collapse to seq_lens and the tile and warp count have to be constants.
+
+    Chunking is decode-only and rides in the head dimension of the grid, so
+    ``topk_chunks == 1`` reproduces the single-program-per-row launch exactly.
+    It applies to the Triton selector below, which is where a row lands when
+    aiter declines it or is not wide enough to pay for -- the two are ordered,
+    not exclusive.
     """
     sbt, sctx, bt_stride0, sbt_stride0 = emit_args
     # Bounds published and the row wide enough to pay for aiter; the selection
@@ -798,7 +881,11 @@ def _launch_select(
             )
         return
 
-    _topk_index_packed_kernel[(rows_per_req, batch, num_idx_heads)](
+    if chunk_args is None:
+        dummy = torch.empty(1, dtype=torch.int32, device=score.device)
+        chunk_args = (dummy, dummy, 0, 0)
+    partial, counter, partial_stride_row, partial_stride_c = chunk_args
+    _topk_index_packed_kernel[(rows_per_req, batch, num_idx_heads * topk_chunks)](
         score,
         topk_idx,
         1,  # sample_interval (block_size_q)
@@ -815,11 +902,17 @@ def _launch_select(
         sctx,
         bt_stride0,
         sbt_stride0,
+        partial,
+        counter,
+        partial_stride_row,
+        partial_stride_c,
         NUM_KV_HEADS=num_idx_heads,
         DECODE_MAX_Q=decode_max_q,
         BLOCK_SIZE_K=block_size_k,
         pages_per_block=PAGES_PER_SPARSE_BLOCK,
         EMIT_SPARSE_BT=emit,
+        TOPK_CHUNKS=topk_chunks,
+        MIN_TILES_SAVED=DECODE_TOPK_MIN_TILES_SAVED,
         num_warps=num_warps,
     )
 
@@ -832,7 +925,14 @@ def _prefill_topk_block_size_k(max_block: int) -> int:
     )
 
 
-@triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"]),
+        "CAND_WIDTH": lambda args: triton.next_power_of_2(
+            args["TOPK_CHUNKS"] * triton.next_power_of_2(args["topk"])
+        ),
+    }
+)
 @triton.jit
 def _topk_index_packed_kernel(
     s_ptr,  # [num_heads, total_q, max_block]
@@ -861,17 +961,26 @@ def _topk_index_packed_kernel(
     sparse_ctx_ptr,  # out: [total_q] int32 (or dummy)
     stride_bt_b,
     stride_sbt_n,
+    # --- chunked selection (decode only; TOPK_CHUNKS == 1 leaves these dummy) ---
+    partial_ptr,  # [rows, TOPK_CHUNKS, BLOCK_SIZE_T] int64 chunk-local winners
+    counter_ptr,  # [rows] int32 arrival counter, zero on entry and on exit
+    stride_partial_row,
+    stride_partial_c,
     NUM_KV_HEADS: tl.constexpr,  # kv-head count folded into the emitted row + page id
     DECODE_MAX_Q: tl.constexpr,  # 0 = prefill; else query rows per request
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
     EMIT_SPARSE_BT: tl.constexpr,  # fuse compaction (per-kv-head row + encoded page)
+    TOPK_CHUNKS: tl.constexpr,  # programs per row; 1 = the unsplit launch
+    CAND_WIDTH: tl.constexpr,  # next_pow2(TOPK_CHUNKS * BLOCK_SIZE_T)
+    MIN_TILES_SAVED: tl.constexpr,  # chain tiles the split must remove to pay
 ):
     tl.static_assert(BLOCK_SIZE_K >= BLOCK_SIZE_T)
     pid_q = tl.program_id(0)
     pid_b = tl.program_id(1)
-    pid_h = tl.program_id(2)
+    pid_h = tl.program_id(2) // TOPK_CHUNKS
+    pid_c = tl.program_id(2) % TOPK_CHUNKS
     if DECODE_MAX_Q > 0:
         # Deriving the starts here rather than materializing them cost three
         # elementwise launches per decode step, ~5% of the op.
@@ -890,24 +999,52 @@ def _topk_index_packed_kernel(
     )
     valid_blocks = (prefix_len + pid_q * sample_interval + block_size) // block_size
     local_start = tl.maximum(0, valid_blocks - local_blocks)
+    row = (seq_start + pid_q) * NUM_KV_HEADS + pid_h
 
-    # valid_blocks >= 1 always, so the first tile is unconditional and the loop
-    # covers only the rows long enough to need a second one. Folding it into the
-    # loop instead would cost the single-tile rows -- the common case -- one
+    # Split the row into equal *blocks*, not equal tiles: an equal-blocks slice
+    # is at most one tile wide once there are enough chunks, and a row short
+    # enough to need only one chunk then falls out of the split by itself --
+    # active == 1 skips the partial, the atomic and the merge, so short
+    # contexts keep the unsplit kernel's cost instead of paying for a split
+    # they cannot use.
+    if TOPK_CHUNKS > 1:
+        tiles = tl.cdiv(valid_blocks, BLOCK_SIZE_K)
+        active = tl.maximum(1, tl.minimum(TOPK_CHUNKS, tiles))
+        # Not enough of the chain removed to pay for the merge: collapse to one
+        # program, which walks the row exactly as the unsplit kernel does.
+        # Decided here rather than at launch so it is per row -- a batch is only
+        # as wide as its widest row, and the short ones should not be dragged
+        # along behind it.
+        if tiles - tl.cdiv(tiles, active) < MIN_TILES_SAVED:
+            active = 1
+        if pid_c >= active:
+            return
+        per = valid_blocks // active
+        extra = valid_blocks - per * active
+        lo = pid_c * per + tl.minimum(pid_c, extra)
+        hi = lo + per + tl.where(pid_c < extra, 1, 0)
+    else:
+        active = 1
+        lo = 0
+        hi = valid_blocks
+
+    # hi > lo always, so the first tile is unconditional and the loop covers
+    # only the slices long enough to need a second one. Folding it into the
+    # loop instead would cost the single-tile slices -- the common case -- one
     # extra cat and topk against an all-padding vector. (The two argument lists
     # are spelled out because triton's Python subset has no *args.)
     winners = tl.topk(
         _score_tile_keys(
-            s_row, 0, valid_blocks, local_start, stride_s_k, init_blocks, BLOCK_SIZE_K
+            s_row, lo, hi, local_start, stride_s_k, init_blocks, BLOCK_SIZE_K
         ),
         BLOCK_SIZE_T,
     )
-    for offset in tl.range(BLOCK_SIZE_K, valid_blocks, BLOCK_SIZE_K):
+    for offset in tl.range(lo + BLOCK_SIZE_K, hi, BLOCK_SIZE_K):
         tile = tl.topk(
             _score_tile_keys(
                 s_row,
                 offset,
-                valid_blocks,
+                hi,
                 local_start,
                 stride_s_k,
                 init_blocks,
@@ -918,6 +1055,35 @@ def _topk_index_packed_kernel(
         winners = tl.topk(tl.cat(winners, tile, can_reorder=True), BLOCK_SIZE_T)
 
     off_t = tl.arange(0, BLOCK_SIZE_T)
+
+    # Publish this chunk's winners and let the last arriver merge in place. A
+    # second launch would do the same work, but it costs ~6 us of dispatch and
+    # that is larger than everything the split wins back.
+    #
+    # The acq_rel is load-bearing, not decoration: it is what orders the other
+    # chunks' partial stores before the last arriver reads them. Under a
+    # relaxed atomic the merge can read a partial that has not landed, and it
+    # would surface only as an occasional wrong block, on some shapes, at some
+    # occupancies.
+    if TOPK_CHUNKS > 1:
+        if active > 1:
+            partial_row = partial_ptr + row * stride_partial_row
+            tl.store(partial_row + pid_c * stride_partial_c + off_t, winners)
+            arrival = tl.atomic_add(counter_ptr + row, 1, sem="acq_rel", scope="gpu")
+            if arrival != active - 1:
+                return
+            off_c = tl.arange(0, CAND_WIDTH)
+            cand_c = off_c // BLOCK_SIZE_T
+            winners = tl.topk(
+                tl.load(
+                    partial_row
+                    + cand_c * stride_partial_c
+                    + (off_c % BLOCK_SIZE_T),
+                    mask=cand_c < active,
+                    other=0,
+                ),
+                BLOCK_SIZE_T,
+            )
     topk_idx = (winners & 0xFFFF).to(tl.int32) - 1  # back to a 0-based block id
     topk_idx = tl.where(off_t < tl.minimum(topk, valid_blocks), topk_idx, -1)
     ti_ptrs = (
@@ -929,12 +1095,11 @@ def _topk_index_packed_kernel(
     tl.store(ti_ptrs, topk_idx.to(ti_ptrs.dtype.element_ty), mask=off_t < topk)
 
     if EMIT_SPARSE_BT:
-        emit_row = (seq_start + pid_q) * NUM_KV_HEADS + pid_h
         _emit_sparse_block_table_row(
             topk_idx,
             block_table_ptr + pid_b * stride_bt_b,
-            sparse_bt_ptr + emit_row * stride_sbt_n,
-            sparse_ctx_ptr + emit_row,
+            sparse_bt_ptr + row * stride_sbt_n,
+            sparse_ctx_ptr + row,
             prefix_len + pid_q * sample_interval + 1,
             topk,
             pid_h,
@@ -943,6 +1108,13 @@ def _topk_index_packed_kernel(
             NUM_KV_HEADS,
             BLOCK_SIZE_T,
         )
+
+    # Hand the row back zeroed so the next launch needs no fill kernel of its
+    # own. Only the merging program gets here, and the next launch cannot start
+    # before this one retires, so there is nothing to race with.
+    if TOPK_CHUNKS > 1:
+        if active > 1:
+            tl.atomic_xchg(counter_ptr + row, 0, sem="acq_rel", scope="gpu")
 
 
 # ---------------------------------------------------------------------------
@@ -1255,6 +1427,10 @@ def minimax_m3_index_topk_decode(
         num_stages=DECODE_SCORE_NUM_STAGES,
     )
 
+    topk_chunks = _decode_topk_chunks(total_q * num_idx_heads)
+    _, chunk_args = _alloc_decode_topk_chunked(
+        total_q * num_idx_heads, topk_chunks, topk, idx_q.device
+    )
     _launch_select(
         score,
         topk_idx,
@@ -1273,5 +1449,7 @@ def minimax_m3_index_topk_decode(
         num_warps=DECODE_TOPK_NUM_WARPS,
         emit=emit_sparse_block_table,
         n_valid_column_per_row=n_valid_column_per_row,
+        chunk_args=chunk_args,
+        topk_chunks=topk_chunks,
     )
     return (topk_idx, *emit_out) if emit_out else topk_idx
