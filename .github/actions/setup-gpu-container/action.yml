@@ -91,7 +91,7 @@ runs:
 
         MODEL_HOST_ROOT=""
         if [ "${RUNNER_LABEL}" = "linux-atom-do-mi350x-8.test" ]; then
-          for d in /home/xihuang@amd.com/models /share_nfs/models /share_nfs; do
+          for d in /models /share_nfs/models /share_nfs; do
             if [ -d "$d" ]; then
               MODEL_HOST_ROOT="$d"
               break
