@@ -38,15 +38,41 @@ logger = logging.getLogger(__name__)
 _LAYER_SEED_STRIDE = 10007
 
 
-def config_declares_engram(hf_config) -> bool:
-    """Whether a HF config declares engram layers (in `text_config` or at root),
-    read without constructing the model or mapping the tables."""
-    tc = getattr(hf_config, "text_config", None) or hf_config
-    return (
-        tc.get("engram_layer_ids") is not None
-        if isinstance(tc, dict)
-        else getattr(tc, "engram_layer_ids", None) is not None
+def engram_text_config(hf_config):
+    """The config container (dict or object) that declares engram layers, or None.
+
+    Probes BOTH the root and a nested `text_config`, because either can carry the
+    engram block. Each container may itself be a dict (read by key) or a config
+    object (read by attribute), independently of the outer shape -- a config
+    OBJECT can hold a raw-dict `text_config`. Centralizing this here keeps every
+    caller (detection, scheduler context, checkpoint loader) reading the engram_*
+    fields off the one container that actually declares them.
+    """
+
+    def declares(value) -> bool:
+        if value is None:
+            return False
+        got = (
+            value.get("engram_layer_ids")
+            if isinstance(value, dict)
+            else getattr(value, "engram_layer_ids", None)
+        )
+        return got is not None
+
+    if declares(hf_config):
+        return hf_config
+    nested = (
+        hf_config.get("text_config")
+        if isinstance(hf_config, dict)
+        else getattr(hf_config, "text_config", None)
     )
+    return nested if declares(nested) else None
+
+
+def config_declares_engram(hf_config) -> bool:
+    """Whether a HF config declares engram layers (root or nested text_config),
+    read without constructing the model or mapping the tables."""
+    return engram_text_config(hf_config) is not None
 
 
 def _is_prime(n: int) -> bool:
@@ -92,6 +118,21 @@ class EngramConfig:
     compressed_vocab_size: int
     seed: int = 0
     kernel_size: int = 4
+
+    def __post_init__(self):
+        # layer_ids and num_embeddings are parallel arrays consumed by zip
+        # (_derive_head_vocab_sizes, EngramModules.from_checkpoint), so a length
+        # mismatch would silently drop a declared layer's table/op -- it would
+        # then be absent from `__contains__` and served with no engram. Fail
+        # closed here instead, before any model can run partially wired.
+        if len(self.layer_ids) != len(self.num_embeddings):
+            raise ValueError(
+                f"engram_layer_ids has {len(self.layer_ids)} entries but "
+                f"engram_num_embeddings has {len(self.num_embeddings)}; each "
+                f"engram layer needs exactly one table size"
+            )
+        if not self.layer_ids:
+            raise ValueError("engram config declares no layers")
 
     @classmethod
     def from_hf(cls, text_config: dict) -> EngramConfig | None:
@@ -151,43 +192,50 @@ class CompressedTokenizer:
     def __len__(self) -> int:
         return self.num_new_token
 
-    def _cache_key(self) -> str:
+    def _cache_key(self) -> str | None:
         # `_build` keys the compressed table on decode() / convert_ids_to_tokens()
-        # over the whole vocab, so the cache key must capture the tokenizer's full
+        # over the whole vocab, so a cache key must capture the tokenizer's full
         # behavior, not just get_vocab(): two tokenizers can share a vocab mapping
         # yet differ in decoder, normalizer, or added tokens and produce different
         # compressed ids. A fast tokenizer serializes to a string that covers all
-        # of that; otherwise fall back to the id->token mapping plus added tokens.
-        h = hashlib.sha256()
-        h.update(str(self._CACHE_VERSION).encode())
+        # of that. A slow tokenizer has no such fingerprint, and a vocab-map key
+        # would not distinguish two decoders that build different tables -- so
+        # return None there and let `_load_or_build` skip the cache entirely rather
+        # than risk silently reusing the wrong table.
         backend = getattr(self._tokenizer, "backend_tokenizer", None)
         serialized = (
             backend.to_str()
             if backend is not None and hasattr(backend, "to_str")
             else None
         )
-        if serialized is not None:
-            h.update(serialized.encode("utf-8"))
-        else:
-            vocab = self._tokenizer.get_vocab()
-            h.update(str(len(vocab)).encode())
-            for tok, tid in sorted(vocab.items()):
-                h.update(tok.encode("utf-8", "replace"))
-                h.update(b"\x00")
-                h.update(str(tid).encode())
-                h.update(b"\x00")
-            added = getattr(self._tokenizer, "get_added_vocab", dict)()
-            for tok, tid in sorted(added.items()):
-                h.update(b"+")
-                h.update(tok.encode("utf-8", "replace"))
-                h.update(str(tid).encode())
+        if serialized is None:
+            return None
+        h = hashlib.sha256()
+        h.update(str(self._CACHE_VERSION).encode())
+        h.update(serialized.encode("utf-8"))
         return h.hexdigest()[:16]
 
     def _load_or_build(self, cache_dir: str | None) -> tuple[np.ndarray, int]:
-        cache_dir = cache_dir or os.environ.get(
-            "ATOM_ENGRAM_CACHE_DIR", str(Path.home() / ".cache" / "atom" / "engram")
+        key = self._cache_key()
+        if key is None:
+            # No stable fingerprint of this tokenizer's decode()/convert behavior
+            # (a slow tokenizer). Rebuild every time rather than key on the vocab
+            # map alone, which a different tokenizer could collide with and reuse a
+            # table built from different surface forms.
+            logger.info(
+                "engram: tokenizer has no fast-serialization fingerprint; "
+                "building compressed vocab without a disk cache"
+            )
+            return self._build()
+        # `or` on each step so an unset OR explicitly-empty env var (envs.py
+        # registers a "" default) falls through to the real default rather than
+        # writing the cache into the process's cwd.
+        cache_dir = (
+            cache_dir
+            or os.environ.get("ATOM_ENGRAM_CACHE_DIR")
+            or str(Path.home() / ".cache" / "atom" / "engram")
         )
-        path = Path(cache_dir) / f"compressed_vocab_{self._cache_key()}.npz"
+        path = Path(cache_dir) / f"compressed_vocab_{key}.npz"
         if path.is_file():
             try:
                 with np.load(path) as blob:
@@ -385,6 +433,40 @@ class NgramHashMapping:
 # ---------------------------------------------------------------------------
 
 
+def _fp8_storage_dtype() -> torch.dtype:
+    """The E4M3 fp8 dtype whose raw bytes a uint8 table/wkv actually holds.
+
+    aiter resolves `dtypes.fp8` per target at import -- E4M3-FNUZ on gfx942/gfx94x
+    (MI308), E4M3-FN on gfx950/NV -- and the checkpoint was quantized with that
+    same type, so raw bytes must be reinterpreted with the matching variant (FNUZ
+    and FN differ in exponent bias, so viewing one as the other corrupts every
+    value). Fall back to E4M3-FN only when aiter is unavailable (CPU-only tooling).
+    """
+    try:
+        from aiter import dtypes
+
+        return dtypes.fp8
+    except (ImportError, AttributeError):
+        # aiter absent (CPU-only tooling) or no `fp8` attribute on this build.
+        return torch.float8_e4m3fn
+
+
+def decode_fp8(tensor: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Decode an E4M3 fp8 value tensor (table rows / wkv weights) to `out_dtype`.
+
+    A native `float8_e4m3*` tensor converts directly under `.to()`. When a build
+    or checkpoint hands the same bytes back as raw `torch.uint8` (the recipe
+    documents this representation), `.to()` would read each byte as an integer
+    0..255 -- e.g. code 0x3c reads as 60 instead of the E4M3 value -- so the
+    storage must be reinterpreted as fp8 first, using the target's own E4M3 variant
+    (see `_fp8_storage_dtype`) rather than an unconditional FN. This is distinct
+    from `decode_block_scale`, which decodes the E8M0 *scale*.
+    """
+    if tensor.dtype == torch.uint8:
+        return tensor.view(_fp8_storage_dtype()).to(out_dtype)
+    return tensor.to(out_dtype)
+
+
 def decode_block_scale(scale: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """Decode an E8M0 block scale to `out_dtype`.
 
@@ -392,9 +474,14 @@ def decode_block_scale(scale: torch.Tensor, out_dtype: torch.dtype) -> torch.Ten
     build has no such dtype ATOM exposes the same bytes as raw `torch.uint8`
     (see deepseek_v4's block-scale loader); those are biased exponents, so the
     value is `2 ** (code - 127)` rather than the magnitude `.to()` would read.
+    Code 0 is the zero-scale sentinel (see v4_quant `_fp32_pow2_to_e8m0` /
+    `_e8m0_to_fp32_pow2`): it must decode to exactly 0.0, not `2 ** -127`, or an
+    all-zero block leaks a tiny nonzero embedding that native E8M0 never would.
     """
     if scale.dtype == torch.uint8:
-        return torch.exp2(scale.to(torch.float32) - 127.0).to(out_dtype)
+        code = scale.to(torch.float32)
+        pow2 = torch.exp2(code - 127.0)
+        return torch.where(code > 0, pow2, torch.zeros_like(pow2)).to(out_dtype)
     return scale.to(out_dtype)
 
 
@@ -459,7 +546,9 @@ class HostEmbeddingTable:
         index = torch.from_numpy(flat)
         # One fancy-index over the whole batch, not a row at a time: measured on
         # the real table that is ~0.9 us/row against ~8 us/row for a Python loop.
-        rows = self._tensor[index].to(out_dtype)
+        # decode_fp8 reinterprets a raw-uint8 fp8 table before converting; a
+        # native float8 table takes the plain `.to()` path unchanged.
+        rows = decode_fp8(self._tensor[index], out_dtype)
         if self._scale is not None:
             # Block-quantized: each scale covers `block_size` consecutive values
             # of a row. Skipping this does not fail, it returns values two orders
@@ -551,11 +640,17 @@ class EngramPrefetcher:
         self,
         hash_mapping,
         tables: dict[int, HostEmbeddingTable],
-        cache_capacity: int = 4096,
+        max_concurrent_seqs: int = 4096,
     ):
         self._hash_mapping = hash_mapping
         self._tables = tables
-        self.cache = EngramPrefetchCache(cache_capacity)
+        # The cache is keyed by (seq_id, layer_id), so a full decode batch inserts
+        # one entry per sequence PER engram layer -- size it for all of them, or
+        # the first layer's rows are evicted before staging reads them and
+        # stage_embeddings recomputes synchronously, defeating the overlap. The
+        # window is keyed by seq_id alone, so it needs only the sequence bound.
+        num_layers = max(1, len(hash_mapping.config.layer_ids))
+        self.cache = EngramPrefetchCache(max_concurrent_seqs * num_layers)
         self._pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="engram-prefetch"
         )
@@ -566,10 +661,11 @@ class EngramPrefetcher:
         # hash pads them and indexes the wrong rows.
         self._ngram = hash_mapping.config.max_ngram_size
         self._pad_id = hash_mapping.config.pad_token_id
-        # Bounded like the cache: finished sequences are dropped by drop_requests
-        # when the runner wires it, but the bound keeps the dict from growing
-        # unboundedly if a drop is ever missed.
-        self._window_capacity = cache_capacity
+        # Sized by the caller to the runner's concurrency ceiling (see
+        # build_engram_host), so an active request is never evicted; finished
+        # sequences are dropped by drop_requests, and the bound is only a leak net
+        # that reclaims a window whose drop was missed.
+        self._window_capacity = max_concurrent_seqs
         self._window: OrderedDict[int, deque] = OrderedDict()
         self._window_lock = threading.Lock()
 
@@ -644,7 +740,9 @@ class EngramPrefetcher:
 
     def _evict_windows(self) -> None:
         """Drop least-recently-used windows past the capacity (caller holds the
-        lock). A safety net for a missed drop_requests, not the primary path."""
+        lock). The capacity is sized to the runner's concurrency ceiling, so this
+        only reclaims a window whose drop_requests was missed -- an active request
+        cannot exceed the bound and so is never evicted out from under itself."""
         while len(self._window) > self._window_capacity:
             self._window.popitem(last=False)
 
@@ -720,6 +818,14 @@ class EngramPrefetcher:
                 "submit_compute needs exactly one of token_ids/token_source"
             )
 
+        # Drain the previous prefetch before admitting. The worker runs one job at
+        # a time in submission order, so waiting the latest in-flight future means
+        # every prior `_run` has finished its `put`. Without this, a seq id reused
+        # while its old prefetch is still queued would have admit() clear that id's
+        # drop mark, letting the stale job's put land under the new request (and
+        # mutate its window) before the new prefetch runs. In steady state this is
+        # a no-op: the prior prefetch was already consumed at this step's stage.
+        self.wait()
         # Admit on the SUBMIT thread, not in `_run`: these seqs are being
         # prefetched now, so clear any stale drop-mark synchronously. If a drop
         # then lands before the worker's `put`, the put is correctly skipped --
@@ -800,6 +906,11 @@ class EngramHost:
     answer.
     """
 
+    # Bound the wait for a queued prefetch: generous vs a normal gather (which is
+    # milliseconds), so it only trips a genuinely stuck or heavily-contended
+    # worker, at which point the rows are recomputed inline instead of hanging.
+    _PREFETCH_WAIT_S = 5.0
+
     def __init__(
         self,
         prefetcher: EngramPrefetcher,
@@ -838,8 +949,15 @@ class EngramHost:
         self._host_slots = {
             layer_id: [self.buffers[layer_id].cpu]
             + [
+                # device="cpu" explicitly: ModelRunner sets the default device to
+                # the CUDA device before _init_engram_host, and pin_memory=True on
+                # a default-CUDA torch.zeros raises / defeats the pinned H2D path.
                 torch.zeros(
-                    max_num_tokens, self.embed_width, dtype=dtype, pin_memory=True
+                    max_num_tokens,
+                    self.embed_width,
+                    dtype=dtype,
+                    device="cpu",
+                    pin_memory=True,
                 )
                 for _ in range(self._n_slots - 1)
             ]
@@ -867,7 +985,10 @@ class EngramHost:
             self._n_token_slots = self._n_slots
             self._token_event = [torch.cuda.Event() for _ in range(self._n_token_slots)]
             self._token_host = [
-                torch.empty(max_num_tokens, dtype=torch.int64).pin_memory()
+                # device="cpu" for the same reason as the staging slots above.
+                torch.empty(
+                    max_num_tokens, dtype=torch.int64, device="cpu"
+                ).pin_memory()
                 for _ in range(self._n_token_slots)
             ]
             self._token_read_done = [
@@ -926,13 +1047,35 @@ class EngramHost:
             if padded_rows is None
             else max(num_rows, min(padded_rows, self.max_num_tokens))
         )
-        self.prefetcher.wait(timeout=None)
-
-        # Probe without consuming: a hit still has to be readable by the fill
-        # loop below, which is what makes this `contains` and not `take`.
-        # A seq is a miss unless EVERY layer is cached: entries evict per
-        # (seq, layer), so probing only layer_ids[0] would call a half-evicted
-        # seq a hit and then fail in the take loop below.
+        # Wait for the prefetch, but bounded so telemetry surfaces a lagging
+        # worker. We must NOT recompute inline from the rolling window on timeout:
+        # the window is advanced to the current token by the worker itself
+        # (submit_compute._run runs advance() then gather), so a worker that has
+        # not reached advance() yet would have us hash a window one token stale --
+        # and its later advance would then desync every following n-gram. So on
+        # timeout, synchronize with the worker instead of second-guessing it: wait
+        # it out. A gather wedged on table I/O would stall an inline recompute just
+        # the same, so blocking is never worse here and is correct when the worker
+        # had simply not started; only a worker stuck well past the budget is a
+        # real fault worth failing on rather than serving a stale window.
+        if not self.prefetcher.wait(timeout=self._PREFETCH_WAIT_S):
+            logger.warning(
+                "engram: prefetch not ready in %.1fs; waiting for the worker",
+                self._PREFETCH_WAIT_S,
+            )
+            if not self.prefetcher.wait(timeout=self._PREFETCH_WAIT_S):
+                raise RuntimeError(
+                    f"engram prefetch worker stalled past "
+                    f"{2 * self._PREFETCH_WAIT_S:.1f}s; refusing to stage from a "
+                    f"possibly-stale rolling window"
+                )
+        # Probe without consuming: a hit still has to be readable by the fill loop
+        # below, which is what makes this `contains` and not `take`. A seq is a
+        # miss unless EVERY layer is cached: entries evict per (seq, layer), so
+        # probing only layer_ids[0] would call a half-evicted seq a hit and then
+        # fail in the take loop below. The worker has finished (waited above), so a
+        # miss here is a genuine cold/just-admitted row, recomputed safely below
+        # from its authoritative anchor -- never from an un-advanced window.
         missing = [
             i
             for i, seq_id in enumerate(seq_ids)
@@ -1022,6 +1165,13 @@ class EngramHost:
             raise ValueError(
                 f"{total} prefill rows exceed staging capacity {self.max_num_tokens}"
             )
+        # Drain any outstanding decode prefetch before we reseed windows below. A
+        # preempt/resume brings a request back through prefill while its last
+        # decode step's worker may still be running advance(); letting that append
+        # its prior token after seed_context() here would mix the resumed request's
+        # first n-gram window. Waiting lets the stale advance land first, then
+        # seed_context replaces the window wholesale.
+        self.prefetcher.wait(timeout=None)
         computed = self.prefetcher.compute_prefill(context_tails, chunk_tokens)
         offsets = np.concatenate(([0], np.cumsum(lengths)))
         self._stage_ring.advance()

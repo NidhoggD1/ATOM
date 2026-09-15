@@ -93,13 +93,16 @@ this name, builds the `EngramHost`, and holds it; keep a reference on the model 
 so the layers can reach it (forward has a fixed `(input_ids, positions)` signature).
 
 ```python
-def build_engram_host(self, device: torch.device, max_num_tokens: int):
+def build_engram_host(self, device, max_num_tokens: int, max_num_seqs: int):
     if self.model.engram is None:
         return None
-    host = self.model.engram.build_engram_host(device, max_num_tokens)
+    host = self.model.engram.build_engram_host(device, max_num_tokens, max_num_seqs)
     self.model.engram_host = host
     return host
 ```
+
+`max_num_tokens` sizes the per-step staging buffer; `max_num_seqs` sizes the
+per-request prefetch cache and rolling-window store (different budgets).
 
 **3. Gate the embedding into the residual, BEFORE the engram layer.** DeepSeek's
 Engram sits *between* decoder layers: the module at `layer_id` reads the residual

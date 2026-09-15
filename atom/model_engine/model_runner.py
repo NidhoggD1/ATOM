@@ -868,6 +868,17 @@ class ModelRunner:
                     "engram is not supported with KV-transfer disaggregation; the "
                     "decode consumer runs no local prefill to seed the n-gram context"
                 )
+            # Fail closed BEFORE constructing and loading the model (which maps
+            # ~200 GB of tables and allocates the full weights): if the resolved
+            # model class does not implement build_engram_host, serving it would
+            # silently ignore the engram weights. _init_engram_host re-checks the
+            # built instance as the final gate (and catches a None return).
+            if not hasattr(model_class, "build_engram_host"):
+                raise NotImplementedError(
+                    f"{model_class.__name__} config declares engram layers but the "
+                    "model class does not implement build_engram_host; serving "
+                    "would silently ignore the engram weights"
+                )
         self.model = model_class(config)
         fused_shared_expert_load_fn = None
         if hasattr(self.model, "load_fused_expert_weights"):
@@ -914,6 +925,7 @@ class ModelRunner:
         self.engram = build_engram_host(
             device=self.device,
             max_num_tokens=self.config.max_num_batched_tokens,
+            max_num_seqs=self.config.max_num_seqs,
         )
         if self.engram is None:
             # build_engram_host may return None; fail closed when the config still
@@ -973,15 +985,19 @@ class ModelRunner:
         # anchor); a carried-over row uses its window, so its placeholder is never
         # read.
         tokens = batch.scheduled_tokens[: len(seq_ids)].astype(np.int64).reshape(-1, 1)
-        # Stage to the CUDAGraph decode bucket height (zero tail) so the engram
-        # layers match the padded forward's row count (mirrors prepare_input_ids).
+        # Stage to the SETTLED forward's row count so the engram layers match the
+        # padded forward exactly. ForwardMode.decide() owns the dispatch: it pads
+        # to a CUDAGraph bucket (running_tokens) when a graph runs, and runs eager
+        # at the scheduled row count otherwise -- enforce_eager, a batch above the
+        # largest captured bucket, or a DP peer that prefills while this rank
+        # decodes (use_cudagraph=False, running_tokens=scheduled_tokens). Re-
+        # deriving a bucket from capture_sizes would over-pad those eager steps and
+        # make EngramOp reject the hidden/embedding token mismatch, so pad only
+        # when the settled mode actually uses a graph.
         padded_rows = len(seq_ids)
-        if not self.enforce_eager:
-            gbs = next(
-                (g for g in reversed(self.capture_sizes) if g >= padded_rows), None
-            )
-            if gbs is not None:
-                padded_rows = max(padded_rows, int(gbs))
+        forward_mode = get_forward_context().context.forward_mode
+        if forward_mode is not None and forward_mode.use_cudagraph:
+            padded_rows = max(padded_rows, int(forward_mode.running_tokens))
         self.engram.stage_embeddings(seq_ids, tokens, padded_rows=padded_rows)
         self.engram.wait_for_embeddings()
 

@@ -44,20 +44,26 @@ from atom.model_ops.engram import (
     HostEmbeddingTable,
     NgramHashMapping,
     decode_block_scale,
+    decode_fp8,
+    engram_text_config,
 )
 
 logger = logging.getLogger(__name__)
 
 
 def _rms_norm(x: torch.Tensor, gain: torch.Tensor, eps: float) -> torch.Tensor:
-    """RMSNorm with a plain multiplicative gain.
+    """RMSNorm with a plain multiplicative gain, kept in fp32.
 
     The tech report notes that the largest trained RMSNorm weight magnitude in
     this model is about 1, which is what these tensors look like -- so the gain
-    is used directly rather than as (1 + gain).
+    is used directly rather than as (1 + gain). The result stays fp32: the
+    reference computes the gate (RMS norms, weighted dot, signed-sqrt) in fp32 and
+    only the final residual contribution is cast back, so `EngramOp.forward` must
+    not round the intermediates to bf16 here (near-threshold gates would flip).
     """
-    var = x.float().pow(2).mean(dim=-1, keepdim=True)
-    return (x.float() * torch.rsqrt(var + eps)).to(x.dtype) * gain
+    x = x.float()
+    var = x.pow(2).mean(dim=-1, keepdim=True)
+    return x * torch.rsqrt(var + eps) * gain.float()
 
 
 class EngramOp(nn.Module):
@@ -129,13 +135,18 @@ class EngramOp(nn.Module):
         keys = kv[..., : self.key_rows].view(*lead, self.hc_mult, self.hidden_size)
         value = kv[..., self.key_rows :]
 
+        # Everything from here runs in fp32 (keys/query via _rms_norm, the dot,
+        # the signed-sqrt gate, the sigmoid, and the value scaling), matching the
+        # reference kernel; only the final contribution is cast to the residual
+        # dtype. bf16 intermediates would flip near-threshold gates.
         key = _rms_norm(keys, self.k_weight, self.norm_eps)
         query = _rms_norm(hidden_states, self.q_weight, self.norm_eps)
         gate = (key * query).sum(dim=-1) / math.sqrt(self.hidden_size)
         # Signed square root before the sigmoid: keeps the gate responsive for
         # small scores without letting large ones saturate it.
         gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-        return gate.sigmoid().unsqueeze(-1) * value.unsqueeze(-2)
+        contribution = gate.sigmoid().unsqueeze(-1) * value.float().unsqueeze(-2)
+        return contribution.to(hidden_states.dtype)
 
     @torch.no_grad()
     def load_checkpoint_weights(
@@ -171,10 +182,14 @@ class EngramOp(nn.Module):
                     f"wkv scale is {tuple(wkv_scale.shape)}, expected "
                     f"{(rows // block, cols // block)} for {block}x{block} blocks"
                 )
-            # Decode E8M0 (native float8 or raw uint8 exponent bytes) before use.
+            # Decode E8M0 scale (native float8 or raw uint8 exponent bytes) and
+            # the E4M3 wkv values before dequantizing. decode_fp8 reinterprets a
+            # raw-uint8 wkv as fp8; a native float8 wkv would else read each byte
+            # as an integer under `.float()`.
             ws = decode_block_scale(wkv_scale, torch.float32)
+            wkv_vals = decode_fp8(wkv, torch.float32)
             wkv = (
-                wkv.float().reshape(rows // block, block, cols // block, block)
+                wkv_vals.reshape(rows // block, block, cols // block, block)
                 * ws.reshape(rows // block, 1, cols // block, 1)
             ).reshape(rows, cols)
         self.wkv.weight.copy_(wkv.to(self.wkv.weight.dtype))
@@ -242,7 +257,12 @@ class EngramModules(nn.Module):
         if hf_config is None:
             with open(os.path.join(model_path, "config.json")) as fh:
                 hf_config = json.load(fh)
-        text_config = hf_config.get("text_config", hf_config)
+        # The engram block (and the hidden_size etc. co-located with it) may sit
+        # at the root or in a nested text_config; resolve the one that declares it
+        # so a text_config without engram fields does not shadow a root block.
+        text_config = engram_text_config(hf_config)
+        if text_config is None:
+            return None
         config = EngramConfig.from_hf(text_config)
         if config is None:
             return None
@@ -321,18 +341,30 @@ class EngramModules(nn.Module):
         self,
         device: torch.device,
         max_num_tokens: int,
+        max_num_seqs: int,
         dtype: torch.dtype | None = None,
     ) -> EngramHost:
         """The contract ModelRunner looks for by name.
 
-        The staging buffers default to the dtype the engram layers actually
-        compute in, so the embeddings arrive ready to feed `wkv` -- staging in
-        float32 against bf16 weights is a dtype error at the first matmul.
+        `max_num_tokens` sizes the per-step staging buffer (a prefill chunk stages
+        up to that many rows); `max_num_seqs` sizes the per-request prefetch cache
+        and rolling-window store -- these are different budgets. The staging
+        buffers default to the dtype the engram layers actually compute in, so the
+        embeddings arrive ready to feed `wkv` -- staging in float32 against bf16
+        weights is a dtype error at the first matmul.
         """
         if dtype is None:
             dtype = next(self.ops.parameters()).dtype
         return EngramHost(
-            EngramPrefetcher(self.hash_mapping, self._tables),
+            # Size the prefetch cache / rolling-window store by the max live
+            # request count (max_num_seqs), NOT the token budget: those are keyed
+            # per request, and a decode batch holds <= max_num_seqs of them, so
+            # this guarantees an active request is never LRU-evicted (the cache
+            # scales internally by the engram layer count). The bound is then only
+            # a leak net for a missed drop_requests.
+            EngramPrefetcher(
+                self.hash_mapping, self._tables, max_concurrent_seqs=max_num_seqs
+            ),
             max_num_tokens=max_num_tokens,
             num_hash_heads=self.config.num_hash_heads,
             head_dim=self.config.head_dim,

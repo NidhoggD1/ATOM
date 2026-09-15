@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-"""Unit tests for the engram host path.
-
-The load-bearing test is `test_head_vocab_sizes_match_checkpoint`: the derived
-per-layer row counts have to equal what DeepSeek-V4.1-Flash's config declares,
-which only happens if the prime search runs in exactly the reference order.
+"""Unit tests for the engram host path. The load-bearing check is in
+`test_primes_and_head_vocab_sizes`: the derived per-layer row counts must equal
+DeepSeek-V4.1-Flash's declared ones, which needs the exact reference prime order.
 """
 
 import numpy as np
@@ -18,9 +16,13 @@ from atom.model_ops.engram import (
     EngramPrefetcher,
     HostEmbeddingTable,
     NgramHashMapping,
+    _fp8_storage_dtype,
     _is_prime,
     _next_prime,
+    config_declares_engram,
     decode_block_scale,
+    decode_fp8,
+    engram_text_config,
 )
 from atom.model_ops.engram_layer import EngramOp
 
@@ -49,37 +51,28 @@ class StubTokenizer:
     def __call__(self, input_ids):
         arr = np.asarray(input_ids, dtype=np.int64)
         out = arr.copy()
-        valid = arr >= 0
-        out[valid] = self.lookup_table[arr[valid]]
+        out[arr >= 0] = self.lookup_table[arr[arr >= 0]]
         return out
 
 
 def tiny_config(**overrides) -> EngramConfig:
     base = {
-        "layer_ids": (0, 2),
-        "num_embeddings": (0, 0),  # replaced below
-        "max_ngram_size": 3,
-        "vocab_size": 1024,
-        "n_heads": 2,
-        "head_dim": 8,
-        "pad_token_id": 0,
+        "layer_ids": (0, 2), "num_embeddings": (0, 0), "max_ngram_size": 3,
+        "vocab_size": 1024, "n_heads": 2, "head_dim": 8, "pad_token_id": 0,
         "compressed_vocab_size": 512,
-    }
+    }  # fmt: skip
     base.update(overrides)
     cfg = EngramConfig(**base)
-    # Derive the true row counts for this toy shape so the checkpoint assertion
-    # passes; the real numbers are exercised by the V4.1 test below.
-    seen: set[int] = set()
-    totals = []
+    # Derive true per-layer row counts for this toy shape (V4.1 numbers below).
+    seen, totals = set(), []
     for _ in cfg.layer_ids:
         total = 0
         for _ in cfg.ngram_orders:
             start = cfg.vocab_size - 1
             for _ in range(cfg.n_heads):
-                p = _next_prime(start, seen)
-                seen.add(p)
-                total += p
-                start = p
+                start = _next_prime(start, seen)
+                seen.add(start)
+                total += start
         totals.append(total)
     return EngramConfig(**{**base, "num_embeddings": tuple(totals)})
 
@@ -89,346 +82,339 @@ def build_mapping(cfg: EngramConfig | None = None) -> NgramHashMapping:
     return NgramHashMapping(cfg, StubTokenizer(cfg.compressed_vocab_size))
 
 
-def test_is_prime_matches_reference_small_cases():
-    assert [n for n in range(2, 30) if _is_prime(n)] == [
-        2,
-        3,
-        5,
-        7,
-        11,
-        13,
-        17,
-        19,
-        23,
-        29,
-    ]
-    assert not _is_prime(1)
-    assert not _is_prime(0)
+def make_prefetcher(max_concurrent_seqs: int = 4096) -> EngramPrefetcher:
+    mapping = build_mapping()
+    tables = {
+        lid: HostEmbeddingTable(
+            torch.arange(int(mapping.head_vocab_sizes[lid].sum()) * 8, dtype=torch.float32).reshape(-1, 8),
+            num_rows=int(mapping.head_vocab_sizes[lid].sum()),
+            head_dim=8,
+        )
+        for lid in mapping.config.layer_ids
+    }  # fmt: skip
+    return EngramPrefetcher(mapping, tables, max_concurrent_seqs=max_concurrent_seqs)
 
 
-def test_next_prime_skips_seen():
-    seen = {11, 13}
-    assert _next_prime(10, seen) == 17
+def make_runtime() -> EngramHost:
+    pf = make_prefetcher()
+    cfg = pf._hash_mapping.config
+    return EngramHost(pf, 8, cfg.num_hash_heads, 8, torch.device("cpu"))
 
 
-def test_head_vocab_sizes_match_checkpoint():
-    """Derived row counts must equal DeepSeek-V4.1-Flash's declared ones."""
+def make_op(hidden=16, engram_hidden=24, hc=2) -> EngramOp:
+    return EngramOp(1, hidden, engram_hidden, hc)
+
+
+def test_primes_and_head_vocab_sizes():
+    assert [n for n in range(2, 12) if _is_prime(n)] == [2, 3, 5, 7, 11]
+    assert not _is_prime(1) and not _is_prime(0)
+    assert _next_prime(10, {11, 13}) == 17
+
     cfg = EngramConfig.from_hf(V41_FLASH)
     mapping = NgramHashMapping(cfg, StubTokenizer(cfg.compressed_vocab_size))
-    for layer_id, expected in zip(cfg.layer_ids, cfg.num_embeddings):
-        assert int(mapping.head_vocab_sizes[layer_id].sum()) == expected
-
-
-def test_head_vocab_sizes_are_globally_distinct():
-    cfg = EngramConfig.from_hf(V41_FLASH)
-    mapping = NgramHashMapping(cfg, StubTokenizer(cfg.compressed_vocab_size))
+    # Derived per-layer row counts must equal the checkpoint's declared ones.
+    for lid, expected in zip(cfg.layer_ids, cfg.num_embeddings):
+        assert int(mapping.head_vocab_sizes[lid].sum()) == expected
+    # Every head's prime-sized bucket is globally distinct.
     every = np.concatenate([mapping.head_vocab_sizes[lid] for lid in cfg.layer_ids])
     assert len(set(every.tolist())) == every.size
-
-
-def test_wrong_row_count_is_rejected():
-    cfg = EngramConfig.from_hf({**V41_FLASH, "engram_num_embeddings": [1, 2]})
+    # A config whose row counts disagree with the derived sizes is rejected.
+    bad = EngramConfig.from_hf({**V41_FLASH, "engram_num_embeddings": [1, 2]})
     with pytest.raises(ValueError, match="does not match the trained tables"):
-        NgramHashMapping(cfg, StubTokenizer(cfg.compressed_vocab_size))
+        NgramHashMapping(bad, StubTokenizer(bad.compressed_vocab_size))
 
 
-def test_from_hf_returns_none_without_engram():
+def test_config_parsing_and_detection():
     assert EngramConfig.from_hf({"hidden_size": 5120}) is None
-
-
-def test_config_shape_helpers():
     cfg = EngramConfig.from_hf(V41_FLASH)
-    assert cfg.ngram_orders == (2, 3, 4)
-    assert cfg.num_hash_heads == 24
+    assert cfg.ngram_orders == (2, 3, 4) and cfg.num_hash_heads == 24
+
+    class _Obj:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    # engram_text_config returns the container that declares engram (root or
+    # nested, dict or object), so callers read engram_* off the right one. The
+    # object-with-dict-text_config shape must return the dict (else the scheduler
+    # would read engram_max_ngram_size off the outer object and raise).
+    nested = {"engram_layer_ids": [1, 14], "engram_max_ngram_size": 4}
+    assert engram_text_config({"text_config": nested}) is nested
+    assert engram_text_config(_Obj(text_config=nested)) is nested
+    root = {"engram_layer_ids": [1], "text_config": {"a": 4}}
+    assert engram_text_config(root) is root  # root wins when it declares
+    obj = _Obj(engram_layer_ids=[1])
+    assert engram_text_config(obj) is obj
+    assert engram_text_config({"text_config": {"hidden_size": 4}}) is None
+    assert engram_text_config(_Obj(hidden_size=4)) is None
+    assert config_declares_engram({"engram_layer_ids": [1, 14]})
+    assert not config_declares_engram({"hidden_size": 4})
+
+    # Parallel arrays consumed pairwise by zip; a length mismatch fails closed.
+    base = {"max_ngram_size": 4, "vocab_size": 100, "n_heads": 2, "head_dim": 8, "pad_token_id": 0, "compressed_vocab_size": 50}  # fmt: skip
+    with pytest.raises(ValueError, match="exactly one table size"):
+        EngramConfig(layer_ids=(1, 14), num_embeddings=(1000,), **base)
+    with pytest.raises(ValueError, match="declares no layers"):
+        EngramConfig(layer_ids=(), num_embeddings=(), **base)
+    EngramConfig(layer_ids=(1, 14), num_embeddings=(1000, 2000), **base)
 
 
-def test_hash_shape_and_determinism():
+def test_hash_properties():
+    # Exact hash values are covered by the scalar-reference test; here just the
+    # shape, layer independence, causal prefix, and table-layout invariants.
     mapping = build_mapping()
     ids = np.array([[5, 9, 13, 21], [1, 2, 3, 4]], dtype=np.int64)
-    first = mapping.hash_layer(ids, layer_id=0)
-    assert first.shape == (2, 4, mapping.config.num_hash_heads)
-    np.testing.assert_array_equal(first, mapping.hash_layer(ids, layer_id=0))
-
-
-def test_hash_is_in_range_per_head():
-    mapping = build_mapping()
-    ids = np.random.default_rng(0).integers(0, 512, size=(3, 16), dtype=np.int64)
-    hashes = mapping.hash_layer(ids, layer_id=0)
-    sizes = mapping.head_vocab_sizes[0]
-    assert (hashes >= 0).all()
-    assert (hashes < sizes[None, None, :]).all()
-
-
-def test_layers_hash_differently():
-    mapping = build_mapping()
-    ids = np.array([[7, 8, 9, 10]], dtype=np.int64)
-    assert not np.array_equal(mapping.hash_layer(ids, 0), mapping.hash_layer(ids, 2))
-
-
-def test_hash_all_layers_agrees_with_per_layer():
-    mapping = build_mapping()
-    ids = np.array([[3, 4, 5, 6, 7]], dtype=np.int64)
+    h = mapping.hash_layer(ids, layer_id=0)
+    assert h.shape == (2, 4, mapping.config.num_hash_heads)
+    assert not np.array_equal(h, mapping.hash_layer(ids, 2))  # layers differ
     every = mapping.hash_all_layers(ids)
-    for layer_id in mapping.config.layer_ids:
-        np.testing.assert_array_equal(
-            every[layer_id], mapping.hash_layer(ids, layer_id)
-        )
-
-
-def test_hash_is_causal_in_the_prefix():
-    """Changing a later token must not disturb an earlier position's hash."""
-    mapping = build_mapping()
-    a = np.array([[11, 12, 13, 14]], dtype=np.int64)
-    b = a.copy()
-    b[0, 3] = 99
-    np.testing.assert_array_equal(
-        mapping.hash_layer(a, 0)[:, :3], mapping.hash_layer(b, 0)[:, :3]
+    for lid in mapping.config.layer_ids:
+        np.testing.assert_array_equal(every[lid], mapping.hash_layer(ids, lid))
+    b = ids.copy()
+    b[0, 3] = 99  # a later token cannot change an earlier position's hash
+    np.testing.assert_array_equal(h[:, :3], mapping.hash_layer(b, 0)[:, :3])
+    # Row indices stay inside the table; heads occupy contiguous, disjoint slices.
+    sizes, offsets = mapping.head_vocab_sizes[0], mapping.head_offsets[0]
+    rows = mapping.to_row_indices(h, 0)
+    assert rows.min() >= 0 and rows.max() < int(sizes.sum()) and offsets[0] == 0
+    assert all(
+        offsets[i] == offsets[i - 1] + sizes[i - 1] for i in range(1, len(offsets))
     )
 
 
-def test_row_indices_stay_inside_the_table():
+def test_hash_layer_matches_scalar_reference():
+    """`hash_layer` + `to_row_indices` must match an independent scalar reimpl
+    (same constants, different code), catching vectorization/head/left-pad bugs."""
     mapping = build_mapping()
-    ids = np.random.default_rng(1).integers(0, 512, size=(2, 12), dtype=np.int64)
-    rows = mapping.to_row_indices(mapping.hash_layer(ids, 0), 0)
-    assert rows.min() >= 0
-    assert rows.max() < int(mapping.head_vocab_sizes[0].sum())
+    layer_id = mapping.config.layer_ids[0]
+    ids = np.array([[5, 7, 9, 2, 5]], dtype=np.int64)  # T=5, short enough to left-pad
+    compressed = mapping.tokenizer(ids)
+    prod = mapping.to_row_indices(
+        mapping.hash_layer(ids, layer_id, compress=True), layer_id
+    )
+    mult = mapping.layer_multipliers[layer_id]
+    sizes = mapping.head_vocab_sizes[layer_id]
+    offsets = mapping.head_offsets[layer_id]
+    pad, n_heads = int(mapping.pad_id), mapping.config.n_heads
+    B, T = compressed.shape
+    expected = np.empty((B, T, mapping.config.num_hash_heads), dtype=np.int64)
+    for b in range(B):
+        for t in range(T):
+            head = 0
+            for order_idx, n in enumerate(mapping.config.ngram_orders):
+                mix = int(compressed[b, t]) * int(mult[0])
+                for k in range(1, n):
+                    prev = int(compressed[b, t - k]) if t - k >= 0 else pad
+                    mix ^= prev * int(mult[k])
+                for j in range(n_heads):
+                    hidx = order_idx * n_heads + j
+                    expected[b, t, head] = mix % int(sizes[hidx]) + int(offsets[hidx])
+                    head += 1
+    np.testing.assert_array_equal(prod, expected)
 
 
-def test_row_indices_do_not_overlap_between_heads():
-    mapping = build_mapping()
-    offsets = mapping.head_offsets[0]
-    sizes = mapping.head_vocab_sizes[0]
-    assert offsets[0] == 0
-    for i in range(1, len(offsets)):
-        assert offsets[i] == offsets[i - 1] + sizes[i - 1]
-
-
-def test_host_table_gather_matches_direct_index():
+def test_host_table_gather_and_fp8():
     table = torch.arange(40 * 4, dtype=torch.float32).reshape(40, 4)
     host = HostEmbeddingTable(table, num_rows=40, head_dim=4)
-    idx = np.array([[[0, 39], [7, 7]]], dtype=np.int64)
-    out = host.gather(idx)
+    out = host.gather(np.array([[[0, 39], [7, 7]]], dtype=np.int64))
     assert out.shape == (1, 2, 2, 4)
     torch.testing.assert_close(out[0, 0, 0], table[0])
     torch.testing.assert_close(out[0, 1, 1], table[7])
-
-
-def test_host_table_rejects_out_of_range():
-    host = HostEmbeddingTable(torch.zeros(8, 4), num_rows=8, head_dim=4)
-    with pytest.raises(IndexError, match="out of range"):
-        host.gather(np.array([[[8]]], dtype=np.int64))
-
-
-def test_host_table_rejects_wrong_shape():
+    with pytest.raises(IndexError, match="out of range"):  # not clamped
+        host.gather(np.array([[[40]]], dtype=np.int64))
     with pytest.raises(ValueError, match="rows"):
         HostEmbeddingTable(torch.zeros(3, 4), num_rows=8, head_dim=4)
     with pytest.raises(ValueError, match="wide"):
         HostEmbeddingTable(torch.zeros(8, 5), num_rows=8, head_dim=4)
 
+    # Block scale applied per block; without it, values are orders of magnitude off.
+    scale = torch.tensor([[1.0, 2.0], [4.0, 8.0], [1.0, 1.0], [2.0, 2.0]])
+    scaled = HostEmbeddingTable(torch.ones(4, 8), num_rows=4, head_dim=8, scale=scale)
+    assert scaled.block_size == 4
+    torch.testing.assert_close(
+        scaled.gather(np.array([[[1]]], dtype=np.int64))[0, 0, 0],
+        torch.tensor([4.0] * 4 + [8.0] * 4),
+    )
+    plain = HostEmbeddingTable(torch.ones(4, 8), num_rows=4, head_dim=8)
+    assert plain.block_size == 0
+    torch.testing.assert_close(
+        plain.gather(np.array([[[1]]], dtype=np.int64))[0, 0, 0], torch.ones(8)
+    )
+    with pytest.raises(ValueError, match="scale has"):
+        HostEmbeddingTable(torch.ones(4, 8), 4, 8, scale=torch.ones(3, 2))
+    with pytest.raises(ValueError, match="not divisible"):
+        HostEmbeddingTable(torch.ones(4, 8), 4, 8, scale=torch.ones(4, 3))
 
-def test_cache_evicts_least_recently_used():
-    cache = EngramPrefetchCache(capacity=2)
-    cache.put(1, 0, torch.zeros(1))
-    cache.put(2, 0, torch.zeros(1))
-    cache.put(3, 0, torch.zeros(1))
-    assert cache.take(1, 0) is None
-    assert cache.take(3, 0) is not None
+    # gather flattens indices first, so a scaled gather over [B, heads] keeps scale
+    # as [rows, n_blocks] (E8M0 bytes 127,128 -> scales 1,2).
+    s8 = HostEmbeddingTable(
+        torch.ones(8, 4), 8, 4, scale=torch.tensor([[127, 128]] * 8, dtype=torch.uint8)
+    )
+    md = s8.gather(np.array([[0, 3], [5, 7]], dtype=np.int64))
+    assert md.shape == (2, 2, 4)
+    assert all(
+        torch.equal(md[b, h], torch.tensor([1.0, 1.0, 2.0, 2.0]))
+        for b in range(2)
+        for h in range(2)
+    )
+    # A raw-uint8 table is reinterpreted with the target's own E4M3 variant (FN or
+    # FNUZ), never read as the integer 60; derive the expected value from that same
+    # variant so the check holds on both platforms.
+    fp8 = _fp8_storage_dtype()
+    bytes3 = torch.tensor([0x3C, 0x00, 0x40], dtype=torch.uint8)
+    assert decode_fp8(bytes3, torch.float32)[0].item() != 60.0  # reinterpreted
+    torch.testing.assert_close(
+        decode_fp8(bytes3, torch.float32), bytes3.view(fp8).float()
+    )
+    raw = HostEmbeddingTable(torch.full((4, 2), 0x3C, dtype=torch.uint8), 4, 2)
+    expected = torch.full((2, 2), bytes3.view(fp8).float()[0].item())
+    torch.testing.assert_close(raw.gather(np.array([0, 3])), expected)
+    # Native float8 passes straight through .to().
+    native = torch.tensor([1.0, 2.0], dtype=torch.float8_e4m3fn)
+    torch.testing.assert_close(
+        decode_fp8(native, torch.float32), torch.tensor([1.0, 2.0])
+    )
 
-
-def test_cache_take_is_destructive():
-    cache = EngramPrefetchCache()
-    cache.put(4, 1, torch.zeros(1))
-    assert cache.take(4, 1) is not None
-    assert cache.take(4, 1) is None
-
-
-def test_cache_drop_forgets_every_layer_of_a_request():
-    cache = EngramPrefetchCache()
-    cache.put(5, 0, torch.zeros(1))
-    cache.put(5, 2, torch.zeros(1))
-    cache.put(6, 0, torch.zeros(1))
-    cache.drop(5)
-    assert cache.take(5, 0) is None and cache.take(5, 2) is None
-    assert cache.take(6, 0) is not None
-
-
-def test_decode_block_scale_uint8_and_float():
-    # Raw uint8 E8M0 codes are biased exponents: value = 2**(code - 127).
-    codes = torch.tensor([127, 128, 126, 130], dtype=torch.uint8)
-    got = decode_block_scale(codes, torch.float32)
-    torch.testing.assert_close(got, torch.tensor([1.0, 2.0, 0.5, 8.0]))
+    # E8M0 scale decode: biased exponents, code 0 the exact-zero sentinel.
+    got = decode_block_scale(
+        torch.tensor([127, 128, 126, 130, 0], dtype=torch.uint8), torch.float32
+    )
+    torch.testing.assert_close(got, torch.tensor([1.0, 2.0, 0.5, 8.0, 0.0]))
     assert got.dtype == torch.float32
-    # A floating dtype (already decoded) passes through via .to().
-    f = torch.tensor([1.5, 2.5], dtype=torch.float32)
-    torch.testing.assert_close(decode_block_scale(f, torch.float32), f)
+    f = torch.tensor([1.5, 2.5])
+    torch.testing.assert_close(decode_block_scale(f, torch.float32), f)  # passthrough
 
 
-def make_prefetcher() -> EngramPrefetcher:
-    mapping = build_mapping()
-    tables = {
-        layer_id: HostEmbeddingTable(
-            torch.arange(
-                int(mapping.head_vocab_sizes[layer_id].sum()) * 8, dtype=torch.float32
-            ).reshape(-1, 8),
-            num_rows=int(mapping.head_vocab_sizes[layer_id].sum()),
-            head_dim=8,
-        )
-        for layer_id in mapping.config.layer_ids
-    }
-    return EngramPrefetcher(mapping, tables)
+def test_cache_evict_take_drop():
+    cache = EngramPrefetchCache(capacity=2)
+    for s in (1, 2, 3):
+        cache.put(s, 0, torch.zeros(1))
+    assert cache.take(1, 0) is None and cache.take(3, 0) is not None  # LRU evicts 1
+    c = EngramPrefetchCache()
+    c.put(4, 1, torch.zeros(1))
+    assert c.take(4, 1) is not None and c.take(4, 1) is None  # take is destructive
+    for s, layer in ((5, 0), (5, 2), (6, 0)):
+        c.put(s, layer, torch.zeros(1))
+    c.drop(5)  # drop forgets every layer of a request
+    assert c.take(5, 0) is None and c.take(5, 2) is None and c.take(6, 0) is not None
 
 
-def test_prefetch_result_equals_inline_compute():
+def test_compressed_tokenizer_cache_key_fast_vs_slow():
+    """Fast tokenizer keys the disk cache on its serialization; a slow one yields
+    None so `_load_or_build` rebuilds rather than reuse a vocab-only key."""
+    from atom.model_ops.engram import CompressedTokenizer
+
+    ct = object.__new__(CompressedTokenizer)  # bypass __init__ (which builds)
+
+    class _Slow:
+        def get_vocab(self):
+            return {"a": 0}
+
+    ct._tokenizer = _Slow()
+    assert ct._cache_key() is None
+
+    class _Fast:
+        class backend_tokenizer:
+            @staticmethod
+            def to_str():
+                return "SERIALIZED-TOKENIZER"
+
+    ct._tokenizer = _Fast()
+    key = ct._cache_key()
+    assert isinstance(key, str) and len(key) == 16
+
+
+def test_prefetcher():
+    # Cache keyed by (seq, layer): capacity scales by layer count, window by seqs.
+    pf = make_prefetcher(max_concurrent_seqs=3)
+    assert len(pf.layer_ids) >= 2
+    assert pf.cache._capacity == 3 * len(pf.layer_ids) and pf._window_capacity == 3
+    pf.shutdown()
+
+    # Async prefetch result == inline compute over the same window.
     pf = make_prefetcher()
-    seq_ids = [11, 12]
-    # Seed each sequence's n-gram context, then prefetch its current token; the
-    # async result must equal an inline compute over the same window (last col).
     pf.seed_context(11, [3, 4])
     pf.seed_context(12, [6, 7])
-    current = np.array([[5], [8]], dtype=np.int64)
-    expected = pf.compute(seq_ids, np.array([[3, 4, 5], [6, 7, 8]], dtype=np.int64))
-    assert pf.submit_compute(seq_ids, current).result(timeout=30) is None
-    assert pf.wait(timeout=30)
+    expected = pf.compute([11, 12], np.array([[3, 4, 5], [6, 7, 8]], dtype=np.int64))
+    fut = pf.submit_compute([11, 12], np.array([[5], [8]], dtype=np.int64))
+    assert fut.result(timeout=30) is None and pf.wait(timeout=30)
     for (seq_id, layer_id), value in expected.items():
         torch.testing.assert_close(pf.cache.take(seq_id, layer_id), value)
     pf.shutdown()
 
-
-def test_prefetch_drop_requests_clears_cache():
+    # drop clears the cache; wait without a submit is a no-op.
     pf = make_prefetcher()
     pf.submit_compute([21], np.array([[1, 2, 3]], dtype=np.int64)).result(timeout=30)
     pf.drop_requests([21])
-    assert len(pf.cache) == 0
+    assert len(pf.cache) == 0 and pf.wait(timeout=1)
     pf.shutdown()
 
 
-def test_wait_without_submit_is_a_noop():
+def test_compute_prefill():
     pf = make_prefetcher()
-    assert pf.wait(timeout=1)
-    pf.shutdown()
-
-
-def test_compute_prefill_matches_per_position_compute():
-    """Each prefill position's embedding equals the decode-window compute for
-    the same n-gram (context prepended, leading outputs discarded)."""
-    pf = make_prefetcher()
-    ctx = [3, 4]  # max_ngram_size-1 = 2 preceding tokens
-    chunk = [5, 6, 7]
-    pre = pf.compute_prefill([np.array(ctx)], [np.array(chunk)])
-    windows = [[3, 4, 5], [4, 5, 6], [5, 6, 7]]  # window ending at each chunk pos
-    for pos, window in enumerate(windows):
+    empty = np.array([], dtype=np.int64)
+    # Each prefill position == the decode-window compute for the same n-gram.
+    pre = pf.compute_prefill([np.array([3, 4])], [np.array([5, 6, 7])])
+    for pos, window in enumerate([[3, 4, 5], [4, 5, 6], [5, 6, 7]]):
         exp = pf.compute([0], np.array([window], dtype=np.int64))
-        for layer_id in pf.layer_ids:
-            torch.testing.assert_close(
-                pre[layer_id][0][pos], exp[(0, layer_id)].reshape(-1)
-            )
+        for lid in pf.layer_ids:
+            torch.testing.assert_close(pre[lid][0][pos], exp[(0, lid)].reshape(-1))
+    # Chunked with the n-1 context carried across the boundary == unchunked.
+    whole = pf.compute_prefill([empty], [np.array([1, 2, 3, 4, 5, 6])])
+    p1 = pf.compute_prefill([empty], [np.array([1, 2, 3])])
+    p2 = pf.compute_prefill([np.array([2, 3])], [np.array([4, 5, 6])])
+    for lid in pf.layer_ids:
+        torch.testing.assert_close(
+            torch.cat([p1[lid][0], p2[lid][0]], 0), whole[lid][0]
+        )
+    # First chunk (empty context) left-pads, so position 0 is a 1-gram.
+    first = pf.compute_prefill([empty], [np.array([9, 8])])
+    e0 = pf.compute([0], np.array([[9]], dtype=np.int64))
+    for lid in pf.layer_ids:
+        torch.testing.assert_close(first[lid][0][0], e0[(0, lid)].reshape(-1))
     pf.shutdown()
 
 
-def test_compute_prefill_chunked_equals_unchunked():
-    """Splitting a prompt into chunks with the n-1 context carried across the
-    boundary reproduces hashing the whole prompt at once."""
-    pf = make_prefetcher()
-    prompt = [1, 2, 3, 4, 5, 6]
-    whole = pf.compute_prefill([np.array([], dtype=np.int64)], [np.array(prompt)])
-    part1 = pf.compute_prefill([np.array([], dtype=np.int64)], [np.array([1, 2, 3])])
-    # chunk 2 starts at position 3; its 2 preceding tokens are [2, 3].
-    part2 = pf.compute_prefill([np.array([2, 3])], [np.array([4, 5, 6])])
-    for layer_id in pf.layer_ids:
-        stitched = torch.cat([part1[layer_id][0], part2[layer_id][0]], dim=0)
-        torch.testing.assert_close(stitched, whole[layer_id][0])
-    pf.shutdown()
-
-
-def test_compute_prefill_first_chunk_left_pads():
-    """A first chunk (empty context) left-pads, so position 0 is a 1-gram."""
-    pf = make_prefetcher()
-    pre = pf.compute_prefill([np.array([], dtype=np.int64)], [np.array([9, 8])])
-    exp0 = pf.compute([0], np.array([[9]], dtype=np.int64))
-    for layer_id in pf.layer_ids:
-        torch.testing.assert_close(pre[layer_id][0][0], exp0[(0, layer_id)].reshape(-1))
-    pf.shutdown()
-
-
-def test_stage_prefill_lays_out_rows_and_seeds_window():
+def test_stage_prefill():
     rt = make_runtime()
-    seq_ids = [71, 72]
     chunks = [np.array([1, 2, 3]), np.array([4, 5])]
     ctxs = [np.array([], dtype=np.int64), np.array([6, 7])]  # 72 is a continuation
     pre = rt.prefetcher.compute_prefill(ctxs, chunks)
-
-    total = rt.stage_prefill(seq_ids, chunks, ctxs, final_mask=[True, True])
-    assert total == 5
-    for layer_id in rt.layer_ids:
-        emb = rt.embeddings(layer_id)
+    assert rt.stage_prefill([71, 72], chunks, ctxs, final_mask=[True, True]) == 5
+    for lid in rt.layer_ids:
+        emb = rt.embeddings(lid)
         assert emb.shape == (5, rt.embed_width)
-        torch.testing.assert_close(emb[0:3], pre[layer_id][0][:, : rt.embed_width])
-        torch.testing.assert_close(emb[3:5], pre[layer_id][1][:, : rt.embed_width])
-
+        torch.testing.assert_close(emb[0:3], pre[lid][0][:, : rt.embed_width])
+        torch.testing.assert_close(emb[3:5], pre[lid][1][:, : rt.embed_width])
     # Final chunk seeds the decode window with the prompt's trailing n-1 tokens.
     assert list(rt.prefetcher._window[71]) == [2, 3]
     assert list(rt.prefetcher._window[72]) == [4, 5]
-    rt.shutdown()
-
-
-def test_stage_prefill_rejects_more_rows_than_capacity():
-    rt = make_runtime()  # max_num_tokens=8
     with pytest.raises(ValueError, match="exceed staging capacity"):
         rt.stage_prefill([81], [np.arange(9)], [np.array([], dtype=np.int64)])
     rt.shutdown()
 
 
-# --- device-side modules and the staging runtime ---
-
-
-def make_op(hidden=16, engram_hidden=24, hc=2) -> EngramOp:
-    return EngramOp(
-        layer_id=1, hidden_size=hidden, engram_hidden_size=engram_hidden, hc_mult=hc
-    )
-
-
-def test_engram_op_is_token_flat():
-    """ATOM residual streams are [num_tokens, hc, dim], not [batch, seq, ...]."""
+def test_engram_op_and_checkpoint():
     op = make_op()
-    out = op(torch.randn(5, 2, 16), torch.randn(5, 24))
-    assert out.shape == (5, 2, 16)
-
-
-def test_engram_op_accepts_leading_batch_dims():
-    op = make_op()
-    out = op(torch.randn(2, 3, 2, 16), torch.randn(2, 3, 24))
-    assert out.shape == (2, 3, 2, 16)
-
-
-def test_engram_op_rejects_wrong_embedding_width():
+    # ATOM residual streams are [num_tokens, hc, dim], with optional leading dims.
+    assert op(torch.randn(5, 2, 16), torch.randn(5, 24)).shape == (5, 2, 16)
+    assert op(torch.randn(2, 3, 2, 16), torch.randn(2, 3, 24)).shape == (2, 3, 2, 16)
     with pytest.raises(ValueError, match="expected 24"):
-        make_op()(torch.randn(2, 2, 16), torch.randn(2, 25))
-
-
-def test_engram_op_rejects_wrong_branch_count():
+        op(torch.randn(2, 2, 16), torch.randn(2, 25))
     with pytest.raises(ValueError, match="hc_mult=2"):
-        make_op()(torch.randn(2, 3, 16), torch.randn(2, 24))
-
-
-def test_engram_op_rejects_token_count_mismatch():
+        op(torch.randn(2, 3, 16), torch.randn(2, 24))
     with pytest.raises(ValueError, match="tokens"):
-        make_op()(torch.randn(5, 2, 16), torch.randn(4, 24))
+        op(torch.randn(5, 2, 16), torch.randn(4, 24))
+    # V4.1 omits the short conv; wkv is hc key projections then one value.
+    assert not any("short_conv" in n for n, _ in op.named_modules())
+    assert op.wkv.weight.shape == (3 * 16, 24) and op.key_rows == 2 * 16
+    # The gate is computed in fp32; the contribution is cast to the residual dtype.
+    opb = make_op().to(torch.bfloat16)
+    out_b = opb(
+        torch.randn(3, 2, 16, dtype=torch.bfloat16),
+        torch.randn(3, 24, dtype=torch.bfloat16),
+    )
+    assert out_b.dtype == torch.bfloat16
 
-
-def test_engram_op_has_no_short_conv():
-    """V4.1 omits the short causal convolution (tech report section 2.4.2)."""
-    assert not any("short_conv" in n for n, _ in make_op().named_modules())
-
-
-def test_wkv_is_fused_keys_then_value():
-    """The checkpoint stores hc_mult key projections first, then one value."""
-    op = make_op(hidden=16, hc=2)
-    assert op.wkv.weight.shape == (3 * 16, 24)
-    assert op.key_rows == 2 * 16
-
-
-def test_load_checkpoint_weights_validates_shapes():
-    op = make_op(hidden=16, engram_hidden=24, hc=2)
     good = torch.zeros(3 * 16, 24)
     with pytest.raises(ValueError, match="wkv is"):
         op.load_checkpoint_weights(
@@ -438,149 +424,58 @@ def test_load_checkpoint_weights_validates_shapes():
         op.load_checkpoint_weights(good, torch.zeros(3, 16), torch.zeros(2, 16))
     with pytest.raises(ValueError, match="q_weight is"):
         op.load_checkpoint_weights(good, torch.zeros(2, 16), torch.zeros(2, 8))
-
-
-def test_load_checkpoint_weights_dequantizes_blocks():
-    op = make_op(hidden=16, engram_hidden=32, hc=2)
-    rows, cols = 3 * 16, 32
-    wkv = torch.ones(rows, cols)
-    scale = torch.full((rows // 8, cols // 8), 3.0)
-    op.load_checkpoint_weights(
-        wkv, torch.ones(2, 16), torch.ones(2, 16), wkv_scale=scale, block=8
-    )
-    torch.testing.assert_close(op.wkv.weight, torch.full((rows, cols), 3.0))
-
-
-def test_load_checkpoint_weights_rejects_bad_scale_shape():
-    op = make_op(hidden=16, engram_hidden=32, hc=2)
+    # Block dequant: scale 3.0 over all-ones weights -> 3.0; bad scale shape rejected.
+    op2 = make_op(hidden=16, engram_hidden=32, hc=2)
+    ones = (torch.ones(48, 32), torch.ones(2, 16), torch.ones(2, 16))
+    op2.load_checkpoint_weights(*ones, wkv_scale=torch.full((6, 4), 3.0), block=8)
+    torch.testing.assert_close(op2.wkv.weight, torch.full((48, 32), 3.0))
     with pytest.raises(ValueError, match="wkv scale is"):
-        op.load_checkpoint_weights(
-            torch.ones(48, 32),
-            torch.ones(2, 16),
-            torch.ones(2, 16),
-            wkv_scale=torch.ones(2, 2),
-            block=8,
-        )
+        op2.load_checkpoint_weights(*ones, wkv_scale=torch.ones(2, 2), block=8)
 
 
-def make_runtime() -> EngramHost:
-    pf = make_prefetcher()
-    cfg = pf._hash_mapping.config
-    return EngramHost(
-        pf,
-        max_num_tokens=8,
-        num_hash_heads=cfg.num_hash_heads,
-        head_dim=8,
-        device=torch.device("cpu"),
-    )
-
-
-def test_runtime_stage_uses_prefetched_rows():
+def test_runtime_staging_miss_and_drop():
     rt = make_runtime()
-    seq_ids = [31, 32]
     tokens = np.array([[5], [6]], dtype=np.int64)
-    rt.prefetch_next(seq_ids, tokens)
-    assert rt.stage_embeddings(seq_ids, tokens) == 2
-    for layer_id in rt.layer_ids:
-        assert rt.embeddings(layer_id).shape == (2, rt.embed_width)
+    rt.prefetch_next([31, 32], tokens)
+    assert rt.stage_embeddings([31, 32], tokens) == 2
+    for lid in rt.layer_ids:
+        assert rt.embeddings(lid).shape == (2, rt.embed_width)
+    rt.prefetch_next([31, 32], tokens)  # padded_rows below batch must not drop rows
+    assert rt.stage_embeddings([31, 32], tokens, padded_rows=1) == 2
+    with pytest.raises(RuntimeError, match="no token ids were supplied"):
+        rt.stage_embeddings([51], None)
+    with pytest.raises(ValueError, match="exceeds staging capacity"):
+        rt.stage_embeddings(list(range(9)), np.zeros((9, 1), dtype=np.int64))
     rt.shutdown()
 
-
-def test_runtime_stage_recomputes_on_prefetch_miss():
-    """A missed prefetch changes latency, never the answer."""
+    # A miss changes latency, never the answer (cold == warm).
     rt = make_runtime()
-    seq_ids = [41]
-    tokens = np.array([[9]], dtype=np.int64)
-    rt.prefetch_next(seq_ids, tokens)
-    rt.stage_embeddings(seq_ids, tokens)
+    rt.prefetch_next([41], np.array([[9]], dtype=np.int64))
+    rt.stage_embeddings([41], np.array([[9]], dtype=np.int64))
     warm = {lid: rt.embeddings(lid).clone() for lid in rt.layer_ids}
-
     cold = make_runtime()
-    cold.stage_embeddings(seq_ids, tokens)  # nothing prefetched
-    for layer_id in cold.layer_ids:
-        torch.testing.assert_close(cold.embeddings(layer_id), warm[layer_id])
+    cold.stage_embeddings([41], np.array([[9]], dtype=np.int64))  # nothing prefetched
+    for lid in cold.layer_ids:
+        torch.testing.assert_close(cold.embeddings(lid), warm[lid])
     rt.shutdown()
     cold.shutdown()
 
-
-def test_runtime_carried_over_miss_recomputes_from_window_not_placeholder():
-    """A carried-over request that misses recomputes from its rolling window,
-    ignoring the placeholder anchor the scheduler writes for it."""
+    # A carried-over miss recomputes from its window, ignoring the placeholder; and
+    # drop_requests clears both the cache and the window.
     rt = make_runtime()
-    seq_ids = [61]
     rt.seed_context(61, [2, 3])
-    rt.prefetch_next(seq_ids, np.array([[4]], dtype=np.int64))
-    rt.stage_embeddings(seq_ids, np.array([[4]], dtype=np.int64))
+    rt.prefetch_next([61], np.array([[4]], dtype=np.int64))
+    rt.stage_embeddings([61], np.array([[4]], dtype=np.int64))
     warm = {lid: rt.embeddings(lid).clone() for lid in rt.layer_ids}
-
-    # The stage above consumed the cached rows, so this stage misses. The window
-    # is intact and ends at token 4; a wrong placeholder anchor must be ignored.
-    rt.stage_embeddings(seq_ids, np.array([[999]], dtype=np.int64))
-    for layer_id in rt.layer_ids:
-        torch.testing.assert_close(rt.embeddings(layer_id), warm[layer_id])
-    rt.shutdown()
-
-
-def test_runtime_drop_requests_clears_cache_and_window():
-    rt = make_runtime()
-    rt.seed_context(91, [2, 3])
-    rt.prefetch_next([91], np.array([[4]], dtype=np.int64))
+    rt.stage_embeddings([61], np.array([[999]], dtype=np.int64))  # placeholder ignored
+    for lid in rt.layer_ids:
+        torch.testing.assert_close(rt.embeddings(lid), warm[lid])
+    # A fresh prefetch repopulates cache + window; drop_requests clears both.
+    rt.prefetch_next([61], np.array([[5]], dtype=np.int64))
     rt.prefetcher.wait(timeout=30)
-    assert 91 in rt.prefetcher._window
-    assert rt.prefetcher.cache.contains(91, rt.layer_ids[0])
-
-    rt.drop_requests([91])
-    assert 91 not in rt.prefetcher._window
-    assert not rt.prefetcher.cache.contains(91, rt.layer_ids[0])
+    assert 61 in rt.prefetcher._window
+    assert rt.prefetcher.cache.contains(61, rt.layer_ids[0])
+    rt.drop_requests([61])
+    assert 61 not in rt.prefetcher._window
+    assert not rt.prefetcher.cache.contains(61, rt.layer_ids[0])
     rt.shutdown()
-
-
-def test_runtime_stage_padded_rows_below_batch_stages_full_batch():
-    rt = make_runtime()
-    seq_ids = [31, 32]
-    tokens = np.array([[5], [6]], dtype=np.int64)
-    rt.prefetch_next(seq_ids, tokens)
-    # padded_rows below the batch size must not silently drop rows.
-    assert rt.stage_embeddings(seq_ids, tokens, padded_rows=1) == 2
-    for layer_id in rt.layer_ids:
-        assert rt.embeddings(layer_id).shape[0] == 2
-    rt.shutdown()
-
-
-def test_runtime_stage_without_tokens_on_miss_is_an_error():
-    rt = make_runtime()
-    with pytest.raises(RuntimeError, match="no token ids were supplied"):
-        rt.stage_embeddings([51], None)
-    rt.shutdown()
-
-
-def test_runtime_rejects_more_rows_than_capacity():
-    rt = make_runtime()
-    ids = list(range(9))
-    with pytest.raises(ValueError, match="exceeds staging capacity"):
-        rt.stage_embeddings(ids, np.zeros((9, 1), dtype=np.int64))
-    rt.shutdown()
-
-
-def test_host_table_applies_block_scales():
-    """A block-quantized table without its scales is off by orders of magnitude."""
-    weight = torch.ones(4, 8)
-    scale = torch.tensor([[1.0, 2.0], [4.0, 8.0], [1.0, 1.0], [2.0, 2.0]])
-    host = HostEmbeddingTable(weight, num_rows=4, head_dim=8, scale=scale)
-    assert host.block_size == 4
-    out = host.gather(np.array([[[1]]], dtype=np.int64))[0, 0, 0]
-    torch.testing.assert_close(out, torch.tensor([4.0] * 4 + [8.0] * 4))
-
-
-def test_host_table_without_scale_is_unscaled():
-    host = HostEmbeddingTable(torch.ones(4, 8), num_rows=4, head_dim=8)
-    assert host.block_size == 0
-    out = host.gather(np.array([[[1]]], dtype=np.int64))[0, 0, 0]
-    torch.testing.assert_close(out, torch.ones(8))
-
-
-def test_host_table_rejects_mismatched_scale():
-    with pytest.raises(ValueError, match="scale has"):
-        HostEmbeddingTable(torch.ones(4, 8), 4, 8, scale=torch.ones(3, 2))
-    with pytest.raises(ValueError, match="not divisible"):
-        HostEmbeddingTable(torch.ones(4, 8), 4, 8, scale=torch.ones(4, 3))

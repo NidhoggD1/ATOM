@@ -517,12 +517,13 @@ class Scheduler:
         self.config = config
 
         # Engram models need each prefill batch to carry the tokens preceding a
-        # chunk (see ScheduledBatch.prefill_context). Read max_ngram_size once;
-        # None for non-engram models so the batch build stays free.
-        from atom.model_ops.engram import config_declares_engram
+        # chunk (see ScheduledBatch.prefill_context). Read max_ngram_size once off
+        # the container that actually declares engram (root or nested, dict or
+        # object); None for non-engram models so the batch build stays free.
+        from atom.model_ops.engram import engram_text_config
 
-        tc = getattr(config.hf_config, "text_config", None) or config.hf_config
-        if config_declares_engram(config.hf_config):
+        tc = engram_text_config(config.hf_config)
+        if tc is not None:
             self._engram_ngram = int(
                 tc["engram_max_ngram_size"]
                 if isinstance(tc, dict)
