@@ -91,12 +91,15 @@ runs:
 
         MODEL_HOST_ROOT=""
         if [ "${RUNNER_LABEL}" = "linux-atom-do-mi350x-8.test" ]; then
-          if [ ! -d "/models" ]; then
-            echo "PITT runner requested local /models, but /models does not exist on this host. Creating it with Docker root."
-            docker run --rm -u 0:0 -v /models:/models "$IMAGE_TAG" bash -lc \
-              'mkdir -p /models && chmod 2777 /models && ls -ld /models'
+          for d in /share_nfs/models /share_nfs; do
+            if [ -d "$d" ]; then
+              MODEL_HOST_ROOT="$d"
+              break
+            fi
+          done
+          if [ -z "$MODEL_HOST_ROOT" ]; then
+            echo "Warning: PITT runner requested /share_nfs model cache, but neither /share_nfs/models nor /share_nfs exists on this host."
           fi
-          MODEL_HOST_ROOT="/models"
         else
           for d in /shared_nfs/huggingface_models /models /data/models; do
             if [ -d "$d" ]; then
