@@ -200,7 +200,6 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
 
     def __init__(self, config) -> None:
         self._config = config
-        kvc = getattr(config, "kv_transfer_config", {}) or {}
         raw_block_size = config.kv_cache_block_size
         if isinstance(raw_block_size, bool) or not isinstance(raw_block_size, Integral):
             # Preserve the public configuration error contract.
@@ -228,7 +227,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         # The ATOM LMCache GPU connector owns per-thread staging streams.
         # OFFLOAD_COPY_WORKERS tunes the SAVE pool only.
         n_save_workers = int(os.environ.get("OFFLOAD_COPY_WORKERS", "1"))
-        self._max_pending_saves = max_pending_saves(kvc, n_save_workers)
+        self._max_pending_saves = max_pending_saves(n_save_workers)
         self._save_admission = threading.BoundedSemaphore(self._max_pending_saves)
         # Terminal PAGE-save outcomes, drained by ``get_finished`` onto
         # ``DSV4_PAGE_SAVE_CHANNEL``. Every request carrying a ``save_spec``
@@ -1887,8 +1886,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         # decisions and forces the scheduler to roll the PAGE watermark back.
         # Keep one shared limit for PAGE-only, SLOT-only, and PAGE+SLOT saves.
         self._max_pending_saves = max_pending_saves(
-            kvc,
-            int(os.environ.get("OFFLOAD_COPY_WORKERS", "1") or 1),
+            int(os.environ.get("OFFLOAD_COPY_WORKERS", "1") or 1)
         )
         # Resume after the last admitted request when capacity becomes free so
         # a long request at the head of the insertion-ordered tracker cannot
