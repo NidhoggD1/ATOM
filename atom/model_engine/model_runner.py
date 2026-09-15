@@ -502,10 +502,15 @@ class tokenIDProcessor:
             # metadata's row order) starting at `decode_offset`.
             # MTP / speculative decode with mixed batches is a separate follow-up
             # (the per-seq multi-token layout isn't wired into this branch).
-            assert not self.use_spec, (
-                "Mixed prefill+decode batches do not yet support MTP / speculative "
-                "decode (follow-up). Disable --enable-mixed-prefill-decode for now."
-            )
+            # `raise`, not `assert`: stripped under `python -O`, and what it
+            # guards is the spec layout being read with the wrong token width.
+            # Config._validate_mixed_prefill_decode should have refused this at launch; reaching here means that table has a gap.
+            if self.use_spec:
+                raise NotImplementedError(
+                    "Mixed prefill+decode batches do not yet support MTP / "
+                    "speculative decode. Disable "
+                    "--enable-mixed-prefill-decode."
+                )
             decode_offset = total_tokens_prefill
             sched_decode = scheduled_tokens[
                 decode_offset : decode_offset + total_tokens_decode

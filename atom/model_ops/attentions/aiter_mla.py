@@ -1906,10 +1906,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         per-field `.clone()`s the shared-buffer design required (and closes the
         same latent pinned-source race the V4 builder hit at large ISL).
         """
-        assert not self.is_sparse, (
-            "Mixed prefill+decode batches do not yet support sparse MLA "
-            "(V3.2/V4 indexer). Disable --enable-mixed-prefill-decode."
-        )
+        # `raise`, not `assert`: stripped under `python -O`, and what it
+        # guards is a dense build over sparse metadata. Config._validate_mixed_prefill_decode should have refused this at launch; reaching here means that table has a gap.
+        if self.is_sparse:
+            raise NotImplementedError(
+                "Mixed prefill+decode batches do not yet support sparse MLA "
+                "(V3.2/V4 indexer). Disable --enable-mixed-prefill-decode."
+            )
         var = self.model_runner.forward_vars
         n_p_seqs = batch.total_seqs_num_prefill
         n_p_tokens = batch.total_tokens_num_prefill
@@ -1921,18 +1924,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # the correct [:n_p_seqs] slice. Run it against the private prefill bank
         # so prefill_meta's tensors are views into buffers the decode half never
         # touches — no per-field clone needed. ----
-        main_var = self.model_runner.forward_vars
-        pf_bank = self._get_mixed_prefill_bank()
-        self.model_runner.forward_vars = pf_bank
-        try:
+        # Swapped through `mixed_prefill_bank_active` rather than by hand: this
+        # path used to do the swap without the `cu_seqlens_q` sync that goes
+        # with it, so from the SECOND mixed step on `prepare_prefill`
+        # cross-checked against a clone frozen at the first step's spans.
+        with self.mixed_prefill_bank_active() as pf_bank:
             # A mixed batch is never padded to a captured graph width, so the
             # prefill segment's running_bs IS its scheduled seq count.
             prefill_meta, _ = self.prepare_prefill(batch, n_p_seqs)
             prefill_positions_np = pf_bank["positions"].np[:n_p_tokens].copy()
-        finally:
-            # Restore even on error so a failed mixed build can't leave the
-            # runner pointed at the mirror bank.
-            self.model_runner.forward_vars = main_var
 
         # ---- Decode half: decode rows live at [n_p_seqs:] in batch arrays but
         # are packed into forward_vars buffer rows [0:n_d_seqs] so the persistent

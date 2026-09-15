@@ -373,6 +373,22 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     num_decode_seqs: int = 0
 
 
+class MixedViewUnslicedField(RuntimeError):
+    """A per-row field was read off a mixed view that never sliced it.
+
+    Deliberately NOT an AttributeError. `getattr(obj, name, default)` swallows
+    only that type, and real consumers do exactly that --
+    `_state_slot_in_np` reads `getattr(batch, "state_fork_srcs", None)` and
+    `gdn_attn` reads two more the same way. An AttributeError guard is
+    therefore SILENT on precisely the reads it exists to catch: the field
+    reads back as absent, the row takes its default, and a forked row ends up
+    with `state_slot_in == state_slot_out`.
+
+    That is the same failure shape the guard was written for -- a rename going
+    quiet instead of loud -- reintroduced by the guard's own exception type.
+    """
+
+
 class _MixedDecodeView:
     """Thin read-only view exposing the DECODE rows ``[n_prefill:]`` of a mixed
     batch as if they were a standalone decode batch, so the unmodified
@@ -405,12 +421,47 @@ class _MixedDecodeView:
         # PREFILL rows' slots. That is silent: no error, output norms stay
         # sensible, and the damage grows with the decode row count (n_d=1 looked
         # fine at 0.95 while the full run sat at 0.81).
+        #
+        # The check below is NOT "this field is one entry per row" -- it is
+        # not. `state_slots_committed` is built from a FILTERED subset
+        # (`scheduler.py`: `has_per_req_cache and state_slot >= 0`), so it is
+        # one entry per row only when that filter happens to drop nothing.
+        #
+        # But every positional consumer already assumes it did:
+        # `_attach_v4_paged_decode_meta` and its DSpark twin both do
+        # `state_slots_committed[:scheduled_bs]` and read the result as
+        # row-aligned. So "the filter was a no-op for this batch" is the shared
+        # precondition of all of them AND of the slice below -- checked here,
+        # where the two lengths are still in hand.
+        #
+        # A `raise`, not an `assert`: under `python -O` an assert is stripped,
+        # and what it was standing in front of is a silent positional
+        # misalignment of every decode row's state slot -- the exact failure
+        # mode (plausible norms, no exception, damage scaling with decode rows)
+        # this whole view exists to prevent.
         _slots = batch.state_slots_committed
-        assert len(_slots) == batch.total_seqs_num, (
-            f"state_slots_committed is {len(_slots)} of {batch.total_seqs_num} "
-            "rows; the positional decode slice below would misalign"
-        )
+        if len(_slots) != batch.total_seqs_num:
+            raise MixedViewUnslicedField(
+                f"state_slots_committed has {len(_slots)} entries for "
+                f"{batch.total_seqs_num} rows: the scheduler's "
+                "`has_per_req_cache and state_slot >= 0` filter dropped "
+                f"{batch.total_seqs_num - len(_slots)} row(s), so neither the "
+                "decode slice here nor the `[:scheduled_bs]` reads downstream "
+                "are row-aligned any more. Both need the slots gathered per "
+                "row rather than positionally."
+            )
         self.state_slots_committed = _slots[n_prefill_seqs:]
+        # Same list, same filter (`scheduler.py` builds both off `state_seqs`),
+        # so the same slice -- and the same precondition, checked just above.
+        #
+        # MISSED until the guard below stopped being swallowable: its only
+        # consumer reads it as `getattr(batch, "state_fork_srcs", None)`, so
+        # while the guard raised AttributeError the field read back as absent
+        # and `_state_slot_in_np` took its early return. Every forked row in a
+        # mixed batch then got `state_slot_in == state_slot_out` -- reading its
+        # own half-written state instead of the parent's, silently.
+        _srcs = getattr(batch, "state_fork_srcs", None)
+        self.state_fork_srcs = _srcs[n_prefill_seqs:] if _srcs is not None else _srcs
         # Per-row arrays the decode consumers index by the DECODE row count.
         # `decode_spans` (backends.py) does `num_scheduled_tokens[:bs]` with
         # `bs = total_seqs_num_decode`, so an unsliced array hands it the
@@ -459,7 +510,7 @@ class _MixedDecodeView:
             and isinstance(val, (list, tuple, np.ndarray))
             and len(val) == self._batch.total_seqs_num
         ):
-            raise AttributeError(
+            raise MixedViewUnslicedField(
                 f"_MixedDecodeView does not slice `{name}`, but the batch holds "
                 f"one entry per row ({len(val)} == total_seqs_num). A decode "
                 "view must slice per-row arrays or the consumer reads the "
@@ -2563,37 +2614,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # (pinned-source-race guard, `ab55dfb6`) that the shared-buffer design
         # required — see `_get_mixed_prefill_bank`. prefill_meta's tensors are
         # views into `pf_bank`, which the decode half never touches. ----
-        main_var = self.model_runner.forward_vars
-        pf_bank = self._get_mixed_prefill_bank()
-        # `cu_seqlens_q` is PUBLISHED upstream (`publish_cu_seqlens_q`, from
-        # `prepare_model`), not staged by the prefill path -- so unlike every
-        # other buffer here the bank's copy is not something prefill fills in,
-        # it is something prefill READS. The bank is built lazily once and never
-        # re-synced, so its copy holds whatever the real buffer had at creation.
-        #
-        # That was invisible until main's `2ce5f68f` changed `prepare_prefill`
-        # from deriving these indices to cross-checking against the published
-        # buffer; the check then read a stale clone and failed with
-        # "published cu_seqlens_q ends at 15486, not the 16298 tokens scheduled
-        # for prefill", which reads like a row-ordering bug and is not one.
-        #
-        # Synced here rather than shared by reference: the decode half
-        # overwrites the real buffer with decode-local spans further down, and
-        # sharing would make this correct only for as long as prefill keeps
-        # running first.
-        _live_cu = main_var["cu_seqlens_q"]
-        pf_bank["cu_seqlens_q"].cpu.copy_(_live_cu.cpu)
-        pf_bank["cu_seqlens_q"].gpu.copy_(_live_cu.gpu)
-        self.model_runner.forward_vars = pf_bank
-        try:
+        # Both halves' reasoning for this bank lives on
+        # `mixed_prefill_bank_active`, including why `cu_seqlens_q` needs a
+        # per-step sync the other buffers do not.
+        with self.mixed_prefill_bank_active() as pf_bank:
             # Same reasoning as the `prepare_decode` call below: a mixed batch is
             # never padded to a captured graph width, so the prefill segment's
             # running_bs IS its scheduled seq count.
             prefill_meta, _prefill_positions = self.prepare_prefill(batch, n_p_seqs)
-        finally:
-            # Restore even on error so a failed mixed build can't leave the
-            # runner pointed at the mirror bank.
-            self.model_runner.forward_vars = main_var
 
         # ---- Decode half: present rows [n_p_seqs:] as a standalone batch so
         # the unmodified prepare_decode builds decode metadata into shared
@@ -2608,9 +2636,27 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # no MTP in mixed) so swa_write / paged-decode index the 31-token decode
         # kv correctly instead of running off the end (GPU OOB in swa_write).
         decode_max_q = batch.num_spec_step + 1
-        var["cu_seqlens_q"].np[: n_d_seqs + 1] = np.arange(
+        _cu = var["cu_seqlens_q"]
+        _cu.np[: n_d_seqs + 1] = np.arange(
             0, (n_d_seqs + 1) * decode_max_q, decode_max_q, dtype=np.int32
         )
+        # ...and UPLOAD it. `prepare_decode` takes the device side as a bare
+        # `.gpu[...]` view on the strength of `publish_cu_seqlens_q` having
+        # already uploaded it, so a host-only correction leaves the kernels
+        # reading the full-batch cumsum this write exists to replace: the very
+        # OOB described above, just moved from the host's arithmetic to the
+        # device's. Every host-side assert passes either way, which is what made
+        # it invisible.
+        #
+        # Ordered by the stream, not by luck: this copy is issued on the current
+        # stream, and `prepare_decode` opens with `prep_stream.wait_stream(
+        # current_stream)` before firing its own H2Ds, so the decode-local spans
+        # are on the device before anything reads them.
+        #
+        # Width matches the read exactly (`.gpu[: running_bs + 1]` at
+        # running_bs == n_d_seqs); the tail past it still holds what
+        # `publish_cu_seqlens_q` left there, which no decode consumer slices.
+        _cu.copy_to_gpu(n_d_seqs + 1)
         # The returned decode positions tensor is unused: the merge below reads the
         # host-side staging buffer instead (see the no-sync note there).
         # `prepare_decode` used to take a single `bs` and derive the rest; it now
@@ -2676,8 +2722,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         running_tokens: int,
         max_seqlen_q: int,
     ):
-        """V4-style decode prep: populates positions, cu_seqlens_q,
-        block_tables, and state_slot_out.
+        """V4-style decode prep: populates positions, block_tables, and
+        state_slot_out.
+
+        NOT `cu_seqlens_q`: this reads it. Its writers are
+        `publish_cu_seqlens_q` for an ordinary step and `prepare_mixed` for the
+        decode half of a mixed one, and both upload before calling here.
 
         Uses stream overlap (like AiterMLAMetadataBuilder) to hide H2D
         latency behind CPU numpy work: basic H2D copies fire on
@@ -2773,7 +2823,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         prep_stream.wait_stream(current_stream)
         with torch.cuda.stream(prep_stream):
             positions = var["positions"].copy_to_gpu(running_tokens)
-            # Uploaded once by `publish_cu_seqlens_q`; this is a view.
+            # Already on the device -- by `publish_cu_seqlens_q` for an
+            # ordinary step, or by `prepare_mixed` for the decode half of a
+            # mixed one, which overwrites it with decode-local spans. A view,
+            # so whichever wrote last is what attention segments by.
             cu_seqlens_q_gpu = var["cu_seqlens_q"].gpu[: running_bs + 1]
             context_lens_gpu = var["context_lens"].copy_to_gpu(scheduled_bs)
             block_tables_gpu = var["block_tables"].copy_to_gpu(scheduled_bs)

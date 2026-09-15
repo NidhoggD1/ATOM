@@ -1664,6 +1664,13 @@ class Scheduler:
         # Prefill-only fast path: behavior identical to pre-mixed-batch days.
         # When the mixed flag is off, we never pack decode rows alongside
         # prefill chunks, so emit the prefill batch immediately.
+        #
+        # `not enable_mixed_prefill_decode` gates only the EARLY RETURN, never
+        # the per-chunk bookkeeping: with the flag on, a batch that ends up
+        # pure-prefill anyway still owes `plan_midstep`, `is_final_chunk` and
+        # the schedule-time advance, and it now gets them on the fall-through
+        # below. Gating the bookkeeping on the flag is what silently dropped
+        # them from every batch, prefill-only ones included.
         if num_seqs_prefill > 0 and not self.enable_mixed_prefill_decode:
             # `num_cached_tokens` below is a cursor, not a hit count: it starts
             # at the prefix-cache hit and then advances by each finished chunk,
@@ -1687,37 +1694,11 @@ class Scheduler:
                 self._publish_state_stores()
                 connector_meta_output = self.kv_connector.build_connector_meta()
 
-            # Freeze, per seq, whether this chunk finishes the prompt. Uses the
-            # pre-advance offsets so it is correct whether or not schedule-time
-            # advancement runs below.
-            is_final_chunk = [
-                (num_cached_tokens_list[i] + int(num_scheduled_tokens[i]))
-                >= seq.num_prompt_tokens
-                for i, seq in enumerate(scheduled_seqs.values())
-            ]
-            # Bound on num_tokens (not num_prompt_tokens): preempted seqs
-            # re-forward generated tokens past the prompt boundary.
-            next_token_ids = None
-            if self.drafter_needs_next_token:
-                next_token_ids = []
-                for i, seq in enumerate(scheduled_seqs.values()):
-                    end = num_cached_tokens_list[i] + int(num_scheduled_tokens[i])
-                    next_token_ids.append(
-                        -1 if end >= seq.num_tokens else int(seq.token_ids[end])
-                    )
-
-            # Reserve midstep checkpoint destinations for the chunks just
-            # settled. Here rather than inside `_finalize_prefill_chunk`
-            # because a reservation takes a slot off the free list, and
-            # admission for this pass only finishes above — planning any
-            # earlier would let a checkpoint's destination compete with a
-            # request still to be let in. The batch below snapshots what this
-            # leaves on each seq.
-            for i, seq in enumerate(scheduled_seqs.values()):
-                start = num_cached_tokens_list[i]
-                self.block_manager.plan_midstep(
-                    seq, start, start + int(num_scheduled_tokens[i])
-                )
+            is_final_chunk, next_token_ids = self._settle_prefill_chunks(
+                list(scheduled_seqs.values()),
+                num_scheduled_tokens,
+                num_cached_tokens_list,
+            )
 
             # Prefill-only step: it returns before the decode phase, so decode
             # got nothing this step -- which is exactly the case worth counting.
@@ -1749,7 +1730,9 @@ class Scheduler:
                 # Advance after batch build (so the batch keeps pre-advance
                 # offsets) so the next schedule() issues the following chunk.
                 self._advance_prefill_on_schedule(
-                    scheduled_seqs, num_scheduled_tokens, is_final_chunk
+                    list(scheduled_seqs.values()),
+                    num_scheduled_tokens,
+                    is_final_chunk,
                 )
 
             return (prefill_batch, scheduled_seqs)
@@ -1915,6 +1898,13 @@ class Scheduler:
             seq.num_cached_tokens for seq in scheduled_seqs.values()
         ]
 
+        # Prefill rows occupy `[:num_seqs_prefill]`: Phase 1/2 put them in
+        # `scheduled_seqs` first and decode scheduling appended after them,
+        # which is the same layout `_MixedDecodeView` slices at `[n_p_seqs:]`.
+        prefill_seqs = list(scheduled_seqs.values())[:num_seqs_prefill]
+
+        is_final_chunk: list[bool] | None = None
+        next_token_ids: list[int] | None = None
         if num_seqs_prefill > 0:
             self.prev_prompt = True
             logger.info(
@@ -1922,6 +1912,28 @@ class Scheduler:
                 f"{num_seqs_prefill} prefill + {num_seqs_decode} decode, "
                 f"{total_tokens_num_prefill}+{total_tokens_num_decode} tokens"
             )
+            # The bookkeeping the prefill-only fast path above would have done
+            # had it not been skipped. Before the batch build: `plan_midstep`
+            # leaves state the batch snapshots.
+            is_final_chunk, next_token_ids = self._settle_prefill_chunks(
+                prefill_seqs,
+                num_scheduled_tokens[:num_seqs_prefill],
+                num_cached_tokens_list[:num_seqs_prefill],
+            )
+            # Pad out to ONE ENTRY PER ROW. `_record_kv_cache_ready` zips this
+            # against `req_ids` with `strict=True`, and every other list on a
+            # batch is row-aligned, so a prefill-length list here would be both
+            # a crash on a mixed batch and a trap for the next reader. False is
+            # the honest value for a decode row: it is not a prompt chunk, so
+            # it never completes one, and nothing should announce its prefix.
+            is_final_chunk = is_final_chunk + [False] * num_seqs_decode
+            if next_token_ids is not None:
+                # Same row-alignment rule; -1 is this list's own "sampling
+                # supplies it", which is exactly right for a decode row.
+                # (Reachable only if mixed+spec is ever allowed -- today it is
+                # refused in ModelRunner -- but leaving the list short would
+                # make that a positional mismatch rather than a clear refusal.)
+                next_token_ids = next_token_ids + [-1] * num_seqs_decode
 
         connector_meta_output = None
         if self.kv_connector is not None:
@@ -1942,6 +1954,10 @@ class Scheduler:
             num_spec_step=self.mtp_k if self.spec_decode_local else 0,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             num_cached_tokens=num_cached_tokens_list,
+            # None on a pure-decode batch, where `produces_output` answers from
+            # the decode row count before it ever looks at this.
+            is_final_chunk=is_final_chunk,
+            next_token_ids=next_token_ids,
             remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
             remote_kv_seq_blocks=remote_kv_seq_blocks,
             # An empty batch cannot execute queued maintenance.
@@ -1955,6 +1971,16 @@ class Scheduler:
             ),
         )
         self._consume_state_forks(scheduled_seqs)
+
+        if num_seqs_prefill > 0 and self.advance_on_schedule:
+            # After the batch build, so the batch keeps pre-advance offsets --
+            # same ordering as the prefill-only path above.
+            self._advance_prefill_on_schedule(
+                prefill_seqs,
+                num_scheduled_tokens[:num_seqs_prefill],
+                is_final_chunk,
+            )
+
         return (decode_batch, scheduled_seqs)
 
     @staticmethod
@@ -2587,9 +2613,69 @@ class Scheduler:
         self.waiting.appendleft(seq)
         return True
 
+    def _settle_prefill_chunks(
+        self,
+        prefill_seqs: list[Sequence],
+        num_scheduled_tokens: list[int],
+        num_cached_tokens: list[int],
+    ) -> tuple[list[bool], list[int] | None]:
+        """Per-chunk bookkeeping every batch carrying prefill rows owes.
+
+        Owed by MIXED batches too, which is why this is a method and not the
+        body of the prefill-only fast path it used to live in: that path is
+        skipped whenever mixed batching is enabled, and with it went the only
+        call to `plan_midstep` in the repo, the only assignment of
+        `is_final_chunk` (left None, which `produces_output` reads as True), and
+        the only call to `_advance_prefill_on_schedule` -- on pure-prefill
+        batches as much as mixed ones, since the old gate asked whether the
+        FEATURE was on rather than whether THIS BATCH had decode rows.
+
+        All three lists are positionally aligned and cover the prefill rows
+        only. A mixed batch's `scheduled_seqs` is `[prefill | decode]` (decode
+        rows are appended during decode scheduling, after admission), so the
+        caller passes the leading slice; handing the whole batch here would
+        advance decode rows' prompt cursors.
+
+        Returns `(is_final_chunk, next_token_ids)` for the batch to carry.
+        """
+        # Freeze, per seq, whether this chunk finishes the prompt. Uses the
+        # pre-advance offsets so it is correct whether or not schedule-time
+        # advancement runs afterwards.
+        is_final_chunk = [
+            (num_cached_tokens[i] + int(num_scheduled_tokens[i]))
+            >= seq.num_prompt_tokens
+            for i, seq in enumerate(prefill_seqs)
+        ]
+
+        # Bound on num_tokens (not num_prompt_tokens): preempted seqs
+        # re-forward generated tokens past the prompt boundary.
+        next_token_ids = None
+        if self.drafter_needs_next_token:
+            next_token_ids = []
+            for i, seq in enumerate(prefill_seqs):
+                end = num_cached_tokens[i] + int(num_scheduled_tokens[i])
+                next_token_ids.append(
+                    -1 if end >= seq.num_tokens else int(seq.token_ids[end])
+                )
+
+        # Reserve midstep checkpoint destinations for the chunks just settled.
+        # Here rather than inside `_finalize_prefill_chunk` because a
+        # reservation takes a slot off the free list, and admission for this
+        # pass only finishes above — planning any earlier would let a
+        # checkpoint's destination compete with a request still to be let in.
+        # The batch the caller builds snapshots what this leaves on each seq,
+        # so this must run before that build.
+        for i, seq in enumerate(prefill_seqs):
+            start = num_cached_tokens[i]
+            self.block_manager.plan_midstep(
+                seq, start, start + int(num_scheduled_tokens[i])
+            )
+
+        return is_final_chunk, next_token_ids
+
     def _advance_prefill_on_schedule(
         self,
-        scheduled_seqs: dict[int, Sequence],
+        prefill_seqs: list[Sequence],
         num_scheduled_tokens: list[int],
         is_final_chunk: list[bool],
     ) -> None:
@@ -2600,7 +2686,7 @@ class Scheduler:
         before this one's output returns. Hash registration is NOT done here — it
         stays in postprocess where the forward has computed the KV.
         """
-        for i, seq in enumerate(scheduled_seqs.values()):
+        for i, seq in enumerate(prefill_seqs):
             seq.num_cached_tokens += int(num_scheduled_tokens[i])
             now_partial = not is_final_chunk[i]
             if now_partial != seq.is_partial_prefill:

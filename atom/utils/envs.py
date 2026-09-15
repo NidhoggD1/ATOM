@@ -725,6 +725,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # dp8/conc1024 it is ~128 of 16384 (0.8%) and cannot by itself explain a
     # TTFT change. Only a per-step tally settles what the budget really did.
     "ATOM_PROBE_STEP_BUDGET": lambda: os.getenv("ATOM_PROBE_STEP_BUDGET", "0") == "1",
+    # Per-segment output magnitude for a mixed batch's two halves. A segment
+    # that is wrong usually shows it here -- zeros, NaN, or a norm an order off
+    # the other half -- and that says WHICH half to read. Registered rather than
+    # read through a raw `os.environ.get` at the call site: that sits on a
+    # per-segment per-layer path (122 reads/step) and, more to the point, an
+    # unregistered variable is one nobody can discover.
+    "ATOM_PROBE_MIXED_NORM": lambda: os.getenv("ATOM_PROBE_MIXED_NORM", "0") == "1",
     # --- PCP MoE comm mode ---
     # Fold the PCP (prefill-context-parallel) dim into the MoE tp/ep sharding.
     # Only meaningful when prefill_context_parallel_size > 1;
