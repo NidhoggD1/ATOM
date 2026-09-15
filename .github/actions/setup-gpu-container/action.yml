@@ -122,6 +122,9 @@ runs:
         # (e.g. benchmark + regression) don't clobber each other's file.
         ENV_FILE="/tmp/atom_${CONTAINER_NAME}_env.txt"
         printenv MODEL_ENV_VARS | grep -v '^$' > "$ENV_FILE" || true
+        if [ "${RUNNER_LABEL}" = "linux-atom-do-mi350x-8.test" ] && ! grep -q '^NCCL_SOCKET_IFNAME=' "$ENV_FILE"; then
+          echo "NCCL_SOCKET_IFNAME=lo" >> "$ENV_FILE"
+        fi
 
         echo "Starting container with image: $IMAGE_TAG"
         echo "Model-specific environment variables:"

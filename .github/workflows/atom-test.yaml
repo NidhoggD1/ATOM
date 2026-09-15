@@ -491,6 +491,7 @@ jobs:
           docker exec \
             -e GPU_COMM_DEBUG_DEVICE_MIB=16 \
             -e GPU_COMM_DEBUG_ITERS=3 \
+            -e NCCL_SOCKET_IFNAME=lo \
             -e NCCL_DEBUG=INFO \
             -e NCCL_DEBUG_SUBSYS=INIT,COLL \
             -e RCCL_DEBUG=INFO \
