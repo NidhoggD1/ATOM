@@ -305,7 +305,7 @@ def _emit_sparse_block_table_kernel(
     Same compaction -- it calls the same helper -- so the two paths cannot
     drift. Its cost splits: 2.5-4.7us of device time, and ~14us of python
     launch that a captured replay does not pay at all. Only the first half is
-    why `_AITER_MIN_WIDTH_WITH_EMIT` asks for a wider row than the bare
+    why the emit path used to ask for a wider row than the bare
     selection does.
     """
     pid_q = tl.program_id(0)
@@ -749,24 +749,37 @@ def _alloc_emit(total_q, num_idx_heads, topk, block_table, emit, device):
     return (sparse_bt, sparse_ctx), args
 
 
-# Row widths (in 128-blocks) from which aiter's selector is the cheaper way to
-# serve the call; under them the fused Triton kernel is, being one launch that
-# also emits. Device us, MI355X, topk=16, rows 1..512, rocprofv3-attributed
-# (`/app/logs_claude/m3_emit_gate_device*.log`), as triton/aiter:
+# Whether to serve the selection through aiter at all. It used to be a width
+# threshold; splitting the Triton selector across chunks removed the thing the
+# threshold was gating on.
 #
-#     width        64     512    1024    2048    8192
-#     emit=True   0.6x    0.7x    1.0x    1.4x    3.7x
-#     emit=False  0.8x    ~1.0x   1.25x   2.0x    4.8x
+# The ratio table it was fitted against was measured against the UNSPLIT Triton
+# kernel, whose cost grows with the row -- so there was a width where aiter
+# overtook it, and picking that width was the whole job. The split kernel's
+# cost does not grow with the row, so there is no crossover left to find.
+# Measured in place (trace, decode, TP4, EAGLE3, triton 3.7), both routes:
 #
-# Width decides, not rows: at fixed width the ratio moves <0.2x across 1..512
-# rows. Emission raises the bar because it costs a second kernel there, 26us
-# against the ~4us the fusion charges for the same work.
-_AITER_MIN_WIDTH = 1024
-_AITER_MIN_WIDTH_WITH_EMIT = 2048
+#     context   width   aiter (select+emit)   chunked Triton (fused)
+#      196K     1536      5.42 + 4.35 = 9.77          7.51
+#      350K     2733      5.36 + 4.47 = 9.83          7.34
+#
+# Two flat lines, the Triton one about 24% lower at both ends. 57 sparse layers
+# make that -137 us/step, ~-1.4% of the step.
+#
+# There is a second reason the threshold could not have worked here: it is a
+# host-side branch, so under a full CUDA graph it is evaluated once at capture
+# and then frozen. Capture sees max_seq_len at the model limit (1M, width
+# 8192), so every replay took the aiter side no matter how long the live
+# context was -- the `n8192` kernel variant shows up in traces of 196K and 350K
+# turns alike, while a 2706-wide eager call picks `n4096`.
+#
+# Left as a flag rather than deleted: the aiter path is still the better one if
+# the Triton selector is ever unsplit again, and a flag is what a bisect wants.
+USE_AITER_SELECTOR = False
 
 
 def _aiter_selector_wins(width, emit):
-    return width >= (_AITER_MIN_WIDTH_WITH_EMIT if emit else _AITER_MIN_WIDTH)
+    return USE_AITER_SELECTOR
 
 
 # aiter's support predicate answers from shape, dtype and arch alone, but costs

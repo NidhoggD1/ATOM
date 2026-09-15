@@ -8,11 +8,13 @@ against another kernel -- a comparison can only catch a defect the two
 implementations do not share, and the second implementation was removed once
 it lost.
 
-One test breaks that rule on purpose:
-`test_the_two_selectors_agree_where_the_dispatch_switches`. Two selectors are
-live again, chosen by row width, and the dispatch's whole claim is that the
-cheaper one computes the same answer -- so agreement between them is the
-property, not a stand-in for one.
+One test breaks that rule on purpose: `test_the_two_selectors_agree`. Two
+selectors are live again -- aiter's and the chunked Triton one -- and the only
+claim the dispatch makes is that they compute the same answer at different
+cost, so agreement between them is the property, not a stand-in for one. It
+drives `USE_AITER_SELECTOR` itself: the route no longer follows row width, so
+separating the two by their arguments would silently compare one of them
+against itself.
 
 The whole file needs triton, because the module under test defines
 `@triton.jit` kernels and a decorator runs at import. CI has no triton, so
@@ -387,7 +389,7 @@ class TestMetadataRowBounds:
     def test_narrow_rows_still_answer_with_the_bounds_published(self, q_per_req):
         """Publishing the bounds must not change the answer where they are unused.
 
-        14 columns is under `_AITER_MIN_WIDTH_WITH_EMIT`, so Triton serves it
+        Triton serves this shape, with a bounds tensor in hand it never reads
         with a tensor in hand that it never reads -- the common decode shape.
         """
         from atom.model_ops.minimax_m3 import index_topk as m
@@ -497,44 +499,54 @@ class TestPerForwardHoist:
 
 
 class TestSelectorDispatch:
-    """`_aiter_selector_wins`: which selector a row width is cheaper on.
+    """`_aiter_selector_wins`: which selector serves the call.
 
-    The thresholds are a fit to measured device time (the table beside them);
-    what is asserted is only that it is applied as stated -- monotone in width,
-    stricter when the call also emits.
+    It used to be a width threshold. Splitting the Triton selector across
+    chunks flattened its cost against the row, which removed the crossover the
+    threshold existed to find -- both routes are now flat in width and the
+    Triton one is the cheaper of the two (the table beside `USE_AITER_SELECTOR`
+    has the measurements). So what is asserted here is the shape of the
+    decision, not a fitted constant: one flag, no width dependence.
     """
 
-    def test_narrow_rows_stay_on_triton(self):
-        for width in (1, 64, 512, m._AITER_MIN_WIDTH - 1):
-            assert not m._aiter_selector_wins(width, emit=False)
-            assert not m._aiter_selector_wins(width, emit=True)
+    def test_the_route_does_not_depend_on_width(self):
+        for emit in (False, True):
+            got = {m._aiter_selector_wins(w, emit) for w in (1, 64, 512, 1024,
+                                                             2048, 8192, 1 << 20)}
+            assert len(got) == 1, f"emit={emit}: route still varies with width"
 
-    def test_emission_raises_the_bar(self):
-        between = m._AITER_MIN_WIDTH
-        assert between < m._AITER_MIN_WIDTH_WITH_EMIT
-        assert m._aiter_selector_wins(between, emit=False)
-        assert not m._aiter_selector_wins(between, emit=True)
+    def test_the_flag_decides(self, monkeypatch):
+        for flag in (False, True):
+            monkeypatch.setattr(m, "USE_AITER_SELECTOR", flag)
+            for emit in (False, True):
+                assert m._aiter_selector_wins(2048, emit) is flag
 
-    def test_wide_rows_take_aiter(self):
-        for width in (m._AITER_MIN_WIDTH_WITH_EMIT, 8192):
-            assert m._aiter_selector_wins(width, emit=False)
-            assert m._aiter_selector_wins(width, emit=True)
+    def test_triton_serves_by_default(self):
+        """The default has to be the measured-faster route, not the legacy one.
+
+        A flag that ships flipped the wrong way is the failure this catches:
+        both kernels are correct, so nothing else in the suite would notice.
+        """
+        assert m.USE_AITER_SELECTOR is False
+        assert not m._aiter_selector_wins(8192, emit=True)
 
 
 @gpu
-def test_the_two_selectors_agree_where_the_dispatch_switches():
-    """Above the width threshold both paths must return the same selection.
+def test_the_two_selectors_agree(monkeypatch):
+    """Both routes must return the same selection; only the cost differs.
 
-    The dispatch claims only that aiter computes the same answer more cheaply,
-    so agreement is the property. 262144 tokens is 2048 columns, the first
-    width `_aiter_selector_wins` takes with emission on.
+    The flag has to be driven explicitly. This test used to separate the routes
+    by passing the bounds tensor or None, which worked while the width decided
+    -- with the route now off by default, both calls would take Triton and the
+    comparison would pass by comparing a run against itself. 2048 columns is
+    the width the old threshold switched at, kept as the shape under test.
     """
     from atom.model_ops.minimax_m3 import index_topk as m2
     from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
 
     if m2.topk_per_row_small_k is None:
         pytest.skip("aiter's small-k selector is not installed")
-    batch, heads, ctx = 2, 1, m2._AITER_MIN_WIDTH_WITH_EMIT * SPARSE_BLOCK_SIZE
+    batch, heads, ctx = 2, 1, 2048 * SPARSE_BLOCK_SIZE
     kw = _inputs([1] * batch, [ctx - 1] * batch, heads, "cuda")
     md = make_sparse_decode_metadata(
         seq_lens=kw["seq_lens"],
@@ -553,7 +565,9 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
             n_valid_column_per_row=bounds,
         )  # fmt: skip
 
+    monkeypatch.setattr(m2, "USE_AITER_SELECTOR", True)
     ait_idx, ait_bt, ait_ctx = run(md.n_valid_column_per_row)
+    monkeypatch.setattr(m2, "USE_AITER_SELECTOR", False)
     tri_idx, tri_bt, tri_ctx = run(None)
     rows = heads * batch
     assert torch.equal(
