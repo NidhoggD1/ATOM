@@ -485,19 +485,14 @@ jobs:
           echo "MODEL_EXTRA_ARGS=${MODEL_EXTRA_ARGS}"
 
           docker exec \
-            -e GPU_COMM_DEBUG_DEVICE_MIB=16 \
-            -e GPU_COMM_DEBUG_ITERS=3 \
             -e NCCL_SOCKET_IFNAME=lo \
-            -e NCCL_DEBUG=INFO \
-            -e NCCL_DEBUG_SUBSYS=INIT,COLL \
-            -e RCCL_DEBUG=INFO \
-            -e TORCH_DISTRIBUTED_DEBUG=DETAIL \
+            -e MORI_SOCKET_IFNAME=lo \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
               echo '=== GPU communication debug context ==='
               hostname
               id
-              env | grep -E '^(HIP|CUDA|ROCR|NCCL|RCCL|HSA|ATOM|AITER)_' | sort || true
+              env | grep -E '^(HIP|CUDA|ROCR|NCCL|MORI|RCCL|HSA|ATOM|AITER)_' | sort || true
               ls -l /dev/kfd /dev/dri/renderD* 2>/dev/null || true
               rocm-smi --showid --showtopo --showpids || true
 
