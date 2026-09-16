@@ -74,8 +74,18 @@ its cost lands squarely on that request's own TTFT and cannot be hidden by
 concurrency.
 
 Under 1P1D this cost is easy to overlook, because prefill already happened on
-the prefill node. The decode node still runs its own
-`io_processor.preprocess()` on the forwarded request.
+the prefill node — but the decode node runs its own `io_processor.preprocess()`
+on the forwarded request, and the router forwards `messages`, not tokens.
+
+**This is now avoided when the pair carries token ids.** atomesh asks the
+prefill node for `return_token_ids` and hands the result to decode in
+`kv_transfer_params["prompt_token_ids"]`; decode then skips both the template
+render and the tokenize, and `api_preprocess` collapses to the cost of building
+a `Sequence`. See
+[Reusing the prefill's token ids](../recipes/pd_disaggregation_guide.md#reusing-the-prefills-token-ids).
+The measurements below predate that change and are what this stage looks like
+without it — which is also what you still get from a prefill node too old to
+answer `return_token_ids`, since decode falls back to tokenizing.
 
 ### `forward_to_output` is not `gpu_forward`
 
@@ -166,7 +176,11 @@ Two distribution details are worth keeping:
 
 This run was PD-transfer bound, which is why `queue_time` dominates. The shares
 move a lot with the workload: when KV transfer is fast, `api_preprocess` becomes
-the largest term.
+the largest term — which is what motivated carrying the prefill's token ids
+across, and why a PD run whose `api_preprocess` still looks like the table above
+is worth checking against
+[Reusing the prefill's token ids](../recipes/pd_disaggregation_guide.md#reusing-the-prefills-token-ids)
+before optimizing anything else.
 
 ## Optional trace spans
 
