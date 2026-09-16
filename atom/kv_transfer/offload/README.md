@@ -590,6 +590,57 @@ still publishing when the forward reaches B+1, that partial prefill pauses; an
 empty metadata step keeps polling B, then snapshots B+1 before any later
 forward can mutate the request SLOT.
 
+### Paying for the slow tier only when it is read
+
+The verdict table above is also the only evidence either optional gate below
+uses; nothing new is measured. Both are off by default, and both exist because
+saves and lookups are unconditional today, which is only right when the slow
+tier has customers.
+
+**Slow-tier save admission (`OFFLOAD_SAVE_ADMISSION=1`).** Each reload verdict
+is one sample: `aligned_large_hit` means the tier paid off, every other outcome
+means it did not. An EMA over those samples is the payoff. At or above
+`OFFLOAD_ADMISSION_TARGET` every save is admitted; below it the admitted share
+falls linearly to `OFFLOAD_ADMISSION_FLOOR`, carried by a credit accumulator so
+the realized share tracks the computed one without randomness.
+
+**Unloadable-lookup skip (`OFFLOAD_LOOKUP_SKIP_UNLOADABLE=1`).** A lookup whose
+answer cannot change the outcome is pure cost. When even a total hit
+(`num_prompt - 1`) would leave the loadable gap `num_prompt - 1 - hbm` below
+`OFFLOAD_MIN_LOAD_TOKENS`, the verdict is `too_small` whatever the tier
+answers, so the round trip is skippable. Skipping is not free: it also leaves
+the save floor at the HBM frontier, asserting the tier already holds this
+prefix -- an assertion nothing checked, because nothing asked. The skip
+therefore stands down whenever the tier is measurably load-bearing (an
+actionable-rate EMA of at least 1% after 64 lookups), and one forced probe
+every 32 skippable lookups keeps that estimate fed after the gate closes.
+
+**Both are regime-dependent, and the regime belongs to the workload, not the
+code.** Measured on M3: at 46647 blocks the tier answered 0.03% of queried
+tokens and the skip won 6.1% throughput; at 16612 blocks the same switch lost
+3.8 points, because there it starved a tier that was being read. Measured on
+GLM-5.2 in this tree (concurrency 16, 600 s, four on/off combinations plus an
+interleaved repeat of the admission cell): the skip never fires at all -- with
+32k prompts and an 18% HBM prefix hit the bound is about 26.9k tokens against
+an 8192 floor, so no lookup is ever skippable --
+and admission refused not one save in any of the three runs that enabled it
+(356, 512 and 522 admitted saves, `skipped=0` in all three) at a steady-state
+payoff near 0.9 against a target of 0.10. Note what carries that conclusion: it
+is the `skipped=0` count itself, not the payoff-above-target reasoning, and
+`save_share` is the *realized* share `saved/(saved+skipped)`, so it is pinned to
+1.0 by `skipped=0` and is not independent evidence.
+All of them land inside run-to-run spread: eight behaviourally equivalent runs
+span 2.7% end to end.
+**Leave both off unless the tier is measured to be idle.** That measurement is
+free: `[OFFLOAD-ADMISSION]` reports the payoff whether or not admission is on.
+
+Two cautions on the estimator itself. `warmup`, `alpha` and the probe cadence
+are defined in event counts, so their wall-clock constants drift with the
+verdict rate -- a change elsewhere that changes the rate silently retunes them.
+And the payoff dips far below target during ramp (4e-05 in GLM-5.2's first
+report, before settling near 0.9), so a threshold sitting between the transient
+and the steady state throttles during ramp rather than at the working point.
+
 ## Correctness, fp8 & Failure Handling
 
 KV offload is unforgiving — a single mis-placed byte corrupts a model's output
@@ -927,6 +978,14 @@ Connector-specific tuning (env):
 | `OFFLOAD_PUBLICATION_POLL_INTERVAL_S` | 0.01 | Finite, positive sleep interval between visibility probes; prevents busy-spinning. |
 | `OFFLOAD_COMMITTED_SIDECAR_CAPACITY` | 65536 | Positive integer bound for scheduler-session AOS1 commit discovery. Oldest commits are evicted first. |
 | `OFFLOAD_PROFILE` | 0 | Emit `[OFFLOAD-SAVE-PROF]` / `[OFFLOAD-LOAD-PROF]` records with transfer counts, fast-path evidence, and outer store/retrieve wall time. |
+| `OFFLOAD_SAVE_ADMISSION` | 0 | Admit saves in proportion to a measured payoff instead of unconditionally (see [Paying for the slow tier only when it is read](#paying-for-the-slow-tier-only-when-it-is-read)). Off by default: it is a heuristic over a workload property, not a correctness control. |
+| `OFFLOAD_ADMISSION_TARGET` | 0.10 | Payoff at or above which every save is admitted. Below it the admitted share falls linearly to the floor. |
+| `OFFLOAD_ADMISSION_FLOOR` | 0.25 | Minimum admitted share however low the payoff falls. The loop is circular -- saving less can only lower the observed payoff -- so this bounds the worst case and lets a tier that starts cold climb back. |
+| `OFFLOAD_ADMISSION_ALPHA` | 1/16 | EMA weight per reload verdict; converges in roughly 40 verdicts. A **count**, not a wall-clock constant: its time constant moves with the verdict rate. |
+| `OFFLOAD_ADMISSION_WARMUP` | 64 | Verdicts admitted unconditionally before the gate engages. |
+| `OFFLOAD_ADMISSION_REPORT_EVERY` | 256 | Verdicts per `[OFFLOAD-ADMISSION]` record. Emitted whether or not admission is enabled. |
+| `OFFLOAD_LOOKUP_SKIP_UNLOADABLE` | 0 | Skip a lookup whose answer could not change the reload verdict (see the same section). Off by default. |
+| `OFFLOAD_LOOKUP_REPORT_EVERY` | 256 | Lookups per `[OFFLOAD-LOOKUP-COST]` record. Emitted by default, independent of `OFFLOAD_PROFILE`. |
 
 Pinned-host asynchronous copies and one batched PAGE block-ID upload per
 transfer are the built-in `BlockGPUConnector` fast path; there are no feature
@@ -1123,6 +1182,25 @@ These records report payload/group counts, whether batched IDs and asynchronous
 host copies actually ran, and outer store/retrieve wall time. Connector phase
 and GPU-event timings are not collected.
 
+Two records are emitted by default, independent of `OFFLOAD_PROFILE`, one per
+rank:
+
+```text
+[OFFLOAD-LOOKUP-COST] lookups=... total_s=... mean_ms=... tokens=...
+                      mean_tokens=... act_ema=... load_bearing=...
+[OFFLOAD-ADMISSION] {'enabled': ..., 'probes': ..., 'payoff': ...,
+                     'saved': ..., 'skipped': ..., 'save_share': ...,
+                     'reasons': {...}}
+```
+
+The first bills the lookup round trip every `OFFLOAD_LOOKUP_REPORT_EVERY`
+lookups and carries the actionable-rate EMA the skip gate reads. The second
+reports the save-admission estimate every `OFFLOAD_ADMISSION_REPORT_EVERY`
+verdicts. Both are cumulative totals, not per-window deltas. Note that
+`save_share` is the **realized** share `saved / (saved + skipped)`, not the
+share the gate computed: with `skipped=0` it is 1.0 by construction and says
+nothing about the estimate. Read `payoff` for that.
+
 Common diagnostics:
 
 - **No PAGE+SLOT registration line:** the model did not expose DSV4
@@ -1146,6 +1224,14 @@ Common diagnostics:
 - **PAGE saved but no logical sidecar commit at TP>1:** inspect every rank's
   sidecar terminal log for the same boundary. One failed rank makes the global
   exact-generation result a failure.
+- **Admission enabled but `skipped` stays 0:** the tier is paying off, so
+  admission is an identity transform for this workload -- the expected outcome
+  wherever the slow tier is actually read, not a switch that failed to take.
+  Confirm with the `enabled` field of the same record rather than `save_share`.
+- **Skip enabled but no lookup is ever skipped:** compare
+  `num_prompt - 1 - hbm` against `OFFLOAD_MIN_LOAD_TOKENS`. Long prompts with a
+  small HBM prefix can never satisfy the precondition, so the gate is
+  unreachable rather than broken.
 - **Configured NVMe but no `LocalDiskBackend`:** startup is expected to fail.
   Verify both disk path/size and a positive local-CPU staging capacity, even
   with `LMCACHE_LOCAL_CPU=False`.
@@ -1316,6 +1402,8 @@ python3 multi-round-qa.py \
 | [`tests/test_lmcache_offload_config.py`](../../../tests/test_lmcache_offload_config.py) | Stable PAGE namespace derivation, geometry/version separation, and scheduler/worker metadata parity. |
 | [`tests/test_lmcache_offload_v4_page_slot.py`](../../../tests/test_lmcache_offload_v4_page_slot.py) | PAGE-before-SLOT save, PAGE-then-SLOT load, missing/corrupt SLOT, staging exhaustion, and bounded logs. |
 | [`tests/test_lmcache_offload_connector.py`](../../../tests/test_lmcache_offload_connector.py) | Scheduler cadence, session commits, nonzero-HBM guard, exact save generations, and dense regressions. |
+| [`tests/test_slow_tier_admission.py`](../../../tests/test_slow_tier_admission.py) | Payoff EMA and its optimistic start, warmup, floor/target clamping, deterministic credit accounting, batched-verdict folding, and restart resynchronisation. |
+| [`tests/test_dense_offload_connector.py`](../../../tests/test_dense_offload_connector.py) | Dense scheduler lifecycle and lookup-pin ownership, plus the unloadable-lookup skip: precondition, default-off, stand-down when the tier is load-bearing, and the forced probe. |
 | [`tests/test_kv_aggregator.py`](../../../tests/test_kv_aggregator.py) | TP all-rank completion/failure and cross-generation isolation. |
 | [`tests/test_lmcache_offload_disk_integration.py`](../../../tests/test_lmcache_offload_disk_integration.py) | Real-LMCache local-disk PAGE and AOS1 sidecar round trips; explicit skip without LMCache. |
 | [`tests/test_lmcache_offload_gpu_disk_e2e.py`](../../../tests/test_lmcache_offload_gpu_disk_e2e.py) | Real PAGE-region + full-SLOT GPU `LocalDiskBackend` round trip; explicit prerequisite probes for ROCm/CUDA, LMCache, and Triton. |
@@ -1372,6 +1460,7 @@ python3 multi-round-qa.py \
 | **suffix prefill / offload-wake** | Resuming a parked seq to prefill only the still-uncached suffix (vs the P/D decode-jump). |
 | **P/D** | Prefill/Decode disaggregation — the sibling connector this module shares base/factory/types with. |
 | **RPC thread** | The worker thread that runs per-step engine calls. DSV4 only enqueues the source-safe SLOT D2D snapshot there; blocking D2H/storage work runs on daemons. |
+| **admission** (three distinct uses) | *Staging-row admission* bounds DSV4 temp rows; *worker save admission* is the `OFFLOAD_MAX_PENDING_SAVES` running-plus-queued bound; *slow-tier admission* (`OFFLOAD_SAVE_ADMISSION`) decides whether a save is worth doing at all. The first two bound concurrency and always run; the third declines work outright and is off by default. |
 | **completion sets** | `finished_loading` / `failed_loading` plus exact-generation PAGE/SLOT save sets, aggregated across TP workers. |
 
 ## See Also
