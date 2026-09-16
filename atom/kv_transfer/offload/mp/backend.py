@@ -11,6 +11,8 @@ without knowing which model or attention implementation produced them.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import threading
@@ -155,6 +157,16 @@ def _tp_replication_factor(config: Any) -> int:
 
     tp_size, _ = _validate_mp_config(config)
     configured = _extra_config(config).get("lmcache.mp.tp_rank_collapse", "auto")
+    if _is_dsv4(config):
+        if configured is True:
+            raise ValueError(
+                "DSV4 native STATE requires every TP rank; disable rank collapse"
+            )
+        if configured is not False and configured != "auto":
+            raise TypeError(
+                "lmcache.mp.tp_rank_collapse must be true, false, or 'auto'"
+            )
+        return 1
     if isinstance(configured, str) and configured.strip().lower() == "auto":
         collapse = _config_has_fully_replicated_tp_pages(config)
     elif type(configured) is bool:
@@ -218,7 +230,21 @@ def _server_urls(config: Any) -> list[str]:
     return urls
 
 
-def _model_namespace(config: Any) -> str:
+def _is_dsv4(config: Any) -> bool:
+    hf = getattr(config, "hf_config", None)
+    hf = getattr(hf, "text_config", hf)
+    return (
+        str(getattr(hf, "model_type", "")).lower()
+        in (
+            "deepseek_v4",
+            "deepseek_v4_mtp",
+        )
+        or "DeepseekV4ForCausalLM" in (getattr(hf, "architectures", None) or [])
+        or bool(getattr(hf, "compress_ratios", None))
+    )
+
+
+def _model_namespace(config: Any, *, checkpoint_spec: Any = None) -> str:
     """Build a model/layout namespace shared by scheduler and workers."""
 
     cfg = offcfg.build_lmcache_config(_storage_kv_transfer_config(config))
@@ -228,7 +254,21 @@ def _model_namespace(config: Any) -> str:
         cfg,
         world_size,
     )
-    return f"{page_namespace}::lmcache-mp-v{_MP_LAYOUT_VERSION}"
+    namespace = f"{page_namespace}::lmcache-mp-v{_MP_LAYOUT_VERSION}"
+    if checkpoint_spec is not None:
+        hf = getattr(config, "hf_config", None)
+        hf = getattr(hf, "text_config", hf)
+        document = {
+            "checkpoint": checkpoint_spec.to_wire(),
+            "hf_commit": getattr(hf, "_commit_hash", None),
+            "revision": getattr(config, "revision", None),
+            "model_revision": _extra_config(config).get("lmcache.mp.model_revision"),
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(document, sort_keys=True).encode()
+        ).hexdigest()[:32]
+        namespace += f"::native-state-v1-{fingerprint}"
+    return namespace
 
 
 def _parallel_strategy(config: Any, worker_id: int) -> Any:
@@ -247,7 +287,7 @@ def _parallel_strategy(config: Any, worker_id: int) -> Any:
     )
 
 
-def _make_scheduler_adapter(config: Any) -> Any:
+def _make_scheduler_adapter(config: Any, *, checkpoint_spec: Any = None) -> Any:
     import zmq
     from lmcache.integration.atom import AtomMPSchedulerAdapter
 
@@ -264,14 +304,18 @@ def _make_scheduler_adapter(config: Any) -> Any:
     return _ReaderAwareSchedulerAdapter(
         server_url=_server_urls(config)[0],
         context=zmq.Context.instance(),
-        model_name=_model_namespace(config),
+        model_name=(
+            _model_namespace(config)
+            if checkpoint_spec is None
+            else _model_namespace(config, checkpoint_spec=checkpoint_spec)
+        ),
         block_size=int(config.kv_cache_block_size),
         parallel_config=_parallel_strategy(config, 0),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
     )
 
 
-def _make_worker_adapter(config: Any, rank: int) -> Any:
+def _make_worker_adapter(config: Any, rank: int, *, checkpoint_spec: Any = None) -> Any:
     import zmq
     from lmcache.integration.atom import AtomMPWorkerAdapter
 
@@ -279,7 +323,11 @@ def _make_worker_adapter(config: Any, rank: int) -> Any:
     return AtomMPWorkerAdapter(
         server_url=_server_urls(config)[0],
         context=zmq.Context.instance(),
-        model_name=_model_namespace(config),
+        model_name=(
+            _model_namespace(config)
+            if checkpoint_spec is None
+            else _model_namespace(config, checkpoint_spec=checkpoint_spec)
+        ),
         block_size=int(config.kv_cache_block_size),
         parallel_config=_parallel_strategy(config, rank),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
@@ -935,7 +983,7 @@ class LMCacheMPConnector(KVConnectorBase):
 class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     """Scheduler-side LMCache MP connector for generic PAGE offload."""
 
-    def __init__(self, config: Any) -> None:
+    def __init__(self, config: Any, *, checkpoint_spec: Any = None) -> None:
         _validate_mp_config(config)
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         validated_kv_role(kvc)
@@ -944,7 +992,11 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             config.kv_cache_block_size,
             minimum=1,
         )
-        adapter = _make_scheduler_adapter(config)
+        adapter = (
+            _make_scheduler_adapter(config)
+            if checkpoint_spec is None
+            else _make_scheduler_adapter(config, checkpoint_spec=checkpoint_spec)
+        )
         try:
             extra = _extra_config(config)
             timeout = float(extra.get("lmcache.mp.lookup_timeout", 30.0))
@@ -965,6 +1017,10 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             if callable(shutdown):
                 shutdown()
             raise
+
+    def save_abandon_timeout_s(self) -> float:
+        """A timeout cannot prove that a remote MP DMA stopped reading HBM."""
+        return 0.0
 
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
         matched = super().get_num_new_matched_tokens(seq)

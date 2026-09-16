@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict, deque
-from collections.abc import Iterator, Mapping
+from collections.abc import Hashable, Iterator, Mapping
 from dataclasses import dataclass
 from time import monotonic
 
@@ -134,6 +134,9 @@ class _OffloadPin:
     checkpoint_id: int
     pinned_at: float
     source_released: bool = False
+    # Explicit connector leases may still have DMA reading their PAGE units
+    # after a timeout. Only a release or terminal completion can end them.
+    timeout_reclaimable: bool = True
 
 
 class PageUnitCheckpointStore:
@@ -491,13 +494,9 @@ class PageUnitCheckpointStore:
                 # cannot spin this call.
                 deferred.append(checkpoint_id)
                 continue
-            self._offload_generation += 1
-            op = StateStoreOperationId(
-                int(record.prefix_hash), self._offload_generation
+            out.append(
+                self._pin_offload_source(checkpoint_id, timeout_reclaimable=True)
             )
-            record.pin_count += 1
-            self._offload_pins[op] = _OffloadPin(checkpoint_id, monotonic())
-            out.append((op, record.unit_ids))
         # Re-queue the deferred nominations for the next drain, once the
         # colliding in-flight generation has had a chance to settle. The drain
         # is `popleft()` (oldest at the left), so `extend` would append these
@@ -507,6 +506,43 @@ class PageUnitCheckpointStore:
         if deferred:
             self._offload_ready.extendleft(reversed(deferred))
         return out
+
+    def acquire_checkpoint_source(
+        self, prefix_hash: int, *, max_inflight: int | None = None
+    ) -> tuple[StateStoreOperationId, tuple[int, ...]] | None:
+        """Lease the existing READY image for an admitted external transfer.
+
+        The caller must finish scheduler admission and reserve its transfer
+        byte budget before acquiring this source. A lease pins the image's
+        existing PAGE units; it neither copies an Active Slot nor queues a
+        checkpoint. Missing, COPYING, or already dispatched hashes return
+        None, as does a full optional operation limit. The limit includes
+        operations whose source was released but whose result is outstanding.
+
+        Release with `release_offload_store_source` once every reader has
+        stopped, then `settle_offload_store` on terminal completion. Settlement
+        can also release a source for a transfer known to have stopped or never
+        started. These leases are never reclaimed by elapsed time: a missing
+        report cannot prove that another process has stopped its DMA.
+        """
+        if max_inflight is not None and len(self._offload_pins) >= max_inflight:
+            return None
+        checkpoint_id = self.lookup(prefix_hash)
+        if checkpoint_id < 0 or self._hash_in_flight(prefix_hash):
+            return None
+        return self._pin_offload_source(checkpoint_id, timeout_reclaimable=False)
+
+    def _pin_offload_source(
+        self, checkpoint_id: int, *, timeout_reclaimable: bool
+    ) -> tuple[StateStoreOperationId, tuple[int, ...]]:
+        record = self.records[checkpoint_id]
+        self._offload_generation += 1
+        op = StateStoreOperationId(int(record.prefix_hash), self._offload_generation)
+        record.pin_count += 1
+        self._offload_pins[op] = _OffloadPin(
+            checkpoint_id, monotonic(), timeout_reclaimable=timeout_reclaimable
+        )
+        return op, record.unit_ids
 
     def _hash_in_flight(self, prefix_hash: int) -> bool:
         """Whether some generation of `prefix_hash` is already pinned.
@@ -606,12 +642,18 @@ class PageUnitCheckpointStore:
         `BlockManager.settle_state_store` refuses to index it. The reclaim
         recovers the memory and forfeits the entry, which is the only pair of
         outcomes this can honestly offer.
+
+        Explicit `acquire_checkpoint_source` leases are excluded. Their
+        connector must confirm source release or terminal completion; the
+        legacy nomination path's timeout policy does not apply to them.
         """
         if timeout_s <= 0 or not self._offload_pins:
             return 0
         cutoff = monotonic() - timeout_s
         stale = [
-            op for op, pin in self._offload_pins.items() if pin.pinned_at <= cutoff
+            op
+            for op, pin in self._offload_pins.items()
+            if pin.timeout_reclaimable and pin.pinned_at <= cutoff
         ]
         for op in stale:
             pin = self._offload_pins.pop(op)
@@ -773,6 +815,10 @@ class PagedStateCheckpointCoordinator:
         # for -- that is one boundary reached twice, not two boundaries.
         self._pending: dict[tuple[int, int], tuple[Sequence, int]] = {}
         self._store_ops: list[CheckpointStoreOp] = []
+        # External loads write temporary PAGE images before a runner gathers
+        # them into an Active Slot. Owners include a transfer generation, so a
+        # late release can never release a newer reservation.
+        self._transfer_units: dict[Hashable, tuple[int, ...]] = {}
         self.checkpoints_kept = 0
         self.checkpoints_dropped = 0
         self.checkpoints_orphaned = 0
@@ -920,6 +966,35 @@ class PagedStateCheckpointCoordinator:
     def ensure_free_units(self, count: int) -> bool:
         return self.store.ensure_free_units(count)
 
+    def reserve_transfer_units(self, owner: Hashable) -> tuple[int, ...] | None:
+        """Reserve one raw checkpoint image for an admitted external load.
+
+        `owner` must uniquely identify this transfer attempt, including its
+        generation. Duplicate active owners and insufficient available units
+        are refused. The caller reserves its byte budget before this call and
+        releases these units only after both the transfer and restore stop
+        using them. No checkpoint is published and no Active Slot is touched.
+        """
+        if owner is None:
+            raise ValueError("a transfer reservation needs an owner")
+        if owner in self._transfer_units:
+            return None
+        if not self.store.ensure_free_units(self.store.units_per_checkpoint):
+            return None
+        units = self.store.pool.reserve_units(
+            self.store.units_per_checkpoint, ("state-transfer", owner)
+        )
+        if units is None:
+            return None
+        self._transfer_units[owner] = tuple(units)
+        return self._transfer_units[owner]
+
+    def release_transfer_units(self, owner: Hashable) -> None:
+        """Release a completed or safely cancelled load reservation, once."""
+        units = self._transfer_units.pop(owner, None)
+        if units is not None:
+            self.store.pool.release_units(units, ("state-transfer", owner))
+
     def contains(self, h: int) -> bool:
         """Whether HBM holds a READY image for `h` right now.
 
@@ -951,6 +1026,14 @@ class PagedStateCheckpointCoordinator:
     ) -> list[tuple[StateStoreOperationId, tuple[int, ...]]]:
         """`(operation, unit_ids)` to hand the tier now. See the store."""
         return self.store.take_offload_stores(max_inflight)
+
+    def acquire_checkpoint_source(
+        self, prefix_hash: int, *, max_inflight: int | None = None
+    ) -> tuple[StateStoreOperationId, tuple[int, ...]] | None:
+        """Lease an admitted transfer's exact READY image. See the store."""
+        return self.store.acquire_checkpoint_source(
+            prefix_hash, max_inflight=max_inflight
+        )
 
     def release_offload_store_source(self, op: StateStoreOperationId) -> None:
         """The gather drained; hand the units back but keep the pin. See store."""

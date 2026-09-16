@@ -1869,6 +1869,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         elem_fp32 = 4
 
         block_regions: list[KVTransferRegion] = []
+        block_tensor_views: list[torch.Tensor] = []
         swa_block_regions: list[KVTransferRegion] = []
         slot_regions: list[KVTransferRegion] = []
 
@@ -1894,6 +1895,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             )
         )
         for plane, row_bytes, role in planes:
+            if not plane.is_contiguous():
+                raise RuntimeError("a KV plane must be contiguous to be transferred")
+            # Retain the real allocation owner, excluding the reverse-indexed
+            # SLOT tail. One opaque physical slot represents one scheduler
+            # PAGE; envelope rows span multiple layers, not logical tokens.
+            block_tensor_views.append(
+                plane[: self.num_blocks * geo.envelope_rows].view(
+                    self.num_blocks,
+                    1,
+                    geo.block_bytes(row_bytes) // plane.element_size(),
+                )
+            )
             block_regions.append(
                 KVTransferRegion(
                     plane.data_ptr(),
@@ -1914,6 +1927,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     raise RuntimeError(
                         "a CSA indexer layer must be contiguous to be transferred"
                     )
+                block_tensor_views.append(view.view(self.num_blocks, 1, view.stride(0)))
                 block_regions.append(
                     KVTransferRegion(
                         view.data_ptr(),
@@ -1993,6 +2007,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             staging_pool_size=pool_size if staging_region else 0,
             gather_slot=gather_slot,
             scatter_slot=scatter_slot,
+            block_tensor_views=block_tensor_views,
+            paged_state_checkpoint_spec=checkpoint_spec,
+            execute_paged_state_copies=self.execute_paged_state_copies,
         )
 
     # ------------------------------------------------------------------ #

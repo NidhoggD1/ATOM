@@ -152,12 +152,18 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._active_load_operations.pop(sid, None)
         self._load_lifecycles[sid] = seq
 
+    def _lookup_token_ids(self, seq) -> list[int]:
+        """The prompt extent this layout can safely ask the tier to resume."""
+        return list(seq.token_ids[: seq.num_prompt_tokens])
+
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
         if not self._do_load or self._lookup_client is None:
             return 0, False
         self._begin_load_lifecycle(seq)
         num_prompt = seq.num_prompt_tokens
-        token_ids = list(seq.token_ids[:num_prompt])
+        token_ids = self._lookup_token_ids(seq)
+        if not token_ids:
+            return 0, False
         sid = str(seq.id)
         pending = self._lookup_results.get(sid)
         if pending is not None and pending[0] is not seq:
@@ -303,6 +309,30 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """Return whether another save may be emitted this scheduler step."""
         return True
 
+    def _new_load_operation(self, seq) -> LoadOperationId:
+        operation = LoadOperationId(seq.id, self._load_nonce)
+        self._load_nonce += 1
+        return operation
+
+    def _build_save_request(
+        self,
+        seq,
+        saved: int,
+        aligned: int,
+        operation: SaveOperationId,
+        block_ids: list[int],
+        is_last_prefill: bool,
+    ) -> LMCacheReqMeta | None:
+        """Admit any layout-specific sources before advancing the watermark."""
+        return LMCacheReqMeta(
+            req_id=seq.id,
+            token_ids=list(seq.token_ids[:aligned]),
+            block_ids=block_ids,
+            save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
+            is_last_prefill=is_last_prefill,
+            save_operation=operation,
+        )
+
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         meta = LMCacheOffloadMetadata()
 
@@ -352,8 +382,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             )
             loading_sids.add(sid)
             self._load_save_floors[sid] = self._chunk_floor(hbm)
-            load_operation = LoadOperationId(seq.id, self._load_nonce)
-            self._load_nonce += 1
+            load_operation = self._new_load_operation(seq)
             seq._load_operation = load_operation
             self._active_load_operations[sid] = (seq, load_operation)
             self._track_load_statistics(load_operation, lmc - hbm)
@@ -377,7 +406,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         # Saves: store fully computed prompt chunks. Under scheduler-side
         # chunked prefill, seq.num_cached_tokens advances after each prefill
         # chunk's forward has completed; use it as the D2H-safe frontier.
-        chunk = self.chunk_size or 256
         tracker_sids = list(self._save_tracker.keys())
         if tracker_sids and self._save_rr_last in self._save_tracker:
             start = (tracker_sids.index(self._save_rr_last) + 1) % len(tracker_sids)
@@ -404,7 +432,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 int(seq.num_prompt_tokens),
             )
             is_last_prefill = computed >= int(seq.num_prompt_tokens)
-            aligned = (computed // chunk) * chunk
+            aligned = self._save_frontier(seq)
             if aligned <= saved:
                 continue
             logger.debug(
@@ -417,20 +445,16 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             )
             save_operation = SaveOperationId(seq.id, self._save_nonce)
             self._save_nonce += 1
-            self._track_save_statistics(save_operation, aligned - saved)
             block_ids = list(
                 getattr(seq, "_offload_finished_block_ids", seq.block_table)
             )
-            meta.add_request(
-                LMCacheReqMeta(
-                    req_id=seq.id,
-                    token_ids=list(seq.token_ids[:aligned]),
-                    block_ids=block_ids,
-                    save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
-                    is_last_prefill=is_last_prefill,
-                    save_operation=save_operation,
-                )
+            request = self._build_save_request(
+                seq, saved, aligned, save_operation, block_ids, is_last_prefill
             )
+            if request is None:
+                continue
+            self._track_save_statistics(save_operation, aligned - saved)
+            meta.add_request(request)
             entry[1] = aligned
             self._save_inflight[sid] = save_operation
             self._save_rr_last = sid
