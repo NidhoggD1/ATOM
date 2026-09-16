@@ -49,9 +49,6 @@ class Adapter:
         self.ended = []
         self.closed = False
 
-    def get_server_config(self):
-        return {"separate_object_groups": False, "supports_null_block_id": True}
-
     def maybe_submit_lookup_request(self, request_id, token_ids):
         self.queries.append((request_id, list(token_ids)))
 

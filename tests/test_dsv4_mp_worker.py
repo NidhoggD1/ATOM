@@ -221,21 +221,9 @@ def test_native_server_chunk_mismatch_fails_before_registration(monkeypatch):
         "build_lmcache_config",
         lambda _: SimpleNamespace(chunk_size=256),
     )
-    adapter = SimpleNamespace(
-        get_server_config=lambda: {
-            "separate_object_groups": False,
-            "supports_null_block_id": True,
-        },
-        lmcache_tokens_per_chunk=512,
-    )
+    adapter = SimpleNamespace(lmcache_tokens_per_chunk=512)
     with pytest.raises(ValueError, match="must match"):
         require_native_server(adapter, config())
-
-
-def test_native_server_capabilities_fail_closed():
-    flags = {"separate_object_groups": False, "supports_null_block_id": False}
-    with pytest.raises(ValueError):
-        require_native_server(SimpleNamespace(get_server_config=lambda: flags))
 
 
 def test_native_namespace_changes_with_image_codec(monkeypatch):

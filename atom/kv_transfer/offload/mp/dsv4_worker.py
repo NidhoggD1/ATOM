@@ -33,10 +33,7 @@ DSV4_MP_STORE_CHANNEL = "dsv4_mp_store"
 
 
 def require_native_server(adapter: Any, config: Any = None) -> None:
-    """Refuse servers that cannot express the complete native PAGE/STATE pair."""
-    capabilities = adapter.get_server_config()
-    if capabilities.get("supports_null_block_id") is not True:
-        raise ValueError("DSV4 lmcache_mp requires per-group null_block_id support")
+    """Validate native transfer geometry shared with the LMCache server."""
     if config is not None:
         configured_chunk = int(
             offcfg.build_lmcache_config(_storage_kv_transfer_config(config)).chunk_size

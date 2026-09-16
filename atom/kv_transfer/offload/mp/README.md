@@ -9,8 +9,8 @@ keeps its normal fixed SLOT while running.
 
 Install the matching ATOM and LMCache changes. The LMCache build must include
 per-group `null_block_id`, automatic object grouping for non-default null
-policies, and the `get_server_config` capability query. Run the MP server on the
-same host, with GPU IPC access to the ATOM worker allocations:
+policies, and sparse null handling. Run the MP server on the same host, with GPU
+IPC access to the ATOM worker allocations:
 
 ```bash
 lmcache server --host 127.0.0.1 --port 5555 \
