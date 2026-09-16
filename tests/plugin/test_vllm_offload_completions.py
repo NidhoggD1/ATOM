@@ -516,6 +516,4 @@ def test_a_scheduler_without_the_hook_never_reclaims():
         _finish(adapter)
         assert adapter._collect_releases() == []
     finally:
-        type(scheduler).save_abandon_timeout_s = (
-            lambda self: self.abandon_timeout_s
-        )
+        type(scheduler).save_abandon_timeout_s = lambda self: self.abandon_timeout_s
