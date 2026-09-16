@@ -35,8 +35,6 @@ DSV4_MP_STORE_CHANNEL = "dsv4_mp_store"
 def require_native_server(adapter: Any, config: Any = None) -> None:
     """Refuse servers that cannot express the complete native PAGE/STATE pair."""
     capabilities = adapter.get_server_config()
-    if capabilities.get("separate_object_groups") is not True:
-        raise ValueError("DSV4 lmcache_mp requires server --separate-object-groups")
     if capabilities.get("supports_null_block_id") is not True:
         raise ValueError("DSV4 lmcache_mp requires per-group null_block_id support")
     if config is not None:

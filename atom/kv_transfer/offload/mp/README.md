@@ -8,12 +8,13 @@ keeps its normal fixed SLOT while running.
 ## Run
 
 Install the matching ATOM and LMCache changes. The LMCache build must include
-per-group `null_block_id` and the `get_server_config` capability query. Run the
-MP server on the same host, with GPU IPC access to the ATOM worker allocations:
+per-group `null_block_id`, automatic object grouping for non-default null
+policies, and the `get_server_config` capability query. Run the MP server on the
+same host, with GPU IPC access to the ATOM worker allocations:
 
 ```bash
 lmcache server --host 127.0.0.1 --port 5555 \
-  --chunk-size 256 --separate-object-groups \
+  --chunk-size 256 \
   --supported-transfer-mode lmcache_driven --l1-size-gb 64
 ```
 
@@ -62,7 +63,8 @@ Engine group 0 contains PAGE views and declares `null_block_id=None`, so PAGE 0
 is ordinary data. Native image ordinal `j` uses engine group `1+j`, aliases the
 same PAGE allocation, and declares a one-chunk recurrent window with null ID
 `-1`. Every ordinal is present at the checkpoint endpoint; earlier chunks use
-all-null STATE groups. LMCache groups all ordinals into one STATE object.
+all-null STATE groups. The non-default null policies make LMCache automatically
+separate PAGE from STATE and group all STATE ordinals into one object.
 The final image region is trimmed at `image_bytes`, preserving the original
 physical PAGE stride.
 

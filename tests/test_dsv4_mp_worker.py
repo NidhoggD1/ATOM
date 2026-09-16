@@ -223,7 +223,7 @@ def test_native_server_chunk_mismatch_fails_before_registration(monkeypatch):
     )
     adapter = SimpleNamespace(
         get_server_config=lambda: {
-            "separate_object_groups": True,
+            "separate_object_groups": False,
             "supports_null_block_id": True,
         },
         lmcache_tokens_per_chunk=512,
@@ -232,14 +232,8 @@ def test_native_server_chunk_mismatch_fails_before_registration(monkeypatch):
         require_native_server(adapter, config())
 
 
-@pytest.mark.parametrize(
-    "flags",
-    [
-        {"separate_object_groups": False, "supports_null_block_id": True},
-        {"separate_object_groups": True, "supports_null_block_id": False},
-    ],
-)
-def test_native_server_capabilities_fail_closed(flags):
+def test_native_server_capabilities_fail_closed():
+    flags = {"separate_object_groups": False, "supports_null_block_id": False}
     with pytest.raises(ValueError):
         require_native_server(SimpleNamespace(get_server_config=lambda: flags))
 

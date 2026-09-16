@@ -297,9 +297,7 @@ def test_actual_lmcache_registration_preserves_native_aliases_and_stride():
     normalized, formats = normalize_and_discover_per_layer_formats(
         list(layout.tensors), layout.layer_groups, EngineType.ATOM
     )
-    manager = KVLayerGroupsManager(
-        normalized, formats, groups, 16, separate_object_groups=True
-    )
+    manager = KVLayerGroupsManager(normalized, formats, groups, 16)
     assert [tuple(group.layer_indices) for group in manager.kernel_groups] == list(
         layout.layer_groups
     )
