@@ -21,6 +21,7 @@ from atom.model_ops.attentions.gdn_attn import (
 from atom.model_ops.fla_ops import fused_recurrent_gated_delta_rule
 from atom.model_ops.mamba_ops.causal_conv1d import causal_conv1d_update
 from atom.plugin.sglang.attention_backend.backend_resolver import (
+    real_batch_size,
     reconstruct_linear_metadata,
     resolve_attn_backend,
     resolve_mamba_req_pool,
@@ -498,6 +499,22 @@ class SGLangGDNForwardContext:
             query_start_loc, idx = reconstructed
         device = query_start_loc.device
         idx = idx.to(dtype=torch.int32, device=device)
+        live_bs = real_batch_size(forward_batch)
+        if live_bs < idx.shape[0]:
+            # CUDA-graph / DP pad rows keep a finished request's mamba slot.
+            # Clone so we do not mutate HybridLinearAttnBackend's static buffer
+            # after it has already written -1 sentinels for this replay.
+            idx = idx.clone()
+            idx[live_bs:] = -1
+        # Decode pads are 1 token/row, so cu_seqlens must stop at live_bs.
+        # Extend reconstruct already ends at the last real request's token.
+        if (
+            mode.is_decode_or_idle()
+            and live_bs < bs
+            and query_start_loc.numel() > live_bs + 1
+        ):
+            query_start_loc = query_start_loc.clone()
+            query_start_loc[live_bs + 1 :] = live_bs
         common_kwargs = {
             "num_spec_decodes": 0,
             "num_spec_decode_tokens": 0,
@@ -567,6 +584,7 @@ class SGLangGDNForwardContext:
 
         metadata = SGLangForwardBatchMetadata.build(forward_batch_or_metadata)
         if metadata is None or metadata.forward_batch is None:
+            logger.warning("SGLang GDN forward context: metadata/forward_batch missing")
             return None
 
         forward_batch = metadata.forward_batch
@@ -582,10 +600,41 @@ class SGLangGDNForwardContext:
         linear_backend = cls._linear_attn_backend(attn_backend)
         gdn_metadata = cls._build_gdn_metadata(forward_batch, linear_backend)
         if gdn_metadata is None and not forward_batch.forward_mode.is_target_verify():
+            fm = getattr(linear_backend, "forward_metadata", None)
+            pool = resolve_mamba_req_pool(forward_batch, linear_backend)
+            logger.warning(
+                "SGLang GDN forward context: gdn_metadata build failed "
+                "(mode=%s linear_backend=%s forward_metadata=%s "
+                "mamba_pool=%s mamba_map=%s)",
+                getattr(forward_batch.forward_mode, "name", forward_batch.forward_mode),
+                type(linear_backend).__name__,
+                None
+                if fm is None
+                else (
+                    hasattr(fm, "query_start_loc"),
+                    hasattr(fm, "mamba_cache_indices"),
+                ),
+                None if pool is None else type(pool).__name__,
+                None if pool is None else getattr(pool, "mamba_map", None),
+            )
             return None
 
         kv_cache_data = cls._build_kv_cache_tensors(forward_batch, linear_backend)
         if not kv_cache_data:
+            pool = resolve_mamba_req_pool(forward_batch, linear_backend)
+            logger.warning(
+                "SGLang GDN forward context: empty kv_cache_data "
+                "(linear_backend=%s mamba_pool=%s attrs=%s)",
+                type(linear_backend).__name__,
+                None if pool is None else type(pool).__name__,
+                None
+                if pool is None
+                else sorted(
+                    a
+                    for a in dir(pool)
+                    if "mamba" in a.lower() or a in ("size", "mamba_map")
+                )[:40],
+            )
             return None
 
         context, num_tokens = cls._build_context(forward_batch)
