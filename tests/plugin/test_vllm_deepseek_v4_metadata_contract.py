@@ -49,3 +49,24 @@ def test_vllm_decode_hca_indices_use_unified_geometry_rows():
         "tl.store(hca_indices_ptr + base + k, bt * envelope_rows, mask=mask)"
         in OPS_SOURCE
     )
+
+
+def test_vllm_decode_graph_waits_for_metadata_staging_fence():
+    assert "def mark_ready(self):" in BRIDGE_SOURCE
+    assert "bufs.mark_ready()" in BRIDGE_SOURCE
+    assert "torch.cuda.synchronize()" in BRIDGE_SOURCE
+    assert "in_hipgraph = False" in BRIDGE_SOURCE
+    assert "_is_vllm_decode_graph_phase" not in BRIDGE_SOURCE
+    assert "decode_bufs.wait_ready()" not in BRIDGE_SOURCE
+
+
+def test_vllm_binds_v4_proxy_before_cudagraph_capture():
+    assert "def prepare_deepseek_v4_decode_graph_state(" in BRIDGE_SOURCE
+    prefix = (
+        Path(__file__).parents[2] / "atom/plugin/vllm/deepseek_v4_prefix_patch.py"
+    ).read_text()
+    assert "bind_deepseek_v4_proxy_cache_views" in prefix
+    wrapper = (
+        Path(__file__).parents[2] / "atom/plugin/vllm/model_wrapper.py"
+    ).read_text()
+    assert "prepare_deepseek_v4_decode_graph_state(" in wrapper

@@ -155,6 +155,24 @@ def apply_vllm_v4_profile_cache_patch() -> None:
             self.compilation_config.static_forward_context,
             is_profiling,
         )
+        # FULL CUDA/HIP-graph capture builds V4 attention metadata *before* the
+        # first captured forward. Bind persistent decode buffers and proxy KV
+        # views here so that capture stages into stable addresses instead of
+        # allocating ephemeral tensors that the graph then replays as garbage.
+        if not is_profiling:
+            wrapper = getattr(self, "model", None)
+            layer_name = getattr(wrapper, "_deepseek_v4_proxy_layer_name", None)
+            atom_model = getattr(wrapper, "model", None)
+            if layer_name and atom_model is not None:
+                from atom.plugin.vllm.deepseek_v4_bridge import (
+                    bind_deepseek_v4_proxy_cache_views,
+                )
+
+                bind_deepseek_v4_proxy_cache_views(
+                    atom_model,
+                    self.vllm_config,
+                    layer_name,
+                )
         return result
 
     wrapped_initialize_kv_cache._atom_v4_profile_cache_patched = True

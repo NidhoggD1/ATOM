@@ -474,9 +474,7 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
         # bucket so the ``batch_id == -1`` sentinel tail covers the padded rows
         # the fused decode ``qk_norm_rope`` iterates over.
         cc = getattr(vllm_config, "compilation_config", None)
-        self._cg_token_sizes = sorted(
-            {int(s) for s in (getattr(cc, "cudagraph_capture_sizes", None) or [])}
-        )
+        self._cg_token_sizes = _v4_cg_token_sizes(vllm_config)
 
     def build(
         self, common_prefix_len: int, common_attn_metadata, fast_build: bool = False
@@ -552,7 +550,8 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
             capturing=capturing,
             req_ids=req_ids,
             num_spec_tokens=self._num_spec_tokens,
-            cudagraph_token_sizes=self._cg_token_sizes,
+            cudagraph_token_sizes=self._cg_token_sizes
+            or _v4_cg_token_sizes(self.vllm_config),
         )
         # Native ATOM enables V4 compressor side-stream launches only while the
         # forward is being captured into a HIP/CUDA graph. vLLM builds this metadata
@@ -868,6 +867,29 @@ class _V4DecodeMetaBuffers:
                 "compress": i32(cap, 4),
                 "write": i32(max(1, T), 4),
             }
+        # Recorded after the last metadata H2D / index kernel of a decode
+        # ``build()``. vLLM may then replay a HIP/CUDA graph on a different
+        # stream; the forward waits this event so it cannot read a stale
+        # metadata snapshot.
+        self._ready_event = None
+
+    def _sync_host(self, buf):
+        """Block CPU overwrite of pinned staging until the previous DMA done.
+
+        ``CpuGpuBuffer.copy_to_gpu`` is ``non_blocking=True``. Native ATOM
+        uses ``_gate_staging_reuse`` for the same race: rewriting ``buf.np``
+        while the last H2D is still in flight corrupts the GPU view.
+        """
+        event = getattr(buf, "_h2d_event", None)
+        if event is not None:
+            event.synchronize()
+
+    def _record_h2d(self, buf):
+        event = getattr(buf, "_h2d_event", None)
+        if event is None:
+            event = torch.cuda.Event()
+            buf._h2d_event = event
+        event.record()
 
     def stage(self, buf, arr_np):
         """Copy ``arr_np`` into the head of CpuGpuBuffer ``buf`` and return the
@@ -876,9 +898,75 @@ class _V4DecodeMetaBuffers:
         assert (
             n <= buf.np.shape[0]
         ), f"V4 decode buffer too small: need {n}, have {buf.np.shape[0]}"
+        self._sync_host(buf)
         if n:
             buf.np[:n] = arr_np
-        return buf.copy_to_gpu(n)
+        view = buf.copy_to_gpu(n)
+        self._record_h2d(buf)
+        return view
+
+    def copy_staged(self, buf, n):
+        """DMA a host buffer that the caller already filled; record the H2D."""
+        view = buf.copy_to_gpu(n)
+        self._record_h2d(buf)
+        return view
+
+    def mark_ready(self):
+        """Fence the decode-metadata stream so graph replay can wait on it."""
+        if self._ready_event is None:
+            self._ready_event = torch.cuda.Event()
+        self._ready_event.record()
+
+
+def _v4_cg_token_sizes(vllm_config) -> list[int]:
+    cc = getattr(vllm_config, "compilation_config", None)
+    return sorted(
+        {int(s) for s in (getattr(cc, "cudagraph_capture_sizes", None) or [])}
+    )
+
+
+def prepare_deepseek_v4_decode_graph_state(
+    model,
+    vllm_config,
+    *,
+    device: torch.device | None = None,
+    proxy_layer_name: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+) -> None:
+    """Point the V4 proxy at the live model before CUDA/HIP-graph capture.
+
+    Decode buffers and KV views are bound from ``initialize_kv_cache`` (real
+    cache, not the profiling stub) so ``build_for_cudagraph_capture`` stages
+    into persistent addresses. This only publishes the model pointer the
+    metadata builder needs to find those buffers.
+    """
+    sfc = vllm_config.compilation_config.static_forward_context
+    proxy = sfc.get(proxy_layer_name)
+    if isinstance(proxy, AtomDeepseekV4ProxyAttention):
+        proxy._atom_v4_model = model
+    num_slots = max(1, int(vllm_config.scheduler_config.max_num_seqs))
+    if not hasattr(model, "_atom_v4_slot_allocator"):
+        model._atom_v4_slot_allocator = _V4StateSlotAllocator(num_slots)
+    if device is None or hasattr(model, "_atom_v4_decode_bufs"):
+        return
+    if device.type == "cpu":
+        return
+    ratios = [int(r) for r in model.args.compress_ratios]
+    max_spec = _v4_max_spec_steps(vllm_config)
+    capture_max = max(_v4_cg_token_sizes(vllm_config) or [0])
+    max_decode_tokens = max(num_slots * (1 + max_spec), capture_max, 1)
+    max_model_len = int(vllm_config.model_config.max_model_len)
+    max_committed_hca = max(1, (max_model_len + 127) // 128)
+    ratios_overlap = [(r, r == 4) for r in sorted(set(ratios)) if r > 0]
+    model._atom_v4_decode_bufs = _V4DecodeMetaBuffers(
+        num_slots=num_slots,
+        max_decode_tokens=max_decode_tokens,
+        window=int(model.args.window_size),
+        index_topk=int(getattr(model.args, "index_topk", 1024)),
+        max_committed_hca=max_committed_hca,
+        ratios_overlap=ratios_overlap,
+        device=device,
+        max_blocks=max_committed_hca,
+    )
 
 
 def bind_deepseek_v4_proxy_cache_views(
@@ -1589,6 +1677,8 @@ def build_atom_v4_attention_metadata(
             md.qo_indptr = bufs.qo_indptr.copy_to_gpu(T_pad + 1)
             bufs.kv_last_page_lens.np[:T_pad] = 1
             md.kv_last_page_lens = bufs.kv_last_page_lens.copy_to_gpu(T_pad)
+        bufs.mark_ready()
+        torch.cuda.synchronize()
         return md
 
     # ---- eager path: prefill, or decode without persistent buffers ----
@@ -2047,51 +2137,6 @@ def get_deepseek_v4_proxy_metadata_from_vllm_context(
     return None
 
 
-def _is_vllm_decode_graph_phase(attn_metadata, atom_config) -> bool:
-    """True when vLLM is inside its CUDA-graph capture window for V4 decode.
-
-    vLLM sets ``cudagraph_capturing_enabled=True`` around both the eager warmup
-    and the actual capture. The flag is global and defaults to True, so narrow
-    it to real V4 decode-shaped forwards before mapping it to ATOM's
-    ``in_hipgraph``.
-    """
-    if getattr(getattr(attn_metadata, "state", None), "value", None) != "decode":
-        return False
-    try:
-        import vllm.compilation.monitor as vllm_monitor
-        from vllm.config import CUDAGraphMode
-        from vllm.forward_context import (
-            get_forward_context,
-            is_forward_context_available,
-        )
-
-        vllm_config = getattr(
-            getattr(atom_config, "plugin_config", None), "vllm_config", None
-        )
-        if vllm_config is None:
-            return False
-        if getattr(getattr(vllm_config, "model_config", None), "enforce_eager", False):
-            return False
-        compilation_config = getattr(vllm_config, "compilation_config", None)
-        if getattr(compilation_config, "cudagraph_mode", None) == CUDAGraphMode.NONE:
-            return False
-        if not is_forward_context_available():
-            return False
-        vllm_ctx = get_forward_context()
-        batch_descriptor = getattr(vllm_ctx, "batch_descriptor", None)
-        is_uniform_decode_bucket = bool(
-            batch_descriptor is not None and getattr(batch_descriptor, "uniform", False)
-        )
-        is_single_query_decode = int(getattr(attn_metadata, "max_seqlen_q", 0)) == 1
-        if not (is_uniform_decode_bucket or is_single_query_decode):
-            return False
-        return bool(getattr(vllm_monitor, "cudagraph_capturing_enabled", False))
-    # A predicate over another engine's internals: anything it raises means
-    # "cannot tell", and the safe answer to that is False.
-    except Exception:  # noqa: BLE001
-        return False
-
-
 @contextmanager
 def atom_deepseek_v4_forward_context(
     *,
@@ -2162,10 +2207,11 @@ def atom_deepseek_v4_forward_context(
             reset_slots = getattr(attn_metadata, "reset_slots", None)
             if reset_slots:
                 reset_deepseek_v4_state_slots(state_model, reset_slots)
-    in_hipgraph = not force_dummy and (
-        bool(getattr(attn_metadata, "in_hipgraph", False))
-        or _is_vllm_decode_graph_phase(attn_metadata, atom_config)
-    )
+    # vLLM HIP/CUDA graphs capture a single compute stream. ATOM's
+    # ``in_hipgraph`` gate turns on compressor side-streams; capturing those
+    # into a vLLM graph replays stale or empty compress work and garbles
+    # logits. Keep the vLLM plugin single-stream.
+    in_hipgraph = False
     is_prefill = not force_dummy and attn_metadata.state.value.startswith("prefill")
     batch_size = int(
         getattr(common_attn_metadata, "num_reqs", 0)

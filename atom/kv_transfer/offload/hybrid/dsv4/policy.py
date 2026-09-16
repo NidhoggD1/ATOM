@@ -17,7 +17,7 @@ import json
 import os
 import threading
 from collections import OrderedDict
-from collections.abc import Iterator, MutableSet
+from collections.abc import Collection, Iterator, MutableSet
 from dataclasses import dataclass
 from math import lcm
 from numbers import Integral
@@ -229,19 +229,27 @@ def select_pending_sidecar_boundary(
     start: int,
     end: int,
     committed_hashes,
-    inflight: tuple[object, int, int] | None,
+    inflight: Collection[tuple[int, int]] | None,
     failed: set[tuple[int, int]],
 ) -> tuple[int, int] | None:
-    """Select the earliest unpublished boundary crossed by a prefill chunk."""
+    """Select the earliest unpublished boundary crossed by a prefill chunk.
 
-    if inflight is not None:
-        return None
+    ``inflight`` carries the identities this request has already emitted but
+    not yet had confirmed.  Those are skipped rather than treated as a barrier:
+    a snapshot is only valid at the step where the computed frontier sits
+    exactly on the boundary, so a boundary blocked behind an unrelated
+    in-flight save can never be taken again.
+    """
+
+    pending = set(inflight or ())
 
     for boundary, boundary_hash in records:
         identity = (boundary, boundary_hash)
         if not int(start) < boundary <= int(end):
             continue
         if boundary_hash in committed_hashes or identity in failed:
+            continue
+        if identity in pending:
             continue
         return identity
     return None
@@ -303,6 +311,33 @@ def _committed_sidecar_capacity(kvc) -> int:
     if capacity <= 0:
         raise ValueError("committed sidecar index capacity must be a positive integer")
     return capacity
+
+
+def _resolve_slot_staging_slots(kvc) -> int:
+    """Resolve how many SLOT sidecar snapshots may be in flight per rank.
+
+    The default is 2 rather than 1 because a snapshot is only valid at the step
+    where the computed frontier sits exactly on a checkpoint boundary.  vLLM's
+    chunked prefill advances a whole chunk per engine step while a sidecar save
+    outlives that step, so a single row makes every second boundary unreachable
+    forever.  Each extra row costs one ``slot_bytes`` GPU staging buffer.
+    """
+
+    extra = (kvc or {}).get("kv_connector_extra_config", kvc or {}) or {}
+    configured = extra.get("slot_sidecar_staging_slots")
+    if configured is None:
+        configured = os.environ.get("OFFLOAD_SLOT_STAGING_SLOTS", "2")
+        try:
+            count = int(configured)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SLOT sidecar staging count must be an integer") from exc
+    else:
+        if isinstance(configured, bool) or not isinstance(configured, Integral):
+            raise ValueError("SLOT sidecar staging count must be an integer")
+        count = int(configured)
+    if count <= 0:
+        raise ValueError(f"SLOT sidecar staging count must be > 0, got {count}")
+    return count
 
 
 def _chained_prefix_hashes(

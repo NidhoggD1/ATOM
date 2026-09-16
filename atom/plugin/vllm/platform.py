@@ -18,6 +18,7 @@ disable_vllm_plugin = envs.ATOM_DISABLE_VLLM_PLUGIN
 # non-chunked fallback. Override with the env var below.
 _V4_MAX_SINGLE_FORWARD_TOKENS = 131072
 _V4_MAX_SINGLE_FORWARD_TOKENS_ENV = "ATOM_V4_MAX_SINGLE_FORWARD_TOKENS"
+_V4_EXPERIMENTAL_CUDAGRAPH_ENV = "ATOM_V4_EXPERIMENTAL_CUDAGRAPH"
 
 
 def _is_deepseek_v4(model_config) -> bool:
@@ -35,7 +36,12 @@ def _chunked_prefill_on(scheduler_config) -> bool:
 def _enforce_deepseek_v4_constraints(vllm_config) -> None:
     """Apply V4-specific plugin constraints.
 
-    1. Enable prefix caching via SWA recompute: V4's per-request SWA
+    1. Disable CUDA/HIP graph replay. ATOM's V4 attention path currently
+       produces corrupt logits when either PIECEWISE or FULL graph replay is
+       enabled, including for tiny prompts with no prefix-cache hit. Leave the
+       requested compilation mode unchanged; only graph replay is unsafe.
+
+    2. Enable prefix caching via SWA recompute: V4's per-request SWA
        sliding-window ring is not carried by vLLM's block-level prefix cache
        (only the CSA/HCA compressed pages are). Rather than disable caching, we
        install a KVCacheManager patch that, on a prefix hit, drops the last
@@ -43,7 +49,7 @@ def _enforce_deepseek_v4_constraints(vllm_config) -> None:
        re-forwarded and the ring is repopulated (mirrors native ATOM "fix B'").
        See ``deepseek_v4_prefix_patch``.
 
-    2. Guard the non-chunked oversized forward: with chunked prefill off, vLLM
+    3. Guard the non-chunked oversized forward: with chunked prefill off, vLLM
        couples max_num_batched_tokens to max_model_len, so a native max_model_len
        forces a single ~max_model_len-token forward that overflows int32 element
        offsets in per-token kernels. Fail fast with an actionable error instead
@@ -53,6 +59,22 @@ def _enforce_deepseek_v4_constraints(vllm_config) -> None:
     mc = getattr(vllm_config, "model_config", None)
     if mc is None or not _is_deepseek_v4(mc):
         return
+
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    if compilation_config is not None:
+        from vllm.config import CUDAGraphMode
+
+        requested_mode = getattr(compilation_config, "cudagraph_mode", None)
+        allow_experimental_graph = os.environ.get(
+            _V4_EXPERIMENTAL_CUDAGRAPH_ENV, "0"
+        ).lower() in ("1", "true", "yes")
+        if requested_mode != CUDAGraphMode.NONE and not allow_experimental_graph:
+            logger.warning(
+                "ATOM DeepSeek-V4: disabling cudagraph_mode=%s because graph "
+                "replay corrupts V4 logits; compilation mode is unchanged.",
+                getattr(requested_mode, "name", requested_mode),
+            )
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
     cache_config = getattr(vllm_config, "cache_config", None)
     if cache_config is not None and getattr(

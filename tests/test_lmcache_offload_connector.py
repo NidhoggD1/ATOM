@@ -2450,11 +2450,9 @@ def test_sidecar_save_emits_at_regular_checkpoint_boundary():
         boundary_block_hash=boundary_hash,
         source_group=2,
     )
-    assert sched._sidecar_save_inflight["706"] == (
-        request.save_operation,
-        16_384,
-        boundary_hash,
-    )
+    assert sched._sidecar_save_inflight["706"] == {
+        request.save_operation: (16_384, boundary_hash),
+    }
 
 
 def test_slot_save_waits_until_post_allocation_state_copy_forward_completes():
@@ -2580,10 +2578,9 @@ def test_page_save_inflight_still_cuts_and_emits_exact_sidecar_boundary():
         prior_operation,
         request.save_operation,
     }
-    assert sched._sidecar_save_inflight["721"][:2] == (
-        request.save_operation,
-        8192,
-    )
+    assert sched._sidecar_save_inflight["721"] == {
+        request.save_operation: (8192, request.slot_save_spec.boundary_block_hash),
+    }
 
 
 def test_save_callbacks_clear_only_matching_operation_generation():
@@ -2609,7 +2606,7 @@ def test_save_callbacks_clear_only_matching_operation_generation():
         SaveOperationId(seq.id, 0),
         SaveOperationId(seq.id, 1),
     }
-    assert sched._sidecar_save_inflight["725"][0] == SaveOperationId(seq.id, 1)
+    assert list(sched._sidecar_save_inflight["725"]) == [SaveOperationId(seq.id, 1)]
 
     sched.sidecar_save_finished(page.save_operation)
     assert "725" in sched._sidecar_save_inflight
@@ -2802,9 +2799,9 @@ def test_raw_callbacks_cannot_retire_exact_active_operations():
     stateful_sched.sidecar_save_finished(stateful_seq.id)
     stateful_sched.sidecar_save_failed(stateful_seq.id)
 
-    assert stateful_sched._sidecar_save_inflight["729"][0] == (
+    assert list(stateful_sched._sidecar_save_inflight["729"]) == [
         sidecar_request.save_operation
-    )
+    ]
     assert boundary_hash not in stateful_sched._committed_sidecar_hashes
     assert stateful_sched._failed_sidecar_saves == {}
 
@@ -2839,12 +2836,12 @@ def test_raw_callbacks_remain_compatible_with_legacy_operations():
     sched.save_finished(seq.id)
     assert sid not in sched._save_inflight
 
-    sched._sidecar_save_inflight[sid] = (seq.id, 8, 123)
+    sched._sidecar_save_inflight[sid] = {seq.id: (8, 123)}
     sched.sidecar_save_finished(seq.id)
     assert sid not in sched._sidecar_save_inflight
     assert 123 in sched._committed_sidecar_hashes
 
-    sched._sidecar_save_inflight[sid] = (seq.id, 8, 456)
+    sched._sidecar_save_inflight[sid] = {seq.id: (8, 456)}
     sched.sidecar_save_failed(seq.id)
     assert sid not in sched._sidecar_save_inflight
     assert sched._failed_sidecar_saves[sid] == {(8, 456)}
@@ -3317,7 +3314,7 @@ def test_sidecar_save_is_not_duplicated_while_inflight_or_after_commit():
     assert sched.build_connector_meta().requests == []
 
 
-def test_terminal_sidecar_is_emitted_after_earlier_inflight_boundary_completes():
+def test_terminal_sidecar_is_emitted_alongside_earlier_inflight_boundary():
     sched = _stateful_scheduler(hit=0)
     seq = _stateful_seq(
         req_id=720,
@@ -3335,17 +3332,19 @@ def test_terminal_sidecar_is_emitted_after_earlier_inflight_boundary_completes()
     seq.num_cached_tokens = 16_384
     sched.request_finished(seq)
     assert sched.should_defer_free(seq) is True
-    page_only = sched.build_connector_meta()
-    assert len(page_only.requests) == 1
-    assert page_only.requests[0].slot_save_spec is None
-    sched.save_finished(page_only.requests[0].save_operation)
-
-    sched.sidecar_save_finished(first_operation)
-    assert sched.should_defer_free(seq) is True
-
     terminal = sched.build_connector_meta()
     assert len(terminal.requests) == 1
     assert terminal.requests[0].slot_save_spec.boundary_tokens == 16_384
+    terminal_operation = terminal.requests[0].save_operation
+    assert set(sched._sidecar_save_inflight["720"]) == {
+        first_operation,
+        terminal_operation,
+    }
+
+    sched.sidecar_save_finished(first_operation)
+    sched.save_finished(first_operation)
+    assert sched.should_defer_free(seq) is True
+    assert list(sched._sidecar_save_inflight["720"]) == [terminal_operation]
 
 
 def test_sidecar_save_failure_clears_inflight_without_committing():
@@ -3425,11 +3424,9 @@ def test_tp_partial_sidecar_completion_never_commits():
     host._update_from_kv_xfer_finished(partial)
 
     assert boundary_hash not in sched._committed_sidecar_hashes
-    assert sched._sidecar_save_inflight["716"] == (
-        save_operation,
-        8192,
-        boundary_hash,
-    )
+    assert sched._sidecar_save_inflight["716"] == {
+        save_operation: (8192, boundary_hash),
+    }
 
     terminal = aggregator.aggregate(
         [
@@ -3594,11 +3591,9 @@ def test_prefill_chunk_does_not_recut_committed_or_inflight_boundary():
     assert sched.adjust_prefill_chunk_after_alloc(seq, 8192) == 8192
 
     sched._committed_sidecar_hashes.clear()
-    sched._sidecar_save_inflight["712"] = (
-        SaveOperationId(seq.id, 0),
-        16_384,
-        boundary_hash,
-    )
+    sched._sidecar_save_inflight["712"] = {
+        SaveOperationId(seq.id, 0): (16_384, boundary_hash),
+    }
     assert sched.adjust_prefill_chunk_after_alloc(seq, 8192) == 8192
 
 
@@ -3615,16 +3610,46 @@ def test_partial_prefill_resumes_and_captures_next_boundary_after_inflight_commi
     first = sched.build_connector_meta().requests[0]
     assert first.slot_save_spec.boundary_tokens == 8192
 
-    # The live SLOT was copied to connector-owned staging before the next
-    # forward, so B1 publication does not pause progress. A second sidecar is
-    # still suppressed until the exact B1 generation retires.
+    # A snapshot is only valid at the exact computed frontier, so B2 cannot wait
+    # behind B1. With two staging rows the second sidecar is emitted while the
+    # first save is still in flight.
     seq.num_cached_tokens = 16_384
-    assert sched._sidecar_save_candidate(seq, 16_384) is None
-
-    sched.sidecar_save_finished(first.save_operation)
-
     second = sched.build_connector_meta().requests[0]
     assert second.slot_save_spec.boundary_tokens == 16_384
+    assert set(sched._sidecar_save_inflight["731"]) == {
+        first.save_operation,
+        second.save_operation,
+    }
+
+    sched.sidecar_save_finished(first.save_operation)
+    assert list(sched._sidecar_save_inflight["731"]) == [second.save_operation]
+
+
+def test_three_sidecar_boundaries_can_be_inflight_without_burning_the_third():
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=733,
+        num_prompt_tokens=24_576,
+        num_cached_tokens=8192,
+        group=2,
+    )
+    sched._save_tracker["733"] = [seq, 8192]
+
+    first = sched.build_connector_meta().requests[0]
+    assert first.slot_save_spec.boundary_tokens == 8192
+
+    seq.num_cached_tokens = 16_384
+    second = sched.build_connector_meta().requests[0]
+    assert second.slot_save_spec.boundary_tokens == 16_384
+
+    seq.num_cached_tokens = 24_576
+    third = sched.build_connector_meta().requests[0]
+    assert third.slot_save_spec.boundary_tokens == 24_576
+    assert set(sched._sidecar_save_inflight["733"]) == {
+        first.save_operation,
+        second.save_operation,
+        third.save_operation,
+    }
 
 
 def test_sidecar_chunk_cut_preserves_earlier_load_handoff_cap():
@@ -4754,7 +4779,7 @@ def test_sidecar_only_save_statistics_use_exact_generation_once():
     operation = SaveOperationId(2, 4)
     stale = SaveOperationId(2, 3)
     sched._track_save_statistics(operation, 0)
-    sched._sidecar_save_inflight["2"] = (operation, 8192, 0x1234)
+    sched._sidecar_save_inflight["2"] = {operation: (8192, 0x1234)}
 
     sched.save_finished(stale)
     assert sched.get_statistics()["saves_pending"] == 1
@@ -5248,7 +5273,7 @@ def test_dsv4_abandon_save_drops_page_set_sidecar_and_tracker():
     op_a = SaveOperationId(7, 0)
     op_b = SaveOperationId(7, 1)  # shared by the page set and the sidecar
     sched._save_inflight[sid] = {op_a, op_b}
-    sched._sidecar_save_inflight[sid] = (op_b, 8, 0x1234)
+    sched._sidecar_save_inflight[sid] = {op_b: (8, 0x1234)}
     sched._save_tracker[sid] = [SimpleNamespace(id=7), 0]
     sched._track_save_statistics(op_a, 16)
     sched._track_save_statistics(op_b, 24)

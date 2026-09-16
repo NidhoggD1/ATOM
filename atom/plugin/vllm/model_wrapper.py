@@ -574,6 +574,16 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 vllm_config,
                 self._deepseek_v4_proxy_layer_name,
             )
+            from atom.plugin.vllm.deepseek_v4_bridge import (
+                prepare_deepseek_v4_decode_graph_state,
+            )
+
+            prepare_deepseek_v4_decode_graph_state(
+                self.model,
+                vllm_config,
+                device=next(self.model.parameters()).device,
+                proxy_layer_name=self._deepseek_v4_proxy_layer_name,
+            )
 
     # Attributes whose writes on the outer model must propagate to the
     # inner model so vLLM's weight-sharing reaches the forward path.

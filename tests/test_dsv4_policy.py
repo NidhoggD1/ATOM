@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from atom.kv_transfer.offload.hybrid.dsv4.policy import (
+    _resolve_slot_staging_slots,
     build_dsv4_profile,
     select_pending_sidecar_boundary,
     sidecar_boundary_tokens,
@@ -133,15 +134,45 @@ def test_sidecar_policy_skips_off_interval_terminal_boundary():
     ) == (8, 16)
 
 
-def test_pending_policy_does_not_cross_later_boundary_while_one_is_inflight():
+def test_pending_policy_skips_inflight_identity_and_selects_later_boundary():
     assert (
         select_pending_sidecar_boundary(
             [(8, 101), (16, 202)],
             start=0,
             end=16,
             committed_hashes=set(),
-            inflight=(object(), 8, 101),
+            inflight=((8, 101),),
+            failed=set(),
+        )
+        == (16, 202)
+    )
+
+
+def test_pending_policy_returns_none_when_all_identities_are_inflight():
+    assert (
+        select_pending_sidecar_boundary(
+            [(8, 101), (16, 202)],
+            start=0,
+            end=16,
+            committed_hashes=set(),
+            inflight=((8, 101), (16, 202)),
             failed=set(),
         )
         is None
+    )
+
+
+def test_slot_staging_slots_default_allows_two_concurrent_sidecars(monkeypatch):
+    monkeypatch.delenv("OFFLOAD_SLOT_STAGING_SLOTS", raising=False)
+    assert _resolve_slot_staging_slots({}) == 2
+
+
+def test_slot_staging_slots_honors_env_and_extra_config(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_SLOT_STAGING_SLOTS", "4")
+    assert _resolve_slot_staging_slots({}) == 4
+    assert (
+        _resolve_slot_staging_slots(
+            {"kv_connector_extra_config": {"slot_sidecar_staging_slots": 3}}
+        )
+        == 3
     )

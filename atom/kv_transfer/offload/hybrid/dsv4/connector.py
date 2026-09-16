@@ -74,6 +74,7 @@ from atom.kv_transfer.offload.hybrid.dsv4.policy import (
     _chained_prefix_hashes,
     _committed_sidecar_capacity,
     _compute_slot_fingerprint,
+    _resolve_slot_staging_slots,
     build_dsv4_profile,
     select_pending_sidecar_boundary,
     sidecar_boundary_tokens,
@@ -431,23 +432,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
 
     def _slot_staging_slots(self) -> int:
         kvc = getattr(self._config, "kv_transfer_config", {}) or {}
-        extra = kvc.get("kv_connector_extra_config", kvc) or {}
-        configured = extra.get("slot_sidecar_staging_slots")
-        if configured is None:
-            configured = os.environ.get("OFFLOAD_SLOT_STAGING_SLOTS", "1")
-            try:
-                count = int(configured)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    "SLOT sidecar staging count must be an integer"
-                ) from exc
-        else:
-            if isinstance(configured, bool) or not isinstance(configured, Integral):
-                raise ValueError("SLOT sidecar staging count must be an integer")
-            count = int(configured)
-        if count <= 0:
-            raise ValueError(f"SLOT sidecar staging count must be > 0, got {count}")
-        return count
+        return _resolve_slot_staging_slots(kvc)
 
     def _initialize_slot_sidecar(
         self,
@@ -1900,7 +1885,14 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._committed_sidecar_hashes = _BoundedLRUSet(
             _committed_sidecar_capacity(kvc)
         )
-        self._sidecar_save_inflight: dict[str, tuple[SaveOperationId, int, int]] = {}
+        # sid -> {save operation: (boundary_tokens, boundary_block_hash)}. More
+        # than one may be open at a time: a boundary is only snapshottable at
+        # the exact step its frontier is reached, so it cannot wait behind an
+        # earlier save.  Bounded by the workers' staging pool, which is what
+        # would otherwise reject the surplus snapshot and burn the boundary.
+        self._sidecar_save_inflight: dict[
+            str, dict[SaveOperationId, tuple[int, int]]
+        ] = {}
         self._failed_sidecar_saves: dict[str, set[tuple[int, int]]] = {}
         self._pending_slot_loads: dict[str, tuple[int, int]] = {}
         self._active_slot_loads: dict[str, tuple[int, int]] = {}
@@ -2128,9 +2120,9 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             not bool(getattr(seq, "_state_initialized_after_alloc", False))
             or not isinstance(source_group, int)
             or source_group < 0
-            or sid in self._sidecar_save_inflight
         ):
             return None
+        inflight = self._sidecar_save_inflight.get(sid) or {}
         for boundary, boundary_hash in self._sidecar_boundary_records(seq):
             if boundary != computed:
                 continue
@@ -2138,6 +2130,8 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             if boundary_hash in self._committed_sidecar_hashes:
                 return None
             if identity in self._failed_sidecar_saves.get(sid, set()):
+                return None
+            if identity in inflight.values():
                 return None
             return identity
         return None
@@ -2161,7 +2155,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             start=start,
             end=end,
             committed_hashes=self._committed_sidecar_hashes,
-            inflight=self._sidecar_save_inflight.get(sid),
+            inflight=tuple((self._sidecar_save_inflight.get(sid) or {}).values()),
             failed=self._failed_sidecar_saves.get(sid, set()),
         )
 
@@ -2435,8 +2429,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 entry[1] = aligned
                 self._save_inflight.setdefault(sid, set()).add(save_operation)
             if sidecar_candidate is not None:
-                self._sidecar_save_inflight[sid] = (
-                    save_operation,
+                self._sidecar_save_inflight.setdefault(sid, {})[save_operation] = (
                     sidecar_candidate[0],
                     sidecar_candidate[1],
                 )
@@ -2553,7 +2546,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             isinstance(operation, SaveOperationId) for operation in inflight
         ):
             return
-        if sid in self._sidecar_save_inflight:
+        if self._sidecar_save_inflight.get(sid):
             return
         self._save_inflight.pop(sid, None)
         self._finish_save_statistics(req_id)
@@ -2580,7 +2573,8 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 self._cancel_save_statistics(operation)
         sidecar = self._sidecar_save_inflight.pop(sid, None)
         if sidecar is not None:
-            self._cancel_save_statistics(sidecar[0])
+            for operation in sidecar:
+                self._cancel_save_statistics(operation)
         self._save_tracker.pop(sid, None)
         # The tracker entry is gone, so there is no longer a watermark to take
         # back; keeping the records would only leak.
@@ -2620,19 +2614,35 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             self.sidecar_save_failed(completion.operation_id)
         return True
 
-    def sidecar_save_finished(self, req_id) -> None:
+    def _claim_sidecar_inflight(self, req_id) -> tuple[str, tuple[int, int]] | None:
+        """Discard and return the one in-flight sidecar ``req_id`` names.
+
+        A request may hold several open boundaries at once, so a completion is
+        matched by its exact `SaveOperationId`.  A bare request ID cannot name a
+        generation and is only honoured when nothing exact is outstanding.
+        """
+
         sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)
         inflight = self._sidecar_save_inflight.get(sid)
-        if inflight is None:
+        if not inflight:
+            return None
+        if isinstance(req_id, SaveOperationId):
+            identity = inflight.pop(req_id, None)
+        elif any(isinstance(operation, SaveOperationId) for operation in inflight):
+            return None
+        else:
+            _, identity = inflight.popitem()
+        if identity is None:
+            return None
+        if not inflight:
+            self._sidecar_save_inflight.pop(sid, None)
+        return sid, identity
+
+    def sidecar_save_finished(self, req_id) -> None:
+        claimed = self._claim_sidecar_inflight(req_id)
+        if claimed is None:
             return
-        if isinstance(req_id, SaveOperationId) and inflight[0] != req_id:
-            return
-        if not isinstance(req_id, SaveOperationId) and isinstance(
-            inflight[0], SaveOperationId
-        ):
-            return
-        self._sidecar_save_inflight.pop(sid, None)
-        identity = (inflight[1], inflight[2])
+        sid, identity = claimed
         self._committed_sidecar_hashes.add(identity[1])
         failed = self._failed_sidecar_saves.get(sid)
         if failed is not None:
@@ -2641,18 +2651,10 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 self._failed_sidecar_saves.pop(sid, None)
 
     def sidecar_save_failed(self, req_id) -> None:
-        sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)
-        inflight = self._sidecar_save_inflight.get(sid)
-        if inflight is None:
+        claimed = self._claim_sidecar_inflight(req_id)
+        if claimed is None:
             return
-        if isinstance(req_id, SaveOperationId) and inflight[0] != req_id:
-            return
-        if not isinstance(req_id, SaveOperationId) and isinstance(
-            inflight[0], SaveOperationId
-        ):
-            return
-        self._sidecar_save_inflight.pop(sid, None)
-        identity = (inflight[1], inflight[2])
+        sid, identity = claimed
         self._failed_sidecar_saves.setdefault(sid, set()).add(identity)
 
     def load_failed(self, req_id) -> bool:

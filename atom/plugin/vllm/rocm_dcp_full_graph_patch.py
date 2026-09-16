@@ -19,6 +19,15 @@ def apply_vllm_rocm_dcp_full_graph_patch() -> None:
 
     original_check = RocmPlatform.check_and_update_config
 
+    def enforce_atom_model_constraints(vllm_config) -> None:
+        # vLLM may validate through RocmPlatform directly before the platform
+        # plugin's returned ATOMPlatform subclass becomes current. Keep
+        # model-specific safety constraints in this base wrapper as well so
+        # they apply at the configuration phase that actually owns graph mode.
+        from atom.plugin.vllm.platform import _enforce_deepseek_v4_constraints
+
+        _enforce_deepseek_v4_constraints(vllm_config)
+
     @classmethod
     def check_and_update_config(cls, vllm_config) -> None:
         compilation_config = vllm_config.compilation_config
@@ -32,6 +41,7 @@ def apply_vllm_rocm_dcp_full_graph_patch() -> None:
 
         if not preserve_dcp_full_graph:
             original_check(vllm_config)
+            enforce_atom_model_constraints(vllm_config)
             return
 
         dcp_size = parallel_config.decode_context_parallel_size
@@ -45,6 +55,7 @@ def apply_vllm_rocm_dcp_full_graph_patch() -> None:
             original_check(vllm_config)
         finally:
             parallel_config.decode_context_parallel_size = dcp_size
+        enforce_atom_model_constraints(vllm_config)
 
     RocmPlatform.check_and_update_config = check_and_update_config
     RocmPlatform._atom_dcp_full_graph_patch = True

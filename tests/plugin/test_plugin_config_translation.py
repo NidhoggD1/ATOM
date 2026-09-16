@@ -1,6 +1,7 @@
 import pytest
 
 import atom.plugin.config as plugin_config
+from atom.config import CUDAGraphMode as AtomCUDAGraphMode
 
 
 class _Obj:
@@ -63,6 +64,23 @@ def test_generate_from_vllm_translates_core_fields(monkeypatch):
     assert cfg.plugin_config.is_plugin_mode is True
     assert cfg.plugin_config.is_vllm is True
     assert cfg.plugin_config.is_sglang is False
+
+
+def test_generate_from_vllm_translates_cudagraph_mode_for_atom_dispatch(monkeypatch):
+    _patch_atom_config_module(monkeypatch)
+
+    class _VllmGraphMode:
+        name = "FULL_AND_PIECEWISE"
+
+    vllm_cfg = _vllm_cfg()
+    vllm_cfg.compilation_config.cudagraph_mode = _VllmGraphMode()
+
+    cfg = plugin_config._generate_atom_config_from_vllm_config(vllm_cfg)
+
+    assert (
+        cfg.compilation_config.cudagraph_mode
+        == AtomCUDAGraphMode.FULL_AND_PIECEWISE
+    )
 
 
 def _vllm_cfg(additional_config=None):

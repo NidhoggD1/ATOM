@@ -269,6 +269,7 @@ def _build_atom_speculative_config_from_vllm(vllm_spec_config: Any):
 
 
 def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
+    from atom.config import CUDAGraphMode as AtomCUDAGraphMode
     from atom.config import CompilationConfig, Config
 
     vllm_model_config = config.model_config
@@ -293,11 +294,19 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
     # when you don't want to use atom torch compile, you can also use
     # --enforce-eager to disable the atom torch compile when launch vllm server
     compilation_config = config.compilation_config
+    vllm_cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
+    atom_cudagraph_mode = None
+    if vllm_cudagraph_mode is not None:
+        mode_name = getattr(vllm_cudagraph_mode, "name", None)
+        if mode_name in AtomCUDAGraphMode.__members__:
+            atom_cudagraph_mode = AtomCUDAGraphMode[mode_name]
     vllm_compilation_config = CompilationConfig(
         # use mode because vllm level argument is deprecated
         level=compilation_config.mode,
         use_cudagraph=False,
-        cudagraph_mode=None,
+        # vLLM owns graph capture, but ATOM still needs the selected mode to
+        # choose its matching V4 attention split and stream-safety path.
+        cudagraph_mode=atom_cudagraph_mode,
     )
 
     vllm_quant_config = config.quant_config
