@@ -278,8 +278,7 @@ class TestV4NativeFp8Routing:
         assert v4_decode_query_group(min_q, max_q) == expected
 
     def test_env_one_routes_native_fp8_to_triton(self, monkeypatch):
-        from atom.model_ops.v4_kernels import paged_decode
-        from atom.model_ops.v4_kernels import paged_decode_fp8_triton
+        from atom.model_ops.v4_kernels import paged_decode, paged_decode_fp8_triton
 
         monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "1")
         monkeypatch.setattr(
@@ -295,8 +294,7 @@ class TestV4NativeFp8Routing:
         assert _call_v4_native_fp8_decode(paged_decode) == "triton"
 
     def test_env_zero_routes_native_fp8_to_aiter(self, monkeypatch):
-        from atom.model_ops.v4_kernels import paged_decode
-        from atom.model_ops.v4_kernels import paged_decode_fp8_triton
+        from atom.model_ops.v4_kernels import paged_decode, paged_decode_fp8_triton
 
         monkeypatch.setenv("ATOM_USE_TRITON_ATTN", "0")
         monkeypatch.setattr(

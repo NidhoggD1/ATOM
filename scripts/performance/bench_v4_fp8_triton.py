@@ -12,9 +12,9 @@ import argparse
 import json
 import statistics
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Sequence
 
 import torch
 

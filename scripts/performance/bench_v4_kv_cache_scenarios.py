@@ -26,9 +26,9 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Sequence
 
 import torch
 
@@ -45,7 +45,6 @@ from scripts.performance.bench_v4_kv_cache_dtype import (
     _time_interleaved,
     benchmark_qk,
 )
-
 
 HCA_LAYERS = 31
 CSA_LAYERS = 30

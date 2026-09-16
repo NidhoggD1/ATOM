@@ -7,9 +7,9 @@ import argparse
 import itertools
 import json
 import statistics
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
 
 import torch
 

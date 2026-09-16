@@ -26,9 +26,9 @@ import os
 import platform
 import statistics
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Sequence
 
 import torch
 from aiter import dtypes
@@ -38,7 +38,6 @@ from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import (
     qk_norm_rope_maybe_quant,
 )
 from atom.model_ops.v4_kernels.v4_quant import quantize_bf16_to_v4_2buff_triton
-
 
 HEAD_DIM = 512
 ROPE_HEAD_DIM = 64

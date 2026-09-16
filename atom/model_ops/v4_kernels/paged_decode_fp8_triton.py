@@ -1125,9 +1125,7 @@ def sparse_attn_v4_paged_decode_fp8_triton(
             dtype=(
                 torch.float16
                 if fp16_partials
-                else torch.bfloat16
-                if bf16_partials
-                else torch.float32
+                else torch.bfloat16 if bf16_partials else torch.float32
             ),
             device=q_packed.device,
         )
@@ -1298,9 +1296,7 @@ def sparse_attn_v4_paged_decode_fp8_triton_query_group(
             dtype=(
                 torch.float16
                 if fp16_partials
-                else torch.bfloat16
-                if bf16_partials
-                else torch.float32
+                else torch.bfloat16 if bf16_partials else torch.float32
             ),
             device=q_packed.device,
         )
@@ -1511,19 +1507,19 @@ def sparse_attn_v4_paged_decode_fp8_triton_auto(
             attn_sink,
             softmax_scale,
         )
-        common_kwargs = dict(
-            block_h=16,
-            block_k=block_k,
-            kv_splits=kv_splits,
-            num_stages=stages,
-            num_warps=4,
-            waves_per_eu=1,
-            matrix_instr_nonkdim=16,
-            use_mxfp8_qk=True,
-            reduce_d_chunk=512,
-            reduce_num_warps=reduce_warps,
-            fp16_partials=True,
-        )
+        common_kwargs = {
+            "block_h": 16,
+            "block_k": block_k,
+            "kv_splits": kv_splits,
+            "num_stages": stages,
+            "num_warps": 4,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+            "use_mxfp8_qk": True,
+            "reduce_d_chunk": 512,
+            "reduce_num_warps": reduce_warps,
+            "fp16_partials": True,
+        }
         if fused_q == 1 or H != 16:
             return sparse_attn_v4_paged_decode_fp8_triton(*common_args, **common_kwargs)
         common_kwargs.pop("block_h")
