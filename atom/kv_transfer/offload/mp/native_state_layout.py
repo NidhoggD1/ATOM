@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Owned tensor aliases for DSv4's native PAGE-backed checkpoint images.
+"""Owned tensor aliases for generic PAGE-backed native checkpoint images.
 
 The native codec streams PAGE units in ordinal order, with regions inside
 each unit. Every ordinal gets its own engine block-id list while aliasing the
@@ -20,7 +20,7 @@ import torch
 
 
 @dataclass(frozen=True)
-class DSV4MPKernelGroup:
+class NativeStateMPKernelGroup:
     """One actual dtype/shape/engine-address-space registration identity."""
 
     tensor_indices: tuple[int, ...]
@@ -33,7 +33,7 @@ class DSV4MPKernelGroup:
 
 
 @dataclass(frozen=True)
-class DSV4MPStateRegion:
+class NativeStateMPStateRegion:
     """One region of the native image, before physical-kernel coalescing."""
 
     tensor_index: int
@@ -44,7 +44,7 @@ class DSV4MPStateRegion:
 
 
 @dataclass(frozen=True)
-class DSV4MPImageSpan:
+class NativeStateMPImageSpan:
     """A validated image copy span into an owned registered tensor."""
 
     tensor_index: int
@@ -54,12 +54,12 @@ class DSV4MPImageSpan:
 
 
 @dataclass(frozen=True)
-class DSV4MPLayout:
+class NativeStateMPLayout:
     tensors: tuple[torch.Tensor, ...]
-    kernel_groups: tuple[DSV4MPKernelGroup, ...]
+    kernel_groups: tuple[NativeStateMPKernelGroup, ...]
     checkpoint_spec: Any
     page_region_count: int
-    state_regions: tuple[DSV4MPStateRegion, ...]
+    state_regions: tuple[NativeStateMPStateRegion, ...]
 
     @property
     def bytes_per_block(self) -> int:
@@ -90,7 +90,7 @@ class DSV4MPLayout:
             for group in self.kernel_groups
         ]
 
-    def image_plan(self, unit_ids: Sequence[int]) -> tuple[DSV4MPImageSpan, ...]:
+    def image_plan(self, unit_ids: Sequence[int]) -> tuple[NativeStateMPImageSpan, ...]:
         """Describe exact native image bytes for arbitrary PAGE unit IDs.
 
         Null placeholders are invalid here: a checkpoint endpoint must supply
@@ -98,17 +98,17 @@ class DSV4MPLayout:
         """
         if len(unit_ids) != self.units_per_checkpoint:
             raise ValueError(
-                f"DSv4 image needs {self.units_per_checkpoint} unit IDs, "
+                f"native image needs {self.units_per_checkpoint} unit IDs, "
                 f"got {len(unit_ids)}"
             )
         num_blocks = self.tensors[0].shape[0]
         for unit_id in unit_ids:
             if type(unit_id) is not int or not 0 <= unit_id < num_blocks:
-                raise ValueError(f"invalid DSv4 checkpoint unit ID: {unit_id!r}")
+                raise ValueError(f"invalid native checkpoint unit ID: {unit_id!r}")
         if len(set(unit_ids)) != len(unit_ids):
-            raise ValueError("DSv4 checkpoint unit IDs must be distinct")
+            raise ValueError("native checkpoint unit IDs must be distinct")
         return tuple(
-            DSV4MPImageSpan(
+            NativeStateMPImageSpan(
                 tensor_index=region.tensor_index,
                 block_id=unit_ids[region.unit_ordinal],
                 image_offset=region.image_offset,
@@ -124,82 +124,87 @@ def _positive_int(name: str, value: Any) -> int:
     return value
 
 
-def build_dsv4_mp_layout(
+def build_native_state_mp_layout(
     transfer_tensors: Any,
     *,
     block_size: int,
     chunk_size: int,
     num_blocks: int | None = None,
-) -> DSV4MPLayout:
-    """Validate and alias DSv4 PAGE plus compact native STATE for LMCache MP.
+) -> NativeStateMPLayout:
+    """Validate and alias PAGE plus compact native STATE for LMCache MP.
 
     PAGE uses engine group zero with no null ID. STATE ordinal ``j`` uses
     group ``1+j``, one logical chunk per block, and null ID ``-1``. The final
     ordinal's final region ends exactly at ``image_bytes``; its dim-0 stride
     continues to address the original full PAGE region.
     """
-    block_size = _positive_int("DSv4 PAGE block size", block_size)
-    chunk_size = _positive_int("DSv4 checkpoint chunk size", chunk_size)
+    block_size = _positive_int("native PAGE block size", block_size)
+    chunk_size = _positive_int("native checkpoint chunk size", chunk_size)
     if chunk_size % block_size:
-        raise ValueError("DSv4 checkpoint chunk size must be divisible by block size")
+        raise ValueError("native checkpoint chunk size must be divisible by block size")
     if transfer_tensors is None:
-        raise ValueError("DSv4 MP requires KVTransferTensors")
+        raise ValueError("native-state LMCache MP requires KVTransferTensors")
     spec = getattr(transfer_tensors, "paged_state_checkpoint_spec", None)
-    if spec is None or not str(getattr(spec, "layout_id", "")).startswith(
-        "dsv4-paged-state-v3:"
-    ):
-        raise ValueError("DSv4 MP requires the native dsv4-paged-state-v3 spec")
-    page_bytes = _positive_int("DSv4 PAGE unit bytes", spec.page_unit_bytes)
-    image_bytes = _positive_int("DSv4 checkpoint image bytes", spec.image_bytes)
-    slot_bytes = _positive_int("DSv4 Active SLOT bytes", spec.slot_bytes)
+    if spec is None:
+        raise ValueError("native-state LMCache MP requires paged checkpoint geometry")
+    layout_id = str(getattr(spec, "layout_id", "")).strip()
+    if not layout_id:
+        raise ValueError("native checkpoint layout_id must be non-empty")
+    page_bytes = _positive_int("native PAGE unit bytes", spec.page_unit_bytes)
+    image_bytes = _positive_int("native checkpoint image bytes", spec.image_bytes)
+    slot_bytes = _positive_int("native Active SLOT bytes", spec.slot_bytes)
     if image_bytes > slot_bytes:
-        raise ValueError("DSv4 image bytes exceed Active SLOT bytes")
-    units = _positive_int("DSv4 checkpoint units", spec.units_per_checkpoint)
+        raise ValueError("native image bytes exceed Active SLOT bytes")
+    units = _positive_int("native checkpoint units", spec.units_per_checkpoint)
     if units != (image_bytes + page_bytes - 1) // page_bytes:
-        raise ValueError("DSv4 checkpoint units disagree with image geometry")
+        raise ValueError("native checkpoint units disagree with image geometry")
     if not callable(getattr(transfer_tensors, "execute_paged_state_copies", None)):
-        raise TypeError("DSv4 MP requires native execute_paged_state_copies")
+        raise TypeError("native-state LMCache MP requires execute_paged_state_copies")
     if num_blocks is None:
         num_blocks = getattr(transfer_tensors, "num_blocks", None)
-    num_blocks = _positive_int("DSv4 scheduler block count", num_blocks)
+    num_blocks = _positive_int("native scheduler block count", num_blocks)
     published_blocks = getattr(transfer_tensors, "num_blocks", 0)
     if published_blocks not in (0, num_blocks):
-        raise ValueError("DSv4 published block count disagrees with scheduler")
+        raise ValueError("native published block count disagrees with scheduler")
 
     regions = list(getattr(transfer_tensors, "block_regions", None) or [])
     page_views = list(getattr(transfer_tensors, "block_tensor_views", None) or [])
     if not regions or len(regions) != len(page_views):
-        raise ValueError("DSv4 MP needs one owned tensor view per PAGE region")
+        raise ValueError(
+            "native-state LMCache MP needs one owned tensor view per PAGE region"
+        )
     devices = set()
     actual_page_bytes = 0
     for index, (view, region) in enumerate(zip(page_views, regions, strict=True)):
         if not isinstance(view, torch.Tensor):
-            raise TypeError(f"DSv4 PAGE view {index} must be a Tensor")
+            raise TypeError(f"native PAGE view {index} must be a Tensor")
         if view.ndim != 3 or view.shape[0] != num_blocks or view.numel() == 0:
-            raise ValueError(f"DSv4 PAGE view {index} has invalid block geometry")
+            raise ValueError(f"native PAGE view {index} has invalid block geometry")
         if not view[0].is_contiguous():
-            raise ValueError(f"DSv4 PAGE view {index} has non-contiguous inner rows")
+            raise ValueError(f"native PAGE view {index} has non-contiguous inner rows")
         if block_size % view.shape[1]:
             raise ValueError(
-                f"DSv4 PAGE view {index} physical slots must divide block size"
+                f"native PAGE view {index} physical slots must divide block size"
             )
-        unit_bytes = _positive_int(f"DSv4 PAGE region {index} bytes", region.unit_bytes)
+        unit_bytes = _positive_int(
+            f"native PAGE region {index} bytes", region.unit_bytes
+        )
         if (
             view[0].numel() * view.element_size() != unit_bytes
             or view.stride(0) * view.element_size() != unit_bytes
             or region.total_bytes != num_blocks * unit_bytes
         ):
-            raise ValueError(f"DSv4 PAGE view {index} byte geometry mismatch")
+            raise ValueError(f"native PAGE view {index} byte geometry mismatch")
         if view.data_ptr() != region.base_addr:
-            raise ValueError(f"DSv4 PAGE view {index} does not alias its region")
+            raise ValueError(f"native PAGE view {index} does not alias its region")
         if region.reverse_indexed:
-            raise ValueError("DSv4 PAGE regions cannot be reverse-indexed")
+            raise ValueError("native PAGE regions cannot be reverse-indexed")
         devices.add(view.device)
         actual_page_bytes += unit_bytes
     if len(devices) != 1:
-        raise ValueError("DSv4 PAGE views must share one device")
+        raise ValueError("native PAGE views must share one device")
     if actual_page_bytes != page_bytes:
-        raise ValueError("DSv4 PAGE regions do not cover the native PAGE unit")
+        raise ValueError("PAGE regions do not cover the native PAGE unit")
 
     tensors = list(page_views)
     engine_ids = [0] * len(tensors)
@@ -227,13 +232,13 @@ def build_dsv4_mp_layout(
             tensors.append(alias)
             engine_ids.append(1 + ordinal)
             state_regions.append(
-                DSV4MPStateRegion(
+                NativeStateMPStateRegion(
                     tensor_index, ordinal, region_index, image_offset, nbytes
                 )
             )
             image_offset += nbytes
     if image_offset != image_bytes:
-        raise ValueError("DSv4 PAGE aliases do not cover the native image")
+        raise ValueError("PAGE aliases do not cover the native image")
 
     by_identity: dict[tuple, list[int]] = {}
     for index, (tensor, engine_id) in enumerate(zip(tensors, engine_ids, strict=True)):
@@ -244,12 +249,13 @@ def build_dsv4_mp_layout(
             # Splitting metadata cannot fix this: it re-coalesces the identity
             # during registration. Reject instead of addressing another PAGE.
             raise ValueError(
-                "DSv4 MP equal-shape regions have different block strides; "
+                "native-state LMCache MP equal-shape regions have different "
+                "block strides; "
                 "LMCache requires one stride per physical kernel identity"
             )
         members.append(index)
     groups = tuple(
-        DSV4MPKernelGroup(
+        NativeStateMPKernelGroup(
             tensor_indices=tuple(indices),
             engine_group_id=identity[2],
             tokens_per_block=chunk_size if identity[2] else block_size,
@@ -259,10 +265,19 @@ def build_dsv4_mp_layout(
         )
         for identity, indices in by_identity.items()
     )
-    return DSV4MPLayout(
+    return NativeStateMPLayout(
         tensors=tuple(tensors),
         kernel_groups=groups,
         checkpoint_spec=spec,
         page_region_count=len(page_views),
         state_regions=tuple(state_regions),
     )
+
+
+__all__ = [
+    "NativeStateMPImageSpan",
+    "NativeStateMPKernelGroup",
+    "NativeStateMPLayout",
+    "NativeStateMPStateRegion",
+    "build_native_state_mp_layout",
+]

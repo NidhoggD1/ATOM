@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""CPU byte contracts for direct native DSv4 checkpoint registration."""
+"""CPU byte contracts for direct native checkpoint registration."""
 
 from __future__ import annotations
 
@@ -14,7 +14,9 @@ import pytest
 import torch
 
 from atom.kv_transfer.disaggregation.types import KVTransferRegion, KVTransferTensors
-from atom.kv_transfer.offload.mp.dsv4_layout import build_dsv4_mp_layout
+from atom.kv_transfer.offload.mp.native_state_layout import (
+    build_native_state_mp_layout,
+)
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 
 
@@ -30,7 +32,7 @@ def _transfer(*, widths=(8, 8, 2), image_bytes=39, num_blocks=7):
         page_unit_bytes=sum(widths),
         slot_bytes=max(image_bytes, 128),
         image_bytes=image_bytes,
-        layout_id="dsv4-paged-state-v3:test-cpu",
+        layout_id="native-test-v1",
     )
     transfer = KVTransferTensors(
         block_regions=[
@@ -52,7 +54,7 @@ def _transfer(*, widths=(8, 8, 2), image_bytes=39, num_blocks=7):
 
 
 def _layout(transfer):
-    return build_dsv4_mp_layout(transfer, block_size=4, chunk_size=16)
+    return build_native_state_mp_layout(transfer, block_size=4, chunk_size=16)
 
 
 def _gather(layout, ids):

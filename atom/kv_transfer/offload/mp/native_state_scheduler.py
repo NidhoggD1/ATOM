@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Bounded transfers of DSv4's native READY checkpoint images over LMCache MP."""
+"""Bounded transfers of native READY checkpoint images over LMCache MP."""
 
 from __future__ import annotations
 
@@ -26,9 +26,9 @@ from atom.kv_transfer.offload.mp.backend import (
     _extra_config,
     _validate_mp_config,
 )
-from atom.kv_transfer.offload.mp.dsv4_worker import (
-    DSV4_MP_STORE_CHANNEL,
-    require_native_server,
+from atom.kv_transfer.offload.mp.native_state_worker import (
+    NATIVE_STATE_MP_STORE_CHANNEL,
+    require_native_state_server,
 )
 
 _MAX_SAVE_ATTEMPTS = 3
@@ -49,7 +49,7 @@ class _NativeLoad:
     dispatched: bool = False
 
 
-class DSV4MPConnectorScheduler(LMCacheMPConnectorScheduler):
+class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
     """Pair PAGE KV with an exact native state image under one operation ID.
 
     Native sources are acquired only after save admission. Loads reserve raw
@@ -74,16 +74,23 @@ class DSV4MPConnectorScheduler(LMCacheMPConnectorScheduler):
         if self._block_manager is block_manager:
             return
         if self._block_manager is not None:
-            raise RuntimeError("DSV4 MP scheduler is already bound to a block manager")
+            raise RuntimeError(
+                "native-state LMCache MP scheduler is already bound to a block manager"
+            )
         coordinator = getattr(block_manager, "paged_state_checkpoints", None)
         if coordinator is None:
-            raise ValueError("DSV4 MP requires native PAGE checkpoint geometry")
+            raise ValueError(
+                "native-state LMCache MP requires PAGE checkpoint geometry"
+            )
         super().__init__(self._config, checkpoint_spec=coordinator.store.spec)
         try:
-            require_native_server(self._mp_adapter, self._config)
+            require_native_state_server(self._mp_adapter, self._config)
             self._hash_block_size = int(block_manager.hash_block_size)
             if self.chunk_size % self._hash_block_size:
-                raise ValueError("DSV4 MP chunk size must align to native hash blocks")
+                raise ValueError(
+                    "native-state LMCache MP chunk size must align to native "
+                    "hash blocks"
+                )
             self._max_pending_saves = max_pending_saves(
                 int(os.environ.get("OFFLOAD_COPY_WORKERS", "1") or 1)
             )
@@ -123,9 +130,10 @@ class DSV4MPConnectorScheduler(LMCacheMPConnectorScheduler):
         chain = getattr(seq, "block_hashes", ())
         if len(chain) >= count:
             return int(chain[count - 1])
-        # DSv4 does not reserve midstep checkpoints, so BlockManager leaves
-        # Sequence.block_hashes empty. Use its exact public hashing algorithm
-        # and token slices, caching only this request's immutable prompt chain.
+        # Some checkpoint producers do not reserve midstep checkpoints, so
+        # BlockManager may leave Sequence.block_hashes empty. Use its exact
+        # public hashing algorithm and token slices, caching only this request's
+        # immutable prompt chain.
         chain = getattr(seq, "_mp_checkpoint_hashes", None)
         if chain is None:
             chain = []
@@ -241,7 +249,7 @@ class DSV4MPConnectorScheduler(LMCacheMPConnectorScheduler):
             self._complete_native_save(req_id, succeeded=True)
 
     def connector_completion(self, completion: ConnectorCompletion) -> bool | None:
-        if completion.channel != DSV4_MP_STORE_CHANNEL:
+        if completion.channel != NATIVE_STATE_MP_STORE_CHANNEL:
             return super().connector_completion(completion)
         if not isinstance(completion.operation_id, SaveOperationId):
             return False
@@ -418,3 +426,6 @@ class DSV4MPConnectorScheduler(LMCacheMPConnectorScheduler):
 
     def reclaim_stale_leases(self, timeout_s: float) -> list[frozenset]:
         return []
+
+
+__all__ = ["NativeStateLMCacheMPConnectorScheduler"]

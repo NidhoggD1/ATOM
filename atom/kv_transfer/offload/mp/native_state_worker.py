@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Native DSV4 checkpoint transport over the standalone LMCache process."""
+"""Native PAGE-backed checkpoint transport over standalone LMCache."""
 
 from __future__ import annotations
 
@@ -25,14 +25,16 @@ from atom.kv_transfer.offload.mp.backend import (
     _transfer_operation_id,
     _validate_mp_config,
 )
-from atom.kv_transfer.offload.mp.dsv4_layout import build_dsv4_mp_layout
+from atom.kv_transfer.offload.mp.native_state_layout import (
+    build_native_state_mp_layout,
+)
 from atom.model_engine.page_unit_checkpoint import CheckpointRestoreOp
 
 logger = logging.getLogger("atom")
-DSV4_MP_STORE_CHANNEL = "dsv4_mp_store"
+NATIVE_STATE_MP_STORE_CHANNEL = "native_state_mp_store"
 
 
-def require_native_server(adapter: Any, config: Any = None) -> None:
+def require_native_state_server(adapter: Any, config: Any = None) -> None:
     """Validate native transfer geometry shared with the LMCache server."""
     if config is not None:
         configured_chunk = int(
@@ -40,7 +42,8 @@ def require_native_server(adapter: Any, config: Any = None) -> None:
         )
         if configured_chunk != int(adapter.lmcache_tokens_per_chunk):
             raise ValueError(
-                "DSV4 LMCache configured chunk size must match the MP server: "
+                "Native-state LMCache configured chunk size must match the MP "
+                "server: "
                 f"configured={configured_chunk}, server={adapter.lmcache_tokens_per_chunk}"
             )
 
@@ -60,7 +63,7 @@ class _NativePending:
     restore_succeeded: bool = False
 
 
-class DSV4MPConnector(LMCacheMPConnector):
+class NativeStateLMCacheMPConnector(LMCacheMPConnector):
     """Transfer pinned native images; never read a request's active SLOT to save."""
 
     def __init__(self, config: Any) -> None:
@@ -86,22 +89,25 @@ class DSV4MPConnector(LMCacheMPConnector):
         native_copy = getattr(transfer_tensors, "execute_paged_state_copies", None)
         if spec is None or not callable(native_copy):
             raise ValueError(
-                "DSV4 MP needs native checkpoint geometry and copy callback"
+                "native-state LMCache MP needs checkpoint geometry and a copy callback"
             )
         _validate_mp_config(self._config)
         rank = int(get_tp_group().rank_in_group)
         adapter = _make_worker_adapter(self._config, rank, checkpoint_spec=spec)
         try:
-            require_native_server(adapter, self._config)
+            require_native_state_server(adapter, self._config)
             chunk_size = int(adapter.lmcache_tokens_per_chunk)
-            layout = build_dsv4_mp_layout(
+            layout = build_native_state_mp_layout(
                 transfer_tensors,
                 block_size=self.block_size,
                 chunk_size=chunk_size,
                 num_blocks=num_blocks,
             )
             adapter.register_kv_caches(
-                {f"dsv4.{i}": tensor for i, tensor in enumerate(layout.tensors)},
+                {
+                    f"native_state.{i}": tensor
+                    for i, tensor in enumerate(layout.tensors)
+                },
                 engine_group_infos=layout.engine_group_infos(),
             )
         except Exception:
@@ -113,7 +119,8 @@ class DSV4MPConnector(LMCacheMPConnector):
         self._native_copy = native_copy
         self._compute_stream = torch.cuda.current_stream()
         logger.info(
-            "DSV4 MP registered rank=%d native_image=%d units=%d groups=%d chunk=%d",
+            "LMCache MP native state registered rank=%d native_image=%d "
+            "units=%d groups=%d chunk=%d",
             rank,
             spec.image_bytes,
             spec.units_per_checkpoint,
@@ -131,15 +138,21 @@ class DSV4MPConnector(LMCacheMPConnector):
     ) -> list[list[int]]:
         state = req.native_state
         if state is None:
-            raise ValueError("DSV4 MP transfers require an exact native checkpoint")
+            raise ValueError(
+                "native-state LMCache MP transfers require an exact checkpoint"
+            )
         if start % self.chunk_size or end % self.chunk_size or start >= end:
-            raise ValueError("DSV4 MP requires a nonempty chunk-aligned range")
+            raise ValueError(
+                "native-state LMCache MP requires a nonempty chunk-aligned range"
+            )
         if state.boundary_tokens != end or len(req.token_ids) != end:
-            raise ValueError("DSV4 native STATE and PAGE endpoints must match")
+            raise ValueError("native STATE and PAGE endpoints must match")
         if loading and (start != 0 or state.destination_slot is None):
-            raise ValueError("DSV4 MP restore requires HBM=0 and a destination SLOT")
+            raise ValueError(
+                "native-state restore requires HBM=0 and a destination SLOT"
+            )
         if not loading and state.destination_slot is not None:
-            raise ValueError("DSV4 MP save must refer to immutable PAGE units")
+            raise ValueError("native-state save must refer to immutable PAGE units")
         self._native_layout.image_plan(state.unit_ids)
         pages = self._block_slice(req, start, end)
         if set(pages) & set(state.unit_ids):
@@ -154,7 +167,9 @@ class DSV4MPConnector(LMCacheMPConnector):
 
         completion = req.load_operation if loading else req.save_operation
         if completion is None:
-            raise ValueError("DSV4 MP transfers require exact operation generations")
+            raise ValueError(
+                "native-state LMCache MP transfers require exact operation generations"
+            )
         operation_id = _transfer_operation_id("load" if loading else "save", completion)
         pending = self._native_loads if loading else self._native_saves
         completed = (
@@ -164,7 +179,9 @@ class DSV4MPConnector(LMCacheMPConnector):
         )
         with self._lock:
             if operation_id in pending or operation_id in completed:
-                raise RuntimeError(f"duplicate DSV4 MP operation {operation_id!r}")
+                raise RuntimeError(
+                    f"duplicate native-state LMCache MP operation {operation_id!r}"
+                )
             if not loading and len(pending) >= self._max_pending_saves:
                 # The scheduler has the same bound. Refuse before transport;
                 # a terminal False safely returns the logical admission credit.
@@ -185,7 +202,9 @@ class DSV4MPConnector(LMCacheMPConnector):
                     end=end,
                 )
             except Exception:
-                logger.exception("Invalid DSV4 MP descriptor %s", operation_id)
+                logger.exception(
+                    "Invalid native-state LMCache MP descriptor %s", operation_id
+                )
                 pending[operation_id] = _NativePending(req, None)
                 return
             entry = _NativePending(req, _UncertainSubmission())
@@ -201,7 +220,8 @@ class DSV4MPConnector(LMCacheMPConnector):
             # Retain the exact source/destination lease. The server might have
             # received the request before the connection raised an exception.
             logger.exception(
-                "DSV4 MP submission uncertain; retaining lease %s", operation_id
+                "Native-state LMCache MP submission uncertain; retaining lease %s",
+                operation_id,
             )
             return
         with self._lock:
@@ -236,7 +256,7 @@ class DSV4MPConnector(LMCacheMPConnector):
                 )
                 pending.restore_succeeded = True
             except Exception:
-                logger.exception("DSV4 MP native restore failed")
+                logger.exception("LMCache MP native restore failed")
             finally:
                 event.record(self._compute_stream)
                 # Also protect this descriptor from the next forward's host
@@ -252,7 +272,7 @@ class DSV4MPConnector(LMCacheMPConnector):
                     continue
                 output.connector_completions.add(
                     ConnectorCompletion(
-                        DSV4_MP_STORE_CHANNEL,
+                        NATIVE_STATE_MP_STORE_CHANNEL,
                         pending.request.save_operation,
                         succeeded=result is True,
                     )
@@ -273,7 +293,8 @@ class DSV4MPConnector(LMCacheMPConnector):
                             self._begin_restore(pending)
                         except Exception:
                             logger.exception(
-                                "DSV4 MP restore safety unknown; retaining lease"
+                                "LMCache MP native restore safety unknown; "
+                                "retaining lease"
                             )
                             pending.future = _UncertainSubmission()
                             pending.restore_event = None
@@ -284,7 +305,8 @@ class DSV4MPConnector(LMCacheMPConnector):
                             continue
                     except Exception:
                         logger.exception(
-                            "DSV4 MP restore event safety unknown; retaining lease"
+                            "LMCache MP native restore event safety unknown; "
+                            "retaining lease"
                         )
                         continue
                 completion = pending.request.load_operation
@@ -301,3 +323,10 @@ class DSV4MPConnector(LMCacheMPConnector):
                     self._completed_load_operation_order,
                 )
         return output
+
+
+__all__ = [
+    "NATIVE_STATE_MP_STORE_CHANNEL",
+    "NativeStateLMCacheMPConnector",
+    "require_native_state_server",
+]

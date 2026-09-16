@@ -162,21 +162,6 @@ class KVConnectorFactory:
         else:
             raise ValueError(f"Unknown role {role!r}, expected 'worker' or 'scheduler'")
 
-        if backend_name == "lmcache_mp":
-            from atom.kv_transfer.offload.mp.backend import _is_dsv4
-
-            if _is_dsv4(config):
-                if role == "worker":
-                    from atom.kv_transfer.offload.mp.dsv4_worker import DSV4MPConnector
-
-                    klass = DSV4MPConnector
-                else:
-                    from atom.kv_transfer.offload.mp.dsv4_scheduler import (
-                        DSV4MPConnectorScheduler,
-                    )
-
-                    klass = DSV4MPConnectorScheduler
-
         logger.debug(
             "Creating KV connector: backend=%s, role=%s, class=%s",
             backend_name,

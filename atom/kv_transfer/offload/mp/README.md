@@ -1,9 +1,17 @@
-# DSv4 native checkpoints with LMCache MP
+# PAGE-backed native checkpoints with LMCache MP
 
-The native ATOM `lmcache_mp` connector supports DSv4 PAGE KV and compact
-`dsv4-paged-state-v3` checkpoints. It pins existing READY checkpoint PAGE units;
-it does not take another snapshot of the request's Active SLOT. Every request
-keeps its normal fixed SLOT while running.
+ATOM's `lmcache_mp` connector has two capability-selected paths:
+
+- ordinary attention backends publish PAGE views and use PAGE-only transfer;
+- stateful attention backends additionally publish a
+  `PagedStateCheckpointSpec` and `execute_paged_state_copies`, enabling one
+  combined PAGE/native-STATE transfer.
+
+The connector does not inspect model names or layout-ID prefixes. A new model
+can reuse the native path by implementing those shared contracts. The native
+path pins existing READY checkpoint PAGE units; it does not take another
+snapshot of the request's Active SLOT. Every request keeps its normal fixed
+SLOT while running.
 
 ## Run
 
@@ -18,7 +26,8 @@ lmcache server --host 127.0.0.1 --port 5555 \
   --supported-transfer-mode lmcache_driven --l1-size-gb 64
 ```
 
-Add the following options to an otherwise working native DSv4 launch:
+For example, add the following options to a DSv4 launch that already publishes
+the native-state contract:
 
 ```bash
 export LMCACHE_CHUNK_SIZE=256
@@ -38,11 +47,11 @@ python -m atom.entrypoints.openai_server \
   }'
 ```
 
-The ATOM configured chunk size must equal the MP server's chunk size. Both
-must align to ATOM's PAGE/hash block size. Native checkpoints are produced by
-ATOM's existing checkpoint policy, so their cadence must provide the desired
-reusable boundaries. A prefix is loadable only where PAGE KV and a complete
-STATE checkpoint both exist on all TP ranks.
+The ATOM configured chunk size must equal the MP server's chunk size. Both must
+align to ATOM's PAGE/hash block size. Native checkpoints are produced by the
+attention backend's existing checkpoint policy, so their cadence must provide
+the desired reusable boundaries. A prefix is loadable only where PAGE KV and a
+complete STATE checkpoint both exist on all TP ranks.
 
 `lmcache.mp.max_pinned_state_bytes` optionally limits native checkpoint sources
 and temporary restore images together. Its default is
@@ -86,7 +95,8 @@ sources or destinations.
 ## Initial scope
 
 - Native ATOM, one MP server, TP only. DP/PP/PCP/DCP and engine-driven transfers
-  are rejected. DSv4 TP rank collapse is disabled because STATE is rank-specific.
+  are rejected. TP rank collapse is disabled whenever native STATE is present,
+  because that state is rank-specific.
 - External restore is used when the actual post-allocation HBM hit is zero.
   Requests with a local HBM prefix follow normal local prefill. Lookups truncate
   the token list to `floor((prompt_tokens - 1) / chunk_size) * chunk_size` before
@@ -115,6 +125,7 @@ LMCache checkout:
 python -m pytest -xvs tests/v1/multiprocess/test_native_state_alias_gpu.py
 ```
 
-It uses synthetic cache contents and does not establish full DSv4-Pro model
-accuracy or serving performance. Those require a model run with forced HBM
-misses, prefix reuse, TP quorum, cancellation, and comparison to fresh prefill.
+It uses synthetic cache contents and validates the shared transport contract,
+not model accuracy or serving performance. Model validation still requires a
+run with forced HBM misses, prefix reuse, TP quorum, cancellation, and
+comparison to fresh prefill.

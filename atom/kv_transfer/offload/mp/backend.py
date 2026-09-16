@@ -146,7 +146,7 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     return getattr(hf_config, "kv_lora_rank", None) is not None
 
 
-def _tp_replication_factor(config: Any) -> int:
+def _tp_replication_factor(config: Any, *, native_state: bool = False) -> int:
     """Return the PAGE rank-collapse factor selected before workers start.
 
     ``auto`` uses only structural cache information available in the shared
@@ -157,10 +157,10 @@ def _tp_replication_factor(config: Any) -> int:
 
     tp_size, _ = _validate_mp_config(config)
     configured = _extra_config(config).get("lmcache.mp.tp_rank_collapse", "auto")
-    if _is_dsv4(config):
+    if native_state:
         if configured is True:
             raise ValueError(
-                "DSV4 native STATE requires every TP rank; disable rank collapse"
+                "native STATE requires every TP rank; disable rank collapse"
             )
         if configured is not False and configured != "auto":
             raise TypeError(
@@ -230,20 +230,6 @@ def _server_urls(config: Any) -> list[str]:
     return urls
 
 
-def _is_dsv4(config: Any) -> bool:
-    hf = getattr(config, "hf_config", None)
-    hf = getattr(hf, "text_config", hf)
-    return (
-        str(getattr(hf, "model_type", "")).lower()
-        in (
-            "deepseek_v4",
-            "deepseek_v4_mtp",
-        )
-        or "DeepseekV4ForCausalLM" in (getattr(hf, "architectures", None) or [])
-        or bool(getattr(hf, "compress_ratios", None))
-    )
-
-
 def _model_namespace(config: Any, *, checkpoint_spec: Any = None) -> str:
     """Build a model/layout namespace shared by scheduler and workers."""
 
@@ -271,7 +257,9 @@ def _model_namespace(config: Any, *, checkpoint_spec: Any = None) -> str:
     return namespace
 
 
-def _parallel_strategy(config: Any, worker_id: int) -> Any:
+def _parallel_strategy(
+    config: Any, worker_id: int, *, native_state: bool = False
+) -> Any:
     from lmcache.integration.atom import AtomMPParallelConfig
 
     tp_size, pp_size = _validate_mp_config(config)
@@ -279,7 +267,7 @@ def _parallel_strategy(config: Any, worker_id: int) -> Any:
         raise ValueError(
             f"LMCache MP worker rank {worker_id} is outside [0, {tp_size})"
         )
-    replication_factor = _tp_replication_factor(config)
+    replication_factor = _tp_replication_factor(config, native_state=native_state)
     return AtomMPParallelConfig(
         world_size=tp_size * pp_size // replication_factor,
         worker_id=worker_id // replication_factor,
@@ -291,7 +279,8 @@ def _make_scheduler_adapter(config: Any, *, checkpoint_spec: Any = None) -> Any:
     import zmq
     from lmcache.integration.atom import AtomMPSchedulerAdapter
 
-    num_kv_readers = _tp_replication_factor(config)
+    native_state = checkpoint_spec is not None
+    num_kv_readers = _tp_replication_factor(config, native_state=native_state)
 
     class _ReaderAwareSchedulerAdapter(AtomMPSchedulerAdapter):
         """Reserve one LMCache read lock for every collapsed TP consumer."""
@@ -310,7 +299,7 @@ def _make_scheduler_adapter(config: Any, *, checkpoint_spec: Any = None) -> Any:
             else _model_namespace(config, checkpoint_spec=checkpoint_spec)
         ),
         block_size=int(config.kv_cache_block_size),
-        parallel_config=_parallel_strategy(config, 0),
+        parallel_config=_parallel_strategy(config, 0, native_state=native_state),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
     )
 
@@ -329,7 +318,9 @@ def _make_worker_adapter(config: Any, rank: int, *, checkpoint_spec: Any = None)
             else _model_namespace(config, checkpoint_spec=checkpoint_spec)
         ),
         block_size=int(config.kv_cache_block_size),
-        parallel_config=_parallel_strategy(config, rank),
+        parallel_config=_parallel_strategy(
+            config, rank, native_state=checkpoint_spec is not None
+        ),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
         heartbeat_interval=float(extra.get("lmcache.mp.heartbeat_interval", 10.0)),
         transfer_mode=_transfer_mode(config),

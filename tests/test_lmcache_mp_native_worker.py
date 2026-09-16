@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+"""Worker contracts for reusable native-state LMCache MP transfers."""
+
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -20,10 +22,12 @@ from atom.kv_transfer.offload.metadata import (
     SaveSpec,
 )
 from atom.kv_transfer.offload.mp.backend import _model_namespace, _tp_replication_factor
-from atom.kv_transfer.offload.mp.dsv4_layout import build_dsv4_mp_layout
-from atom.kv_transfer.offload.mp.dsv4_worker import (
-    DSV4MPConnector,
-    require_native_server,
+from atom.kv_transfer.offload.mp.native_state_layout import (
+    build_native_state_mp_layout,
+)
+from atom.kv_transfer.offload.mp.native_state_worker import (
+    NativeStateLMCacheMPConnector,
+    require_native_state_server,
 )
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 
@@ -43,7 +47,7 @@ def config(**extra):
     return SimpleNamespace(
         kv_cache_block_size=4,
         tensor_parallel_size=2,
-        hf_config=SimpleNamespace(model_type="deepseek_v4", kv_lora_rank=512),
+        hf_config=SimpleNamespace(model_type="reusable_test_model", kv_lora_rank=512),
         kv_transfer_config={
             "kv_connector": "lmcache_mp",
             "kv_role": "offload",
@@ -54,9 +58,9 @@ def config(**extra):
 
 @pytest.fixture
 def worker():
-    instance = DSV4MPConnector(config())
+    instance = NativeStateLMCacheMPConnector(config())
     page = torch.zeros((32, 1, 32), dtype=torch.uint8)
-    spec = PagedStateCheckpointSpec(32, 128, "dsv4-paged-state-v3:test", 80)
+    spec = PagedStateCheckpointSpec(32, 128, "native-test-v1", 80)
     tensors = KVTransferTensors(
         block_regions=[
             KVTransferRegion(
@@ -69,7 +73,9 @@ def worker():
         execute_paged_state_copies=lambda *_: None,
     )
     tensors.set_block_count(32)
-    instance._native_layout = build_dsv4_mp_layout(tensors, block_size=4, chunk_size=8)
+    instance._native_layout = build_native_state_mp_layout(
+        tensors, block_size=4, chunk_size=8
+    )
     instance.chunk_size = 8
     instance.submitted = []
     instance.future = Future()
@@ -192,38 +198,26 @@ def test_exact_completed_generation_cannot_replay(worker):
         worker._submit_save(request(), object())
 
 
-def test_dsv4_cannot_collapse_tp_state():
-    assert _tp_replication_factor(config()) == 1
+def test_native_state_cannot_collapse_tp_ranks():
+    assert _tp_replication_factor(config()) == 2
+    assert _tp_replication_factor(config(), native_state=True) == 1
     with pytest.raises(ValueError, match="every TP rank"):
-        _tp_replication_factor(config(**{"lmcache.mp.tp_rank_collapse": True}))
-
-
-def test_factory_selects_native_worker_and_scheduler_for_v3_schema():
-    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-    from atom.kv_transfer.offload.mp.dsv4_scheduler import DSV4MPConnectorScheduler
-
-    cfg = config()
-    cfg.hf_config.model_type = "deepseek_v3"
-    cfg.hf_config.compress_ratios = [0, 4, 128]
-    assert isinstance(
-        KVConnectorFactory.create_connector(cfg, "worker"), DSV4MPConnector
-    )
-    assert isinstance(
-        KVConnectorFactory.create_connector(cfg, "scheduler"), DSV4MPConnectorScheduler
-    )
+        _tp_replication_factor(
+            config(**{"lmcache.mp.tp_rank_collapse": True}), native_state=True
+        )
 
 
 def test_native_server_chunk_mismatch_fails_before_registration(monkeypatch):
-    from atom.kv_transfer.offload.mp import dsv4_worker
+    from atom.kv_transfer.offload.mp import native_state_worker
 
     monkeypatch.setattr(
-        dsv4_worker.offcfg,
+        native_state_worker.offcfg,
         "build_lmcache_config",
         lambda _: SimpleNamespace(chunk_size=256),
     )
     adapter = SimpleNamespace(lmcache_tokens_per_chunk=512)
     with pytest.raises(ValueError, match="must match"):
-        require_native_server(adapter, config())
+        require_native_state_server(adapter, config())
 
 
 def test_native_namespace_changes_with_image_codec(monkeypatch):
@@ -234,7 +228,7 @@ def test_native_namespace_changes_with_image_codec(monkeypatch):
     monkeypatch.setattr(
         backend.offcfg, "build_page_namespace", lambda *_: "page-config"
     )
-    first = PagedStateCheckpointSpec(32, 128, "dsv4-paged-state-v3:a", 80)
+    first = PagedStateCheckpointSpec(32, 128, "native-test-v1", 80)
     second = replace(first, image_bytes=81)
     assert _model_namespace(config(), checkpoint_spec=first) != _model_namespace(
         config(), checkpoint_spec=second

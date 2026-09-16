@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 
-"""DSv4 MP admission and native PAGE-image lifetime contracts."""
+"""Native-state MP admission and PAGE-image lifetime contracts."""
 
 from types import SimpleNamespace
 
@@ -14,8 +14,13 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
 )
 from atom.kv_transfer.offload.mp import backend
-from atom.kv_transfer.offload.mp.dsv4_scheduler import DSV4MPConnectorScheduler
-from atom.kv_transfer.offload.mp.dsv4_worker import DSV4_MP_STORE_CHANNEL
+from atom.kv_transfer.offload.mp.connector import LMCacheMPConnectorScheduler
+from atom.kv_transfer.offload.mp.native_state_scheduler import (
+    NativeStateLMCacheMPConnectorScheduler,
+)
+from atom.kv_transfer.offload.mp.native_state_worker import (
+    NATIVE_STATE_MP_STORE_CHANNEL,
+)
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.page_unit_checkpoint import (
@@ -88,7 +93,7 @@ def make_scheduler(monkeypatch, *, capacity=2, budget=60, units=30, role="offloa
             },
         },
     )
-    scheduler = DSV4MPConnectorScheduler(config)
+    scheduler = NativeStateLMCacheMPConnectorScheduler(config)
     assert connections == []
     checkpoints = PagedStateCheckpointCoordinator(
         BlockPool(units),
@@ -133,7 +138,7 @@ def terminal(scheduler, operation, *, succeeded=True):
     output = KVConnectorOutput(
         finished_saving={operation},
         connector_completions={
-            ConnectorCompletion(DSV4_MP_STORE_CHANNEL, operation, succeeded)
+            ConnectorCompletion(NATIVE_STATE_MP_STORE_CHANNEL, operation, succeeded)
         },
     )
     return scheduler.process_completions(output)
@@ -385,7 +390,7 @@ def engine_scheduler(monkeypatch):
             },
         },
     )
-    connector = DSV4MPConnectorScheduler(config)
+    connector = LMCacheMPConnectorScheduler(config)
     monkeypatch.setattr(
         "atom.utils.forward_context.get_kvconnector", lambda _role, _config: connector
     )
