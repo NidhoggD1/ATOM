@@ -47,10 +47,36 @@ class _Qwen4ExpQuantizationConfig:
     Exclusions take precedence over ordered layer rules, as in QuantizationConfig.
     GDN policies also recognize the packed name, but the four checkpoint shards
     remain separate queries until their compatibility has been checked.
+
+    compressed-tensors / llmcompressor often puts the bare GDN container
+    ``*.linear_attn`` into ``ignore``. ATOM treats that as a prefix exclude and
+    then also drops quantized children (``out_proj``, ``in_proj_qkv``, ...) that
+    PTPC-FP8 actually ships. Strip only the bare container entries; keep the
+    leaf ignores (``in_proj_a/b``, ``norm``) and force ``conv1d`` unquantized.
     """
 
     def __init__(self, config):
         self._config = config
+        for field in ("exclude_layers", "online_exclude_layers"):
+            raw = list(getattr(config, field, []) or [])
+            cleaned = []
+            parents = []
+            for e in raw:
+                if (
+                    isinstance(e, str)
+                    and (e.endswith(".linear_attn") or e == "linear_attn")
+                    and "*" not in e
+                    and not e.startswith("re:")
+                ):
+                    parents.append(e)
+                else:
+                    cleaned.append(e)
+            for p in parents:
+                conv = p + ".conv1d"
+                if conv not in cleaned:
+                    cleaned.append(conv)
+            if cleaned != raw:
+                setattr(config, field, cleaned)
 
     def __getattr__(self, name):
         return getattr(self._config, name)
@@ -262,6 +288,105 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
         return out.view(orig_shape)
 
 
+def _install_ptpc_gdn_in_proj_dequant(linear) -> None:
+    """Load PTPC FP8 in_proj_qkv/z into BF16 packed GDN in_proj.
+
+    Official Flash-Next FP8 keeps GDN in_proj BF16. PTPC quantizes qkv/z with
+    per-channel scales while a/b stay BF16. Runtime stays the BF16 packed GEMM
+    (same as official); FP8 shards are dequantized at load with their scales.
+    """
+    out_features = int(linear.weight.shape[0])
+    scale = atom_parameter(
+        torch.ones(out_features, 1, dtype=torch.float32, device=linear.weight.device)
+    )
+    # Temporarily accept checkpoint scales; removed after dequant commit.
+    linear.register_parameter("weight_scale", scale)
+    n_shards = len(linear.output_sizes)
+    linear._ptpc_fp8_w = [None] * n_shards
+    linear._ptpc_scales = [None] * n_shards
+    base_loader = type(linear).weight_loader
+
+    def _try_commit(module, shard_id: int) -> None:
+        w = module._ptpc_fp8_w[shard_id]
+        s = module._ptpc_scales[shard_id]
+        if w is None or s is None:
+            return
+        # Keep FULL (pre-TP) tensors so base_loader can apply TP sharding once.
+        s2 = s.reshape(-1, *([1] * (w.dim() - 1)))
+        dequant = (w.to(torch.float32) * s2.to(dtype=torch.float32)).to(
+            module.weight.dtype
+        )
+        base_loader(module, module.weight, dequant, shard_id)
+        module._ptpc_fp8_w[shard_id] = None
+
+    def weight_loader(self, param, loaded_weight, loaded_shard_id=None):
+        if isinstance(loaded_shard_id, tuple):
+            shard_sizes = [self.output_sizes[i] for i in loaded_shard_id]
+            off = 0
+            for shard_id, shard_size in zip(loaded_shard_id, shard_sizes):
+                shard = loaded_weight.narrow(self.tp_dim, off, shard_size)
+                weight_loader(self, param, shard, shard_id)
+                off += shard_size
+            return
+
+        if loaded_shard_id is None:
+            return base_loader(self, param, loaded_weight, loaded_shard_id)
+
+        shard_id = int(loaded_shard_id)
+        if shard_id >= 4:
+            return base_loader(self, param, loaded_weight, loaded_shard_id)
+
+        if param is getattr(self, "weight_scale", None):
+            # Only buffer the scale for dequant; do not write it through
+            # base_loader (temp scale has no weight_loader_process).
+            self._ptpc_scales[shard_id] = (
+                loaded_weight.detach().float().reshape(-1, 1).cpu()
+            )
+            _try_commit(self, shard_id)
+            return
+
+        if param is self.weight and loaded_weight.dtype == torch.float8_e4m3fn:
+            self._ptpc_fp8_w[shard_id] = loaded_weight.detach().to("cpu")
+            _try_commit(self, shard_id)
+            return
+
+        return base_loader(self, param, loaded_weight, loaded_shard_id)
+
+    import types
+
+    linear.weight_loader = types.MethodType(weight_loader, linear)
+    linear.weight.weight_loader = linear.weight_loader
+    linear.weight_scale.weight_loader = linear.weight_loader
+    if hasattr(linear, "weight_loader_process"):
+        linear.weight_scale.weight_loader_process = linear.weight_loader_process
+        if not hasattr(linear.weight, "weight_loader_process"):
+            linear.weight.weight_loader_process = linear.weight_loader_process
+
+    _orig_proc = getattr(linear, "process_weights_after_loading", None)
+
+    def process_weights_after_loading(self):
+        for i in range(len(self.output_sizes)):
+            _try_commit(self, i)
+        if self._ptpc_fp8_w is not None and any(w is not None for w in self._ptpc_fp8_w):
+            missing = [i for i, w in enumerate(self._ptpc_fp8_w) if w is not None]
+            raise RuntimeError(
+                f"{getattr(self, 'prefix', 'in_proj')}: PTPC GDN in_proj "
+                f"missing scales for shards {missing}"
+            )
+        # Keep forward as plain BF16 GEMM (no scale path).
+        if hasattr(self, "weight_scale"):
+            delattr(self, "weight_scale")
+        self.register_parameter("weight_scale", None)
+        self._ptpc_fp8_w = None
+        self._ptpc_scales = None
+        if callable(_orig_proc):
+            _orig_proc()
+
+    linear.process_weights_after_loading = types.MethodType(
+        process_weights_after_loading, linear
+    )
+
+
 class Qwen4ExpLinearAttention(nn.Module):
     """Gated DeltaNet, on the 36 `linear_attention` layers.
 
@@ -288,22 +413,25 @@ class Qwen4ExpLinearAttention(nn.Module):
         self, atom_config, config, quant_config=None, prefix: str = ""
     ) -> None:
         super().__init__()
+        # Official blockwise FP8 keeps all GDN in_proj shards BF16 and packs
+        # them. PTPC-FP8 quantizes in_proj_qkv/z (per-channel) while leaving
+        # in_proj_a/b BF16. We still run the packed GEMM in BF16 (same as
+        # official) and dequant FP8 shards at load -- do not reject PTPC.
+        self._ptpc_dequant_in_proj = False
         if quant_config is not None:
-            # B/A have 48 output rows, so separately quantized checkpoint
-            # shards cannot share packed block scales. Published FP8 weights
-            # exclude GDN; reject other source/online layouts before loading.
+            quantized = {}
             for projection in ("qkv", "z", "b", "a"):
                 name = f"{prefix}.in_proj_{projection}"
-                for online in (False, True) if quant_config.online_quant else (False,):
-                    policy = quant_config.get_layer_quant_config(
-                        name, use_online_quant=online
-                    )
-                    if policy.is_quantized:
-                        raise ValueError(
-                            "Qwen3.8-Flash-Next requires unquantized GDN input "
-                            f"projections; {name} is quantized "
-                            f"({'online' if online else 'source'} policy)"
-                        )
+                policy = quant_config.get_layer_quant_config(
+                    name, use_online_quant=False
+                )
+                quantized[projection] = bool(getattr(policy, "is_quantized", False))
+            if quantized["b"] or quantized["a"]:
+                raise ValueError(
+                    "Qwen3.8-Flash-Next GDN in_proj_a/b must stay unquantized so "
+                    f"they can pack with qkv/z; got quantized a/b under {prefix}"
+                )
+            self._ptpc_dequant_in_proj = quantized["qkv"] or quantized["z"]
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.config = config
@@ -338,6 +466,8 @@ class Qwen4ExpLinearAttention(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.in_proj_qkvzba",
         )
+        if self._ptpc_dequant_in_proj:
+            _install_ptpc_gdn_in_proj_dequant(self.in_proj_qkvzba)
         self.out_proj = RowParallelLinear(
             self.value_dim,
             self.hidden_size,
@@ -348,11 +478,12 @@ class Qwen4ExpLinearAttention(nn.Module):
             prefix=f"{prefix}.out_proj",
         )
 
+        # conv1d is BF16 in both official FP8 and PTPC; never attach PTPC.
         self.conv1d = ColumnParallelLinear(
             input_size=self.conv_kernel_size,
             output_size=self.conv_dim,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=f"{prefix}.conv1d",
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)

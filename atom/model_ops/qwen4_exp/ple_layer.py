@@ -225,7 +225,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         embedding_cls = VocabParallelEmbedding
         if policy is not None and policy.is_quantized:
-            if quant_config.quant_method != "fp8":
+            # Official Flash-Next FP8 and PTPC-FP8 both keep PLE as a global
+            # FP8 table (not blockwise / PTPC linear). compressed-tensors
+            # checkpoints still report quant_method="compressed-tensors".
+            if quant_config.quant_method not in ("fp8", "compressed-tensors"):
                 raise ValueError("PLE embedding supports BF16 or FP8 checkpoints")
             # PLE uses a global scalar, independently of the linear block scales.
             embedding_cls = _Qwen4ExpFP8Embedding
