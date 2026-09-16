@@ -176,6 +176,180 @@ models:
       fewshot: 3
       limit: null
 
+  # DeepSeek-V4-Pro-0813 checkpoint with DSpark speculative decoding (built into
+  # the checkpoint -- no separate draft model, unlike Kimi-K3), benchmarked with
+  # the agentic aiperf request path (inferencex-agentx-mvp on the semianalysis 1M
+  # traces) -- the same benchmark kind the lirzhang agentic-benchmark-ci branch
+  # uses, not the default random ISL/OSL. Follows
+  # recipes/DeepSeek-V4-Agentic-PD-Max.md: method dspark, 3 speculative tokens,
+  # acceptance length 3.01; TP up to concurrency 32, DP attention from 64. Each
+  # concurrency is its own job so every measurement starts from a fresh service
+  # instead of inheriting HBM prefix-cache state.
+  DeepSeek-V4-Pro-0813:
+    backend: atom
+    model_path: "${ATOMESH_MODEL_ROOT}/DeepSeek-V4-Pro-0813/"
+    precision: FP4
+    env:
+      common:
+        AITER_BF16_FP8_MOE_BOUND: "0"
+        ATOM_MOE_GU_ITLV: "1"
+      prefill: {}
+      decode: {}
+    server:
+      # Agentic server config from recipes/DeepSeek-V4-Agentic-PD-Max.md. spec_*
+      # go through common_args (not extra_args) so they are not double-passed;
+      # max_num_seqs is overridden per concurrency below (the recipe's CONC*2).
+      common_args: &ds0813_agentic_args
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        block_size: 16
+        enable_prefix_caching: true
+        gpu_memory_utilization: 0.9
+        max_model_len: ""
+        max_num_batched_tokens: 16384
+        state_checkpoint_interval_tokens: 8192
+        method: dspark
+        num_speculative_tokens: 3
+        spec_decode_acceptance_length: 3.01
+        extra_args: "--attn-prefill-chunk-size 16384"
+    suites:
+      nightly:
+        # --- TP band, concurrency 1-32 (recipe's TP section). Decode graph range
+        # is left to `auto` because DSpark's width feeds it. ---
+        - <<: &ds0813_agentic_tp8
+            topology: 1p1d_dspark3
+            display_topology: 1P1D-TP8-DSPARK3
+            pd_worker_layout: multi_node
+            nodes: "${ATOMESH_1P1D_NODES}"
+            isl: [1048576]
+            osl: 1024
+            prefill:
+              workers: 1
+              tp: 8
+              compilation_level: 3
+            decode:
+              workers: 1
+              tp: 8
+              cudagraph: auto
+              cudagraph_mode: FULL
+              compilation_level: 3
+            benchmark: &ds0813_agentic_1m_aiperf
+              kind: aiperf_agentic
+              aiperf_commit: 754356e9a39acc6cc6afb242d123bb57c3fb6f75
+              scenario: inferencex-agentx-mvp
+              public_dataset: semianalysis_cc_traces_weka_062126
+              apply_chat_template: true
+              max_context_length: 1048576
+              num_dataset_entries: 393
+              benchmark_duration: 3600
+              warmup_requests_per_lane: 10
+              trace_idle_gap_cap_seconds: 300
+              warmup_grace_period: 1800
+              trajectory_start_min_ratio: 0.25
+              trajectory_start_max_ratio: 0.75
+              failed_request_threshold: 0.10
+              slice_duration: 1.0
+              cancel_drain_timeout: 300
+              http_tcp_user_timeout: 900000
+              dataset_weka_live_assistant_responses: 0
+              dataset_configuration_timeout: 1800
+              service_profile_configure_timeout: 1800
+              wait_server_timeout: 4500
+              wait_router_timeout: 600
+            run_eval: false
+          name: ds-v4-dspark-1p1d-tp8-agentic-1m-c1
+          concurrency: [1]
+          server:
+            common_args:
+              <<: *ds0813_agentic_args
+              max_num_seqs: 2
+
+        - <<: *ds0813_agentic_tp8
+          name: ds-v4-dspark-1p1d-tp8-agentic-1m-c2
+          concurrency: [2]
+          server:
+            common_args:
+              <<: *ds0813_agentic_args
+              max_num_seqs: 4
+
+        - <<: *ds0813_agentic_tp8
+          name: ds-v4-dspark-1p1d-tp8-agentic-1m-c4
+          concurrency: [4]
+          server:
+            common_args:
+              <<: *ds0813_agentic_args
+              max_num_seqs: 8
+
+        - <<: *ds0813_agentic_tp8
+          name: ds-v4-dspark-1p1d-tp8-agentic-1m-c8
+          concurrency: [8]
+          server:
+            common_args:
+              <<: *ds0813_agentic_args
+              max_num_seqs: 16
+
+        - <<: *ds0813_agentic_tp8
+          name: ds-v4-dspark-1p1d-tp8-agentic-1m-c16
+          concurrency: [16]
+          server:
+            common_args:
+              <<: *ds0813_agentic_args
+              max_num_seqs: 32
+
+        - <<: *ds0813_agentic_tp8
+          name: ds-v4-dspark-1p1d-tp8-agentic-1m-c32
+          concurrency: [32]
+          server:
+            common_args:
+              <<: *ds0813_agentic_args
+              max_num_seqs: 64
+
+        # --- DP attention band, concurrency 64-128 (recipe's DP section).
+        # --enable-tbo is prefill-only; the decode node runs DP attention without
+        # it. DP master/base ports are managed by pd_server_atom.sh, so only the
+        # four DP tuning variables the recipe calls out are set (session affinity
+        # is the load-bearing one for the DP path's cache hit). ---
+        - <<: &ds0813_agentic_dpa_tp8
+            <<: *ds0813_agentic_tp8
+            topology: 1p1d_dpa_dspark3
+            display_topology: 1P1D-DPA-TP8-DSPARK3
+            env:
+              common:
+                GPU_MAX_HW_QUEUES: "5"
+                ATOM_NUMA_BIND: "1"
+                ATOM_DP_SESSION_AFFINITY: "1"
+                ATOM_DP_LB_REQ_EQUIV: "512"
+            prefill:
+              workers: 1
+              tp: 8
+              compilation_level: 3
+              extra_args: "--enable-dp-attention --enable-tbo"
+            decode:
+              workers: 1
+              tp: 8
+              cudagraph: auto
+              cudagraph_mode: FULL
+              compilation_level: 3
+              extra_args: "--enable-dp-attention"
+          name: ds-v4-dspark-1p1d-dpa-tp8-agentic-1m-c64
+          concurrency: [64]
+          server:
+            common_args:
+              <<: *ds0813_agentic_args
+              max_num_seqs: 128
+
+        - <<: *ds0813_agentic_dpa_tp8
+          name: ds-v4-dspark-1p1d-dpa-tp8-agentic-1m-c128
+          concurrency: [128]
+          server:
+            common_args:
+              <<: *ds0813_agentic_args
+              max_num_seqs: 256
+    accuracy:
+      task: gsm8k
+      fewshot: 3
+      limit: null
+
   GLM-5.2-MXFP4:
     backend: atom
     model_path: "${ATOMESH_MODEL_ROOT}/GLM-5.2-MXFP4"

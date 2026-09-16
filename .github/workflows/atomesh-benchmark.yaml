@@ -46,7 +46,7 @@ on:
         default: false
         type: boolean
       model_names:
-        description: 'When run_all_models=false, run all cases in the selected suite for these model families. Comma-separated: DeepSeek-V4-Pro,GLM-5.2-MXFP4,Kimi-K3-MXFP4,Kimi-K2.5-MXFP4,MiniMax-M3-MXFP4,MiniMax-M3-MXFP8'
+        description: 'When run_all_models=false, run all cases in the selected suite for these model families. Comma-separated: DeepSeek-V4-Pro,DeepSeek-V4-Pro-0813,GLM-5.2-MXFP4,Kimi-K3-MXFP4,Kimi-K2.5-MXFP4,MiniMax-M3-MXFP4,MiniMax-M3-MXFP8'
         required: false
         default: ''
         type: string
@@ -56,6 +56,12 @@ on:
           DeepSeek:
             ds-v4-1p1d-tp8-smoke,ds-v4-1p1d-tp8,ds-v4-1p1d-dpa-tp8,
             ds-v4-1p1d-tp8-mtp3,ds-v4-1p1d-dpa-tp8-mtp1
+
+          DeepSeek-V4-Pro-0813 (DSpark, agentic 1M):
+            ds-v4-dspark-1p1d-tp8-agentic-1m-c1,ds-v4-dspark-1p1d-tp8-agentic-1m-c2,
+            ds-v4-dspark-1p1d-tp8-agentic-1m-c4,ds-v4-dspark-1p1d-tp8-agentic-1m-c8,
+            ds-v4-dspark-1p1d-tp8-agentic-1m-c16,ds-v4-dspark-1p1d-tp8-agentic-1m-c32,
+            ds-v4-dspark-1p1d-dpa-tp8-agentic-1m-c64,ds-v4-dspark-1p1d-dpa-tp8-agentic-1m-c128
 
           GLM:
             glm-52-mxfp4-1p1d-tp4,glm-52-mxfp4-1p1d-tp8,
@@ -337,7 +343,7 @@ jobs:
             ATOMESH_2P1D_NODES=mia1-p02-g42,mia1-p02-g44,mia1-p02-g47 \
               python3 .github/scripts/atomesh/pd_matrix.py \
               --suite nightly \
-              --model DeepSeek-V4-Pro \
+              --model DeepSeek-V4-Pro,DeepSeek-V4-Pro-0813 \
               ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
               --output atomesh-matrix-deepseek.json
 
