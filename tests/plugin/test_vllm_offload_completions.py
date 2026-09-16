@@ -24,7 +24,8 @@ connector_mod = pytest.importorskip(
 class _FakeScheduler:
     """Records the resolver calls; those are the contract under test."""
 
-    def __init__(self, defer=()) -> None:
+    def __init__(self, defer=(), abandon_timeout_s: float = 0.0) -> None:
+        self.abandon_timeout_s = abandon_timeout_s
         self.saves: list[str] = []
         self.loads: list[str] = []
         self.failed_loads: list[str] = []
@@ -52,16 +53,23 @@ class _FakeScheduler:
     def cancel_pending_load(self, seq) -> None:
         self.cancelled.append(str(seq.id))
 
+    def save_abandon_timeout_s(self) -> float:
+        return self.abandon_timeout_s
 
-def _adapter(world_size: int = 1, defer=()) -> tuple[object, _FakeScheduler]:
+
+def _adapter(
+    world_size: int = 1, defer=(), abandon_timeout_s: float = 0.0
+) -> tuple[object, _FakeScheduler]:
     # Built without __init__: constructing it for real needs a VllmConfig and
     # would pull the whole offload stack in, which is not what this covers.
     adapter = object.__new__(connector_mod.AtomLMCacheOffloadConnector)
-    scheduler = _FakeScheduler(defer)
+    scheduler = _FakeScheduler(defer, abandon_timeout_s)
     adapter._scheduler = scheduler
     adapter._seqs = SeqViewRegistry()
     adapter._promised_loads = {}
     adapter._deferred_frees = set()
+    adapter._deferred_since = {}
+    adapter._deferred_reclaimed = 0
     adapter._releases_in_flight = set()
     adapter._save_reports = {}
     adapter._load_failure_reports = {}
@@ -419,3 +427,95 @@ def test_a_dispatched_load_is_not_reported():
     )
 
     assert adapter._promised_loads == {}
+
+
+# -- a deferral that is never reported ------------------------------------
+#
+# `should_defer_free` clears only when the save is reported. On the native path
+# `reclaim_stale_leases` bounds that wait; on this path vLLM holds the blocks
+# and only `_collect_releases` can hand them back, so the bound has to live
+# here. Without it a lost report costs the pool that request's blocks
+# permanently, and enough of them stall the engine at Running=0 on capacity.
+
+
+def test_a_never_reported_save_does_not_hold_the_blocks_forever(monkeypatch):
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(connector_mod.time, "monotonic", lambda: clock["t"])
+
+    adapter, scheduler = _adapter(defer={"a"}, abandon_timeout_s=330.0)
+    assert _finish(adapter) == (True, None)
+
+    # The save never reports: `defer` is never cleared.
+    clock["t"] += 329.0
+    assert adapter._collect_releases() == []
+    assert adapter._deferred_frees == {"a"}
+
+    clock["t"] += 2.0  # now past the window
+    assert adapter._collect_releases() == ["a"]
+
+    # Reclaimed the same way a normal release is, so ATOM's save tracker is
+    # popped and the worker still owes the echo back.
+    assert scheduler.finished == ["a", "a"]
+    assert adapter._deferred_frees == set()
+    assert adapter._deferred_since == {}
+    assert len(adapter._seqs) == 0
+    assert adapter._deferred_reclaimed == 1
+
+
+def test_reclamation_is_off_when_the_scheduler_reports_no_window(monkeypatch):
+    """Non-positive disables it, as on the native path."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(connector_mod.time, "monotonic", lambda: clock["t"])
+
+    adapter, _ = _adapter(defer={"a"}, abandon_timeout_s=0.0)
+    _finish(adapter)
+
+    clock["t"] += 86_400.0
+    assert adapter._collect_releases() == []
+    assert adapter._deferred_frees == {"a"}
+    assert adapter._deferred_reclaimed == 0
+
+
+def test_a_save_that_lands_inside_the_window_is_not_counted_as_reclaimed(
+    monkeypatch,
+):
+    """The timeout must not paper over the healthy path in the statistics."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(connector_mod.time, "monotonic", lambda: clock["t"])
+
+    adapter, scheduler = _adapter(defer={"a"}, abandon_timeout_s=330.0)
+    _finish(adapter)
+
+    clock["t"] += 10.0
+    scheduler.defer.clear()
+    assert adapter._collect_releases() == ["a"]
+    assert adapter._deferred_reclaimed == 0
+
+
+def test_the_window_is_per_request_not_per_connector(monkeypatch):
+    """Two deferrals started 300s apart must expire 300s apart."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(connector_mod.time, "monotonic", lambda: clock["t"])
+
+    adapter, _ = _adapter(defer={"a", "b"}, abandon_timeout_s=330.0)
+    _finish(adapter, "a")
+    clock["t"] += 300.0
+    _finish(adapter, "b")
+
+    clock["t"] += 31.0  # a is 331s old, b is 31s old
+    assert adapter._collect_releases() == ["a"]
+    assert adapter._deferred_frees == {"b"}
+    assert adapter._deferred_since.keys() == {"b"}
+
+
+def test_a_scheduler_without_the_hook_never_reclaims():
+    """Older offload schedulers predate `save_abandon_timeout_s`."""
+    adapter, scheduler = _adapter(defer={"a"}, abandon_timeout_s=330.0)
+    del type(scheduler).save_abandon_timeout_s
+    try:
+        _finish(adapter)
+        assert adapter._collect_releases() == []
+    finally:
+        type(scheduler).save_abandon_timeout_s = (
+            lambda self: self.abandon_timeout_s
+        )

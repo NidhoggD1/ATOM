@@ -23,6 +23,7 @@ per transfer, not one layer at a time.
 """
 
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -133,6 +134,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         # echo the release back. See `_collect_releases`.
         self._deferred_frees: set[str] = set()
         self._releases_in_flight: set[str] = set()
+        # When each deferral started, so `_collect_releases` can bound it. The
+        # native engine bounds the same wait with `reclaim_stale_leases`; on
+        # this path vLLM owns the blocks and only the connector can let go.
+        self._deferred_since: dict[str, float] = {}
+        self._deferred_reclaimed = 0
         # Per-request rank tallies for the two facts that travel as worker
         # metadata rather than as one of vLLM's two id sets.
         self._save_reports: dict[str, int] = {}
@@ -484,21 +490,77 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         The final `request_finished` is what pops ATOM's save tracker, which is
         in turn what stops the save loop from ever emitting a save against
         blocks vLLM is about to reassign.
+
+        The wait is bounded. `should_defer_free` clears only when the save is
+        reported, and a report can be lost -- most cheaply when the per-rank
+        quorum `_absorb_worker_meta` counts never completes -- after which the
+        deferral has nothing left to wait for. There is no ceiling anywhere else
+        on this path: the native engine has one (`reclaim_stale_leases`), but on
+        the plugin path vLLM holds the blocks and only this method can hand them
+        back. Left unbounded, finished requests keep their GPU blocks until the
+        pool is exhausted and the engine stalls at Running=0 with every slot
+        WAITING on capacity and no preemption possible -- the blocks are
+        referenced, not merely cached, so the prefix cache cannot be dropped to
+        recover. Measured on MiniMax-M3 agentic replay at concurrency 40 with a
+        400 GiB/rank CPU tier, i.e. with the tier nowhere near full.
         """
         if not self._deferred_frees:
             return []
+        timeout_s = self._save_abandon_timeout_s()
+        now = time.monotonic()
         released = []
         for req_id in sorted(self._deferred_frees):
             seq = self._seqs.get(req_id)
             if seq is not None:
                 if self._scheduler.should_defer_free(seq):
-                    continue
+                    held = now - self._deferred_since.get(req_id, now)
+                    if timeout_s <= 0 or held < timeout_s:
+                        continue
+                    self._deferred_reclaimed += 1
+                    logger.warning(
+                        "ATOM LMCache offload: reclaiming the deferred free of "
+                        "%s after %.1fs (limit %.1fs) -- its save never "
+                        "reported. reclaimed_so_far=%d still_deferred=%d",
+                        req_id,
+                        held,
+                        timeout_s,
+                        self._deferred_reclaimed,
+                        len(self._deferred_frees) - len(released) - 1,
+                    )
                 self._scheduler.request_finished(seq)
             self._seqs.drop(req_id)
             released.append(req_id)
         self._deferred_frees.difference_update(released)
+        for req_id in released:
+            self._deferred_since.pop(req_id, None)
         self._releases_in_flight.update(released)
         return released
+
+    def _save_abandon_timeout_s(self) -> float:
+        """Seconds a deferred free may sit before the blocks are taken back.
+
+        Asked of the scheduler rather than re-derived here: the value is LMCache
+        knowledge (`offload_save_abandon_timeout_s` sums LMCache's own
+        `LMCACHE_EC_PIN_TIMEOUT_SEC` with a margin, and that ordering IS the
+        safety argument), and the native engine already reads it from the same
+        place for `reclaim_stale_leases`. A second env var of this connector's
+        own could be set the wrong way round with nothing to say so.
+
+        Non-positive disables reclamation, matching the native path.
+        """
+
+        getter = getattr(self._scheduler, "save_abandon_timeout_s", None)
+        if getter is None:
+            return 0.0
+        try:
+            return float(getter())
+        except Exception:  # pragma: no cover - a knob must not break the step
+            logger.warning(
+                "ATOM LMCache offload: save_abandon_timeout_s() failed; "
+                "deferred frees will not be reclaimed",
+                exc_info=True,
+            )
+            return 0.0
 
     def has_pending_push_work(self) -> bool:
         """Keep the engine stepping while a deferred free is still owed.
@@ -630,6 +692,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
                 # the connector names the id in `finished_sending`, and
                 # `_collect_releases` is what eventually produces that.
                 self._deferred_frees.add(req_id)
+                self._deferred_since.setdefault(req_id, time.monotonic())
                 return True, None
             self._seqs.drop(req_id)
         return False, None
