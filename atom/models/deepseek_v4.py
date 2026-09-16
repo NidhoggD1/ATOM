@@ -113,6 +113,7 @@ from atom.model_ops.v4_kernels import (
     sparse_attn_v4_paged_prefill,
     swa_write,
     update_compressor_states,
+    v4_decode_query_group,
 )
 from atom.utils import envs, mark_spliting_op
 from atom.utils.attn_ffn_piecewise import decode_bucket_key, piecewise_core
@@ -3142,9 +3143,9 @@ class DeepseekV4Attention(nn.Module):
             else:  # ratio == 128
                 kv_indices = attn_md.kv_indices_hca
                 kv_indptr = attn_md.kv_indptr_hca
-            # Dispatch on kv-cache layout inside the wrapper: fp8 2buff
-            # (unified_kv_rope set) → aiter asm op5 with pre-packed fp8 Q + the
-            # 2buff fp8/bf16 pools read with no requant; bf16 (unified_kv_rope
+            # Dispatch on KV-cache layout inside the wrapper. Native 2-buffer
+            # FP8 uses the tuned Triton path by default and consumes pre-packed
+            # Q plus the FP8 NoPE/BF16 RoPE pools without requantization.
             o = sparse_attn_v4_paged_decode(
                 qkn.q_sa,
                 self.unified_kv,
@@ -3157,6 +3158,10 @@ class DeepseekV4Attention(nn.Module):
                 q_rope_in=qkn.q_rope,
                 qo_indptr=attn_md.qo_indptr,
                 prefix=f"{self.layer_name}.sparse_attn_decode",
+                query_group=v4_decode_query_group(
+                    attn_md.min_seqlen_q, attn_md.max_seqlen_q
+                ),
+                kv_kind="csa" if ratio == 4 else "hca" if ratio == 128 else "swa",
             )  # [S, H, head_dim]
         else:
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio

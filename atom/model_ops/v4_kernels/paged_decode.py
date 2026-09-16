@@ -80,6 +80,19 @@ _FP8_GROUP_SIZE = 64
 _FP8_DTYPE = torch.float8_e4m3fnuz
 
 
+def v4_decode_query_group(min_seqlen_q: int, max_seqlen_q: int) -> int:
+    """Expose rectangular verify widths with a tuned Triton specialization.
+
+    Four-row verification uses the query-fused kernel, while DSpark K6 produces seven target
+    rows and uses a q7-specific regular/striped launch policy. All ragged or
+    otherwise unsupported shapes stay at one so they cannot accidentally
+    share KV indices across requests.
+    """
+    if min_seqlen_q == max_seqlen_q and min_seqlen_q in (4, 7):
+        return min_seqlen_q
+    return 1
+
+
 @functools.lru_cache(maxsize=1)
 def _cu_count() -> int:
     """Compute-unit count of the active GPU, queried once via aiter.
@@ -1066,12 +1079,15 @@ def sparse_attn_v4_paged_decode(
     qo_indptr: torch.Tensor | None = None,
     kv_last_page_lens: torch.Tensor | None = None,
     prefix: str = "",
+    query_group: int = 1,
+    kv_kind: str = "",
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
-    Native 2buff fp8 (``unified_kv_rope`` provided): routes to the aiter asm
-    kernel (op5) with pre-packed fp8 Q (``q_packed_in``/``q_rope_in``); the
-    fp8 NoPE pool + bf16 RoPE pool are read with no requant.
+    Native 2buff fp8 (``unified_kv_rope`` provided): routes to the native-cache
+    Triton dispatcher when ``ATOM_USE_TRITON_ATTN=1``; otherwise it uses the
+    aiter asm kernel (op5). Both consume pre-packed fp8 Q and read the fp8 NoPE
+    pool + bf16 RoPE pool without requantizing the cache.
 
     Otherwise (bf16): the existing Triton / reference path. When ``kv_scales``
     is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and is dequantized
@@ -1079,6 +1095,23 @@ def sparse_attn_v4_paged_decode(
     unreachable from the model).
     """
     if unified_kv_rope is not None:
+        if os.environ.get("ATOM_USE_TRITON_ATTN", "1") == "1":
+            from atom.model_ops.v4_kernels.paged_decode_fp8_triton import (
+                sparse_attn_v4_paged_decode_fp8_triton_auto,
+            )
+
+            return sparse_attn_v4_paged_decode_fp8_triton_auto(
+                q_packed_in,
+                q_rope_in,
+                unified_kv,
+                unified_kv_rope,
+                kv_indices,
+                kv_indptr,
+                attn_sink,
+                softmax_scale,
+                query_group=query_group,
+                kv_kind=kv_kind,
+            )
         return _sparse_attn_v4_paged_decode_asm(
             unified_kv,
             kv_indices,
