@@ -207,6 +207,9 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def request_finished(self, seq) -> None:
         self._impl.request_finished(seq)
 
+    def source_blocks_released(self, seq) -> None:
+        self._impl.source_blocks_released(seq)
+
     def should_park_for_load_after_alloc(self, seq) -> bool:
         return self._impl.should_park_for_load_after_alloc(seq)
 

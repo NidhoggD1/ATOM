@@ -2430,6 +2430,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 save_operation,
                 aligned - saved if page_save_due else 0,
             )
+            self._refresh_save_reclaim_clock(seq)
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
@@ -2709,6 +2710,14 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._active_slot_loads.pop(sid, None)
         self._load_save_floors.pop(sid, None)
         return True
+
+    def source_blocks_released(self, seq) -> None:
+        sid = str(seq.id)
+        entry = self._save_tracker.get(sid)
+        if entry is not None and entry[0] is seq and not self.should_defer_free(seq):
+            self._save_tracker.pop(sid, None)
+            self._failed_sidecar_saves.pop(sid, None)
+            self._save_watermark_rollback.pop(sid, None)
 
     def request_finished(self, seq) -> None:
         sid = str(seq.id)

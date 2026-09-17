@@ -434,6 +434,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             )
             entry[1] = aligned
             self._save_inflight[sid] = save_operation
+            self._refresh_save_reclaim_clock(seq)
             self._save_rr_last = sid
             if getattr(self, "_early_release", False):
                 # Freeze the exact token-index -> block-id mapping before a
@@ -855,6 +856,14 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._cancel_load_statistics(operation)
             if getattr(seq, "_load_operation", None) == operation:
                 delattr(seq, "_load_operation")
+
+    def source_blocks_released(self, seq) -> None:
+        # Do not rerun request finalization. Keep trackers backing independent
+        # leases or undispatched suffixes; retire only bookkeeping no reader needs.
+        sid = str(seq.id)
+        entry = self._save_tracker.get(sid)
+        if entry is not None and entry[0] is seq and not self.should_defer_free(seq):
+            self._save_tracker.pop(sid, None)
 
     def request_finished(self, seq) -> None:
         sid = str(seq.id)

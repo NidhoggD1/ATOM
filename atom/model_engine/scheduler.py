@@ -949,12 +949,6 @@ class Scheduler:
             callback(str(seq.id))
 
     def _maybe_release_deferred(self, seq: Sequence) -> None:
-        """Release only after the producer send and all offload work finish.
-
-        Save completions also drive incremental prefill saves, so they may
-        arrive before the send, or before the final suffix is even dispatched.
-        The connector's predicate covers both in-flight and undispatched work.
-        """
         if (
             seq.id not in self.deferred_free_blocks
             or getattr(seq, "_awaiting_kv_send", False)
@@ -963,11 +957,11 @@ class Scheduler:
         ):
             return
 
-        callback = getattr(self.kv_connector, "request_finished", None)
-        if callable(callback):
-            callback(seq)
         self.deferred_free_blocks.pop(seq.id, None)
         self.block_manager.deallocate(seq)
+        callback = getattr(self.kv_connector, "source_blocks_released", None)
+        if callable(callback):
+            callback(seq)
 
     def _save_abandon_timeout_s(self) -> float:
         """Seconds a deferred save may sit before reclamation, or 0 to disable.
@@ -994,15 +988,10 @@ class Scheduler:
         never-reported save keeps `has_pending_kv_work()` True forever and the
         engine busy-loops with every GPU idle.
 
-        Producer saves are eligible only after `finished_sending` clears
-        `_awaiting_kv_send`; a save timeout cannot release blocks still owned
-        by the send. Reclamation does not re-invoke `request_finished`: it was
-        already called when the request finished, before block free was
-        deferred. It does notify the connector via `abandon_save` -- freeing
-        the blocks here is not enough on its own: the connector holds the save in
-        `_save_inflight` (and, on K3, in the stall latch), so `should_defer_free`
-        would stay True and `has_pending_kv_work()` would never clear without
-        that drop.
+        A stalled save can be abandoned only after its producer's send has
+        finished. Otherwise reclamation would free the send's source blocks.
+        Notify the offload connector via `abandon_save` to retire its pending
+        work along with the blocks.
 
         The complement of the K3 connector's stall escape
         (`kimi_k3.connector.save_stall_seconds()`), not a duplicate of it: that
@@ -1947,6 +1936,7 @@ class Scheduler:
             # is in flight yet, but the connector still owns cleanup work.
             # Already-dispatched loads retain the completion-driven path below.
             self.kv_connector.cancel_pending_load(seq)
+            self.kv_connector.request_finished(seq)
             self.deferred_free_blocks[seq.id] = seq
             self._maybe_release_deferred(seq)
         if not has_inflight_load or not self._connector_flag("is_offload"):
@@ -1970,6 +1960,9 @@ class Scheduler:
         if hasattr(seq, "_awaiting_aborted_load_cleanup"):
             delattr(seq, "_awaiting_aborted_load_cleanup")
         self._uncount_inflight_load(seq)
+        callback = getattr(self.kv_connector, "request_finished", None)
+        if callable(callback):
+            callback(seq)
         self._maybe_release_deferred(seq)
 
     def _finish_aborted_load_cleanup(self, req_id) -> bool:
@@ -2543,6 +2536,8 @@ class Scheduler:
         # surrendered blocks (the mutator half of `should_defer_free`'s escape).
         self._connector_release_stalled_save(seq)
         self.block_manager.deallocate(seq)
+        if hasattr(seq, "_awaiting_kv_send"):
+            del seq._awaiting_kv_send
         self.waiting.appendleft(seq)
         return True
 
@@ -3007,6 +3002,25 @@ class Scheduler:
                 ),
             )
 
+            if leave_reason is not None:
+                # logger.info(
+                #     f"Sequence {seq.id} finished with reason: {leave_reason}, {seq.token_ids[-8:]=}"
+                # )
+                seq.num_tokens = num_tokens
+                seq.leave_reason = leave_reason
+                seq.status = SequenceStatus.FINISHED
+                self.total_finished_requests += 1
+                self.total_prompt_tokens += int(seq.num_prompt_tokens)
+                self.total_generation_tokens += max(
+                    0, int(num_tokens) - int(seq.num_prompt_tokens)
+                )
+                finished_seqs.append(seq)
+
+                # Finish the request once; later block release only retires trackers.
+                callback = getattr(self.kv_connector, "request_finished", None)
+                if callable(callback):
+                    callback(seq)
+
             # Prepare stream output
             # A terminal event is required even when truncation leaves no
             # tokens (for example max_tokens <= 0). Async consumers wait for
@@ -3014,8 +3028,6 @@ class Scheduler:
             if stream_output_queue is not None and (
                 new_tokens or leave_reason is not None
             ):
-                if self.kv_connector is not None and leave_reason is not None:
-                    self.kv_connector.request_finished(seq)
                 output_tokens_list = (
                     list(new_tokens)
                     if isinstance(new_tokens, tuple)
@@ -3040,20 +3052,6 @@ class Scheduler:
                     f"Scheduler: Created stream output for seq_id={seq.id}, "
                     f"tokens={new_tokens}, finished={leave_reason is not None}"
                 )
-
-            if leave_reason is not None:
-                # logger.info(
-                #     f"Sequence {seq.id} finished with reason: {leave_reason}, {seq.token_ids[-8:]=}"
-                # )
-                seq.num_tokens = num_tokens
-                seq.leave_reason = leave_reason
-                seq.status = SequenceStatus.FINISHED
-                self.total_finished_requests += 1
-                self.total_prompt_tokens += int(seq.num_prompt_tokens)
-                self.total_generation_tokens += max(
-                    0, int(num_tokens) - int(seq.num_prompt_tokens)
-                )
-                finished_seqs.append(seq)
 
         if stream_output_queue is not None and stream_outputs:
             stream_output_queue.put_nowait(stream_outputs)
@@ -3082,14 +3080,17 @@ class Scheduler:
                 seq.is_partial_prefill = False
                 self._partial_prefill_count -= 1
             if self.kv_connector is not None:
-                if hasattr(self.kv_connector, "request_finished"):
-                    self.kv_connector.request_finished(seq)
-                if self._connector_flag("is_producer"):
+                if (
+                    self._connector_flag("is_producer")
+                    and seq.leave_reason != "aborted"
+                    and getattr(seq, "_awaiting_kv_send", True)
+                ):
                     logger.debug(
                         "Deferring block free for seq %s until KV send completes.",
                         seq.id,
                     )
                     seq._awaiting_kv_send = True
+                    seq._deferred_save_at = time.monotonic()
                     self.deferred_free_blocks[seq.id] = seq
                 elif self._connector_should_defer_free(seq):
                     protected = self._connector_protected_block_ids(seq)
@@ -3422,25 +3423,22 @@ class Scheduler:
 
         finished_saving = kv_connector_output.finished_saving or ()
         for req_id in kv_connector_output.finished_sending or ():
-            assert (
-                self.kv_connector.is_producer
-            ), "Only producer should free blocks after sending KV"
-            logger.debug("Finished sending KV transfer for request %s", req_id)
             seq = self._deferred_sequence(req_id)
             if seq is None:
-                # Already reclaimed by `_reconcile_stalled_deferred_saves` after
-                # a stall; a late completion report has nothing left to free.
-                continue
-            seq._awaiting_kv_send = False
-            # Start save reclamation only after RDMA releases its ownership.
-            if (
-                self._connector_should_defer_free(seq)
-                and getattr(seq, "_deferred_save_at", None) is None
-            ):
-                seq._deferred_save_at = time.monotonic()
-            self._maybe_release_deferred(seq)
-
-        for req_id in finished_saving:
+                # PP can report the send before postprocess defers the request.
+                seq = next(
+                    (
+                        s
+                        for s in getattr(self, "running", ())
+                        if str(s.id) == str(req_id)
+                    ),
+                    None,
+                )
+            if seq is not None:
+                seq._awaiting_kv_send = False
+        completed_requests = set(kv_connector_output.finished_sending or ())
+        completed_requests.update(finished_saving)
+        for req_id in completed_requests:
             seq = self._deferred_sequence(req_id)
             if seq is not None:
                 self._maybe_release_deferred(seq)

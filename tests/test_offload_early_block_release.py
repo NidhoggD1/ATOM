@@ -393,6 +393,30 @@ class TestStoreOutcomeSeparation:
 
 
 class TestNoDoubleFree:
+    def test_suffix_save_gets_a_full_lease_window(self, monkeypatch):
+        clock = [1000.0]
+        monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(398, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        first = scheduler.build_connector_meta().requests[0].save_operation
+        seq.num_cached_tokens = 16
+        _finish_and_lease(scheduler, seq)
+
+        clock[0] += 99
+        scheduler.connector_completion(_source_safe(first, (0, 8)))
+        scheduler.take_source_safe_releases()
+        scheduler.connector_completion(_store_terminal(first))
+        second = scheduler.build_connector_meta().requests[0].save_operation
+        clock[0] += 2
+        assert scheduler.reclaim_stale_leases(100) == []
+        assert scheduler._save_inflight[str(seq.id)] == second
+
+        clock[0] += 98
+        assert scheduler.reclaim_stale_leases(100) == [frozenset({2, 3})]
+        assert not scheduler.has_pending_work()
+
     def test_timeout_drops_an_unemitted_finished_save_before_freeing(self, monkeypatch):
         scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
         seq = _seq(399, num_prompt_tokens=16, num_blocks=4)

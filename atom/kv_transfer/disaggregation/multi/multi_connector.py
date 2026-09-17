@@ -47,12 +47,12 @@ Merge strategy mirrors vLLM's ``MultiConnector``, adapted to ATOM's
 Send/save lifetime
 ------------------
 Completion reports describe individual operations, not permission to free a
-request. The scheduler owns that decision: a producer waits for its send and
-for ``should_defer_free`` to clear, including computed chunks whose save has
-not yet been dispatched. Holding a chunk's ``finished_saving`` until the send
-finishes prevents the scheduler from issuing the next chunk's save. Forward
-both kinds of progress immediately; TP/PP aggregation still requires every
-worker owning a slice of each save to finish before reporting it.
+request. The scheduler retains blocks until the send finishes and the
+composite ``should_defer_free`` predicate clears, including computed chunks
+whose save has not yet been dispatched. Holding a chunk's ``finished_saving``
+until the send finishes prevents the scheduler from issuing the next chunk's
+save. Forward both kinds of progress immediately; TP/PP aggregation still
+requires every worker owning a slice of each save to finish before reporting it.
 """
 
 from __future__ import annotations
@@ -116,6 +116,12 @@ def _build_subconnectors(config: Any, role: str) -> list:
             i,
             sub["kv_connector"],
             role,
+        )
+    # Request-ID send completions cannot distinguish multiple send owners.
+    if sum(bool(getattr(c, "is_producer", False)) for c in connectors) > 1:
+        raise ValueError(
+            "multi permits at most one is_producer/send connector: "
+            "request-ID completion sets cannot identify multiple send owners"
         )
     return connectors
 
@@ -216,8 +222,7 @@ class MultiConnector(KVConnectorBase):
 
     def __init__(self, config: Any) -> None:
         self._connectors = _build_subconnectors(config, role="worker")
-        # Producer if any sub is a producer (moriio kv_producer drives the
-        # scheduler's producer-side deferred-free path).
+        # Producer if any sub needs the scheduler to wait for a P/D send.
         self.is_producer = any(
             getattr(c, "is_producer", False) for c in self._connectors
         )
@@ -469,6 +474,12 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         for c in self._connectors:
             if hasattr(c, "request_finished"):
                 c.request_finished(seq)
+
+    def source_blocks_released(self, seq: Any) -> None:
+        for child in self._connectors:
+            callback = getattr(child, "source_blocks_released", None)
+            if callable(callback):
+                callback(seq)
 
     def abandon_save(self, req_id: Any) -> None:
         # Reclamation of a stalled offload save (see

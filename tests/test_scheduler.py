@@ -427,6 +427,33 @@ class TestSchedulerAddQuery:
 
 
 class TestSchedule:
+    def test_aborted_multi_producer_does_not_wait_for_an_unsent_response(self):
+        from atom.kv_transfer.disaggregation.multi.multi_connector import (
+            MultiConnectorScheduler,
+        )
+
+        seq = SimpleNamespace(id=95, status=SequenceStatus.ABORTED)
+        sender = SimpleNamespace(is_producer=True, request_finished=mock.Mock())
+        offload = SimpleNamespace(
+            cancel_pending_load=mock.Mock(), request_finished=mock.Mock()
+        )
+        composite = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
+        composite._connectors = [sender, offload]
+        composite._load_winner = {}
+        composite.is_offload = True
+        composite.is_producer = True
+        sched = Scheduler.__new__(Scheduler)
+        sched.kv_connector = composite
+        sched._rejected = []
+        sched.deferred_free_blocks = {}
+        sched.block_manager = SimpleNamespace(deallocate=mock.Mock())
+
+        sched._reject_aborted_waiting(seq)
+
+        offload.request_finished.assert_called_once_with(seq)
+        sched.block_manager.deallocate.assert_called_once_with(seq)
+        assert not sched.deferred_free_blocks
+
     def test_non_offload_abort_keeps_existing_receive_cleanup(self):
         seq = SimpleNamespace(
             id=96,
@@ -1963,20 +1990,54 @@ class TestPostprocess:
         assert scheduler.get_request_counts() == (0, 0)
 
     @pytest.mark.parametrize("pp_size", [1, 4])
-    def test_producer_retains_blocks_until_send_finishes(self, seq_factory, pp_size):
+    @pytest.mark.parametrize("send_before_postprocess", [False, True])
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_producer_retains_blocks_until_send_finishes(
+        self, seq_factory, pp_size, send_before_postprocess, streaming
+    ):
         sched = Scheduler(MockConfig(pipeline_parallel_size=pp_size))
         seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
-        sched.kv_connector = SimpleNamespace(is_producer=True)
-        sched.postprocess([seq], self._output(seq.id, [2]))
+        connector = SimpleNamespace(is_producer=True, request_finished=mock.Mock())
+        sched.kv_connector = connector
+        completion = KVConnectorOutput(finished_sending={seq.id})
+        if send_before_postprocess:
+            sched._update_from_kv_xfer_finished(completion)
+        stream = mock.Mock() if streaming else None
+        sched.postprocess([seq], self._output(seq.id, [2]), stream_output_queue=stream)
+        if not send_before_postprocess:
+            assert seq.id in sched.deferred_free_blocks
+            assert seq.block_table
+            assert not sched.is_finished()
+            sched._update_from_kv_xfer_finished(completion)
+        assert not seq.block_table
+        assert sched.is_finished()
+        connector.request_finished.assert_called_once_with(seq)
 
-        assert seq._awaiting_kv_send
+    def test_preemption_discards_send_completion_for_the_old_allocation(
+        self, scheduler, seq_factory
+    ):
+        seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
+        scheduler.kv_connector = SimpleNamespace(
+            is_producer=True,
+            request_finished=mock.Mock(),
+            get_num_new_matched_tokens=lambda seq: (0, False),
+            update_state_after_alloc=mock.Mock(),
+            build_connector_meta=lambda: None,
+        )
+        scheduler._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_sending={seq.id})
+        )
+        scheduler.running.remove(seq)
+        assert scheduler.preempt(seq)
+        scheduler.schedule()
+        scheduler.postprocess([seq], self._output(seq.id, [2]))
         assert seq.block_table
-        assert not sched.is_finished()
-        sched._update_from_kv_xfer_finished(
+        assert seq.id in scheduler.deferred_free_blocks
+        scheduler._update_from_kv_xfer_finished(
             KVConnectorOutput(finished_sending={seq.id})
         )
         assert not seq.block_table
-        assert sched.is_finished()
+        assert scheduler.is_finished()
 
 
 # ── chunked-prefill finality ───────────────────────────────────────────────
@@ -2495,9 +2556,12 @@ class TestStalledOffloadSaveReclaim:
         seq = SimpleNamespace(
             id=1,
             _deferred_save_at=_time.monotonic() - 500.0,
-            _awaiting_kv_send=True,
         )
-        s, freed = self._sched(monkeypatch, [seq])
+        seq._awaiting_kv_send = True
+        connector = SimpleNamespace(
+            is_producer=True, save_abandon_timeout_s=lambda: 100.0
+        )
+        s, freed = self._sched(monkeypatch, [seq], connector)
         assert s._reconcile_stalled_deferred_saves() == 0
         assert not freed
         assert seq.id in s.deferred_free_blocks

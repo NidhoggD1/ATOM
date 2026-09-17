@@ -4688,6 +4688,7 @@ def test_pending_work_tracks_undispatched_loads_and_unreported_saves():
 @pytest.mark.parametrize("send_first", [False, True])
 def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight(
     send_first,
+    monkeypatch,
 ):
     sched = _scheduler()
     seq = SimpleNamespace(
@@ -4714,33 +4715,50 @@ def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight(
     assert len(meta2.requests) == 0
 
     # The producer finishes with one save in flight and a suffix not yet issued.
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        MultiConnectorScheduler,
+    )
+
+    sender = SimpleNamespace(is_producer=True)
     seq._awaiting_kv_send = True
     freed = []
     engine_sched = Scheduler.__new__(Scheduler)
     engine_sched.deferred_free_blocks = {seq.id: seq}
     engine_sched.block_manager = SimpleNamespace(deallocate=freed.append)
-    engine_sched.kv_connector = SimpleNamespace(
-        is_producer=True,
-        is_offload=True,
-        process_completions=sched.process_completions,
-        should_defer_free=sched.should_defer_free,
-    )
+    composite = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
+    composite._connectors = [sender, sched]
+    composite._load_winner = {}
+    composite.is_producer = True
+    composite.is_offload = True
+    engine_sched.kv_connector = composite
+    clock = [1000.0]
+    monkeypatch.setattr("time.monotonic", lambda: clock[0])
+    seq._deferred_save_at = clock[0]
+    engine_sched._next_save_reconcile_at = 0
+    engine_sched._abandoned_saves = 0
+    monkeypatch.setattr(composite, "save_abandon_timeout_s", lambda: 100.0)
     report = engine_sched._update_from_kv_xfer_finished
     if send_first:
         report(KVConnectorOutput(finished_sending={seq.id}))
         assert not freed
-        assert seq._deferred_save_at > 0
 
     first_save = meta1.requests[0].save_operation
     report(KVConnectorOutput(finished_saving={first_save}))
     assert str(seq.id) not in sched._save_inflight
     assert not freed  # The undispatched suffix still owns the source blocks.
+    clock[0] += 99
     meta3 = sched.build_connector_meta()
 
     assert len(meta3.requests) == 1
     assert len(meta3.requests[0].token_ids) == 12
     assert meta3.requests[0].save_spec.skip_leading_tokens == 8
     assert meta3.requests[0].is_last_prefill is True
+
+    # The original teardown timer expires while the new generation is young.
+    clock[0] += 2
+    assert engine_sched._reconcile_stalled_deferred_saves() == 0
+    assert sched._save_inflight[str(seq.id)] == {meta3.requests[0].save_operation}
+    assert not freed
 
     report(KVConnectorOutput(finished_saving={first_save}))  # Stale generation.
     assert not freed
@@ -4750,6 +4768,7 @@ def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight(
         report(KVConnectorOutput(finished_sending={seq.id}))
     assert freed == [seq]
     assert not engine_sched.deferred_free_blocks
+    assert str(seq.id) not in sched._save_tracker
 
 
 def test_finished_saving_releases_deferred_free_with_string_req_id():

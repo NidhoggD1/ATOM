@@ -642,6 +642,49 @@ def test_full_prompt_hit_of_exactly_one_chunk_asks_for_no_load_at_all(monkeypatc
     assert lookup.hit_tokens("7") is None
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+def test_deferred_save_ends_mp_session_once(seq_factory, streaming):
+    from queue import Queue
+
+    from conftest import MockConfig
+
+    from atom.kv_transfer.disaggregation.types import KVConnectorOutput
+    from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+
+    host = Scheduler(MockConfig())
+    seq = seq_factory([1, 2, 3, 4])
+    host.add(seq)
+    batch, _ = host.schedule()
+    adapter = _LookupAdapter([])
+    connector = mp_connector.LMCacheMPConnectorScheduler.__new__(
+        mp_connector.LMCacheMPConnectorScheduler
+    )
+    connector._mp_adapter = adapter
+    ChunkedOffloadSchedulerBase.__init__(
+        connector, _config(role="kv_producer"), chunk_size=4, lookup_client=None
+    )
+    connector.update_state_after_alloc(seq)
+    host.kv_connector = connector
+    output = ScheduledBatchOutput(
+        req_ids=[seq.id],
+        token_ids=[(2,)],
+        num_rejected=None,
+        num_bonus=None,
+        draft_token_ids=None,
+    )
+    host.postprocess(
+        [seq], output, stream_output_queue=Queue() if streaming else None, batch=batch
+    )
+    assert adapter.ended == [str(seq.id)]
+    assert seq.id in host.deferred_free_blocks
+    operation = connector.build_connector_meta().requests[0].save_operation
+    host._update_from_kv_xfer_finished(KVConnectorOutput(finished_saving={operation}))
+    assert not seq.block_table
+    assert not host.deferred_free_blocks
+    assert str(seq.id) not in connector._save_tracker
+    assert adapter.ended == [str(seq.id)]
+
+
 def test_stale_load_failure_does_not_release_current_generation_locks():
     adapter = _LookupAdapter([])
     lookup = mp_connector._MPLookupClient(

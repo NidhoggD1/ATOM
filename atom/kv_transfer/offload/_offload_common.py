@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 
@@ -534,6 +535,20 @@ class OffloadSchedulerMixin(ABC):
 
     def _track_save_statistics(self, operation, tokens: int) -> None:
         self._save_inflight_tokens[operation] = max(0, int(tokens))
+
+    def _refresh_save_reclaim_clock(self, seq) -> None:
+        """Give each newly dispatched save a full source-retention window.
+
+        A finished request may dispatch several saves serially. Its teardown
+        time (or original lease time) must not expire a later generation while
+        the worker is still reading it. Holding older work longer is safe.
+        """
+        now = time.monotonic()
+        if getattr(seq, "_deferred_save_at", None) is not None:
+            seq._deferred_save_at = now
+        lease_times = getattr(self, "_save_lease_at", {})
+        if id(seq) in lease_times:
+            lease_times[id(seq)] = now
 
     def _finish_load_statistics(self, operation, *, succeeded: bool) -> None:
         if operation not in self._load_inflight_tokens:

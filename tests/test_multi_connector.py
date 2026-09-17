@@ -829,3 +829,21 @@ def test_worker_forwards_kv_cache_ready_hook_to_capable_sub_connectors():
     worker.record_kv_cache_ready([11, 12])
 
     assert ready_calls == [[11, 12]]
+
+
+@pytest.mark.parametrize("connector_class", [MultiConnector, MultiConnectorScheduler])
+def test_multi_rejects_multiple_send_owners(monkeypatch, connector_class):
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    monkeypatch.setattr(
+        KVConnectorFactory,
+        "create_connector",
+        lambda config, role: FakeSchedSub(is_producer=True),
+    )
+    config = SimpleNamespace(
+        kv_transfer_config={
+            "connectors": [{"kv_connector": "sender_a"}, {"kv_connector": "sender_b"}]
+        }
+    )
+    with pytest.raises(ValueError, match="at most one"):
+        connector_class(config)
