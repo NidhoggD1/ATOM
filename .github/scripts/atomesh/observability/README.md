@@ -17,13 +17,20 @@ that artifact, then open a `report.html` file. GitHub Actions summaries cannot
 execute the report's JavaScript; the report runs locally without a server.
 
 The report defaults to an eight-panel Overview with Prefill/Decode TTFT, queue
-time, total cache reuse, and GPU forward latency. Use Latency, Workload, Cache & KV, or
+time, total cache reuse, and GPU forward latency. Use Latency, Workload, Cache & KV, Host CPU, or
 All metrics to inspect the full set. Desktop charts use two columns:
 
 - Mesh overall TTFT: ingress to first generated streaming output.
 - Decode ITL: output intervals normalized and weighted by new token count.
 - Prefill local TTFT: request arrival to first internal token delivery.
 - Decode local TTFT: request arrival to first generated streaming output.
+- Decode TTFT stages: five Latency-view panels cutting the local TTFT above into
+  API preprocess, API enqueue, forward to output, output to callback, and
+  callback to SSE. Together with queue time they tile the interval, so their
+  means add up to local TTFT; their percentiles do not, because the stages' tails
+  land on different requests. Forward to output is a superset of GPU forward.
+  Only streaming requests are sampled. See
+  [the TTFT breakdown guide](../../../../docs/ttft_breakdown_guide.md).
 - Prefill and Decode request queues: running, waiting, and external KV waits.
 - Prefill and Decode queue time: engine receipt to first forward dispatch,
   including input queue residence, scheduling, and KV loading waits.
@@ -45,6 +52,14 @@ All metrics to inspect the full set. Desktop charts use two columns:
   dispatch, once per request sequence.
 - Prefill and Decode GPU forward: per-worker device-event duration, including
   stream communication/waits; PP samples cover each local stage, not the full pipeline.
+- Prefill and Decode host CPU: cores consumed by each role's process tree, in the
+  Host CPU view. Two curves split at the process that owns the event loop —
+  API process (chat templating, tokenization, SSE) and Engine + workers (scheduler
+  loop and GPU workers). Compare against `atom:process_cpus`, the visible CPU count.
+  This is the panel that separates a CPU-starved host from one waiting on the GPU:
+  every other latency here is device time or wall clock, and those two look alike.
+  An API curve pinned near 1.0 core is a saturated event loop, which inflates the
+  API preprocess stage above whatever the GPU is doing.
 
 Both request context metrics are collected through Prometheus `/metrics` as
 Gauges with request ID and phase dispatch-time labels. Scatter plots show each
@@ -62,7 +77,7 @@ chart and series selections are retained when switching roles. Small screens
 stack charts in the same order.
 The global Statistics controls contain only Mean, P50, P90, P95, and P99.
 Queue and KV state controls stay inside their own panels. Units are milliseconds,
-requests, tokens, or percent as indicated on each chart and in the CSV.
+requests, tokens, cores, or percent as indicated on each chart and in the CSV.
 The existing KV utilization panels also display summed Used / Total block
 counts for the latest point in the selected range, or the hovered point.
 Their data tables and CSV include the raw counts with unit `blocks`.

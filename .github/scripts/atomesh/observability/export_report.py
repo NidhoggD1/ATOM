@@ -33,6 +33,8 @@ GAUGE_SERIES = {
     "reuse",
     "gpu",
     "lmcache",
+    "api",
+    "engine",
 }
 
 
@@ -175,6 +177,54 @@ def panels_for(deployment: str) -> list[dict]:
                 "unit": "ms",
             }
         )
+    # TTFT stage slices, cut so each ends where the next begins. Their means add
+    # up to the role's streaming TTFT; their percentiles do not, because the
+    # stages' tails land on different requests. docs/ttft_breakdown_guide.md.
+    role = roles[-1]
+    for suffix, title, observer, detail in (
+        (
+            "api_preprocess",
+            "TTFT · API preprocess",
+            "API",
+            "Middleware entry → preprocess() returns · chat template, tokenize, sequence build · thread-pooled, so it overlaps other requests but is serial ahead of this one's enqueue",
+        ),
+        (
+            "api_enqueue",
+            "TTFT · API enqueue",
+            "API",
+            "preprocess() returns → add_request() returns · handing the sequence to the engine",
+        ),
+        (
+            "forward_to_output",
+            "TTFT · forward to output",
+            "SCHEDULER",
+            "First real forward dispatch → scheduler's first generation emit · superset of GPU forward: also spans prepare_model, drafting, sampling and postprocess",
+        ),
+        (
+            "output_to_callback",
+            "TTFT · output to callback",
+            "IPC",
+            "Scheduler emit → API stream callback · the engine→API hop, measured on wall clock since the ends are separate processes",
+        ),
+        (
+            "callback_to_sse",
+            "TTFT · callback to SSE",
+            "API",
+            "Stream callback → first SSE payload carrying content · detokenize, frame encode, and the output-thread→event-loop hop",
+        ),
+    ):
+        panels.append(
+            {
+                "id": f"{role}_ttft_{suffix}",
+                "role": role,
+                "title": title,
+                "label": f"{role.upper()} · {observer}",
+                "detail": detail,
+                "metric": f"atom:ttft_{suffix}_seconds",
+                "selector": f'job="atom",role="{role}"',
+                "unit": "ms",
+            }
+        )
     for role in roles:
         common = {"selector": f'job="atom",role="{role}"', "role": role}
         panels.extend(
@@ -198,6 +248,16 @@ def panels_for(deployment: str) -> list[dict]:
                     "unit": "ms",
                     "metric": "atom:gpu_forward_seconds",
                     "detail": "One observation per worker forward step · includes GPU stream communication/waits · excludes input prep, sampling and drafting",
+                },
+                {
+                    **common,
+                    "id": f"{role}_cpu",
+                    "title": f"{role.title()} host CPU",
+                    "label": f"{role.upper()} · HOST",
+                    "unit": "cores",
+                    "kind": "cpu",
+                    "metric": "atom:process_cpu_seconds",
+                    "detail": "Cores consumed by this role's process tree · API row bounds api_preprocess, engine row covers engine cores and GPU workers · compare against atom:process_cpus",
                 },
             ]
         )
@@ -299,13 +359,17 @@ def panels_for(deployment: str) -> list[dict]:
         match = re.search(r'role="([^"]+)"', panel["selector"])
         panel.setdefault("role", match[1] if match else "overall")
         panel["category"] = (
-            "cache"
-            if panel.get("kind") in {"cache", "blocks"}
+            "host"
+            if panel.get("kind") == "cpu"
             else (
-                "workload"
-                if panel.get("kind") == "queues"
-                or panel["unit"] in {"requests", "tokens"}
-                else "latency"
+                "cache"
+                if panel.get("kind") in {"cache", "blocks"}
+                else (
+                    "workload"
+                    if panel.get("kind") == "queues"
+                    or panel["unit"] in {"requests", "tokens"}
+                    else "latency"
+                )
             )
         )
         panel.setdefault(
@@ -330,6 +394,11 @@ def statistics_for(panel: dict):
         return ("running", "waiting", "waiting_kv")
     if panel.get("kind") == "blocks":
         return ("used", "evictable", "vacant")
+    if panel.get("kind") == "cpu":
+        # Split at the process that owns the event loop, because that is the
+        # boundary the two CPU questions fall on: `api` bounds tokenization and
+        # SSE delivery, `engine` is the scheduler loop plus the GPU workers.
+        return ("api", "engine")
     return tuple(STATISTICS)
 
 
@@ -385,6 +454,12 @@ def query_for(panel: dict, statistic: str, window: int, *, by_instance=False) ->
         if panel["kind"] == "queues":
             return numerator
         return f'100 * {numerator} / {aggregate}({metric}{{{selector},state="total"}})'
+    if panel.get("kind") == "cpu":
+        # Counter, so rate() -- a utilization gauge sampled once per scrape
+        # would miss exactly the bursts this panel exists to catch. Summing
+        # user and system, and over every process in the group, gives cores.
+        process = 'process="api"' if statistic == "api" else 'process!="api"'
+        return f"{aggregate}(rate({metric}_total{{{selector},{process}}}[{window}s]))"
     scale = panel.get("scale", 1000)
 
     def rate(suffix):
@@ -800,8 +875,8 @@ def validate_data(data: dict) -> None:
         if panel["id"] in identifiers:
             raise ValueError("Panel identifiers must be unique")
         identifiers.add(panel["id"])
-        if panel.get("unit", "ms") not in {"ms", "requests", "%", "tokens"}:
-            raise ValueError("Panel unit must be ms, requests, tokens or %")
+        if panel.get("unit", "ms") not in {"ms", "requests", "%", "tokens", "cores"}:
+            raise ValueError("Panel unit must be ms, requests, tokens, cores or %")
         instances = panel.get("instances", {})
         if not isinstance(instances, dict) or any(
             not isinstance(k, str) or not k for k in instances

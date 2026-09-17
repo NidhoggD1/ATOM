@@ -138,8 +138,8 @@ def test_components_do_not_pollute_default_registry_or_other_api_instances():
         return {metric.name for metric in REGISTRY.collect()}
 
     before = default_names()
-    first, request_metrics, stream_metrics = create_metrics_exporter()
-    second, _, _ = create_metrics_exporter()
+    first, request_metrics, stream_metrics, _ = create_metrics_exporter()
+    second, _, _, _ = create_metrics_exporter()
     request_metrics.observe_time_to_first_token(0.5, True)
     stream_metrics.observe_inter_token_latency(0.020, 4)
     first.update({"enabled": True, "requests_running": 2})
@@ -187,6 +187,7 @@ def test_async_scrapes_keep_live_state_on_loop_and_do_not_cache_responses(monkey
             key: value
             for key, value in _samples(exposition).items()
             if not key[0].startswith("atom:gc_")
+            and not key[0].startswith("atom:process_")
         }
 
     expected = stable(exporter.render())

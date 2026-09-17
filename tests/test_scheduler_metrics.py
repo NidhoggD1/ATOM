@@ -316,7 +316,7 @@ def test_cache_tiers_preserve_admitted_reuse_through_snapshots():
     engine = SimpleNamespace(
         core_mgr=SimpleNamespace(latest_metrics=ranks, get_dp_router_statistics=dict)
     )
-    exporter, _, _ = create_metrics_exporter()
+    exporter, _, _, _ = create_metrics_exporter()
     for _ in range(2):
         exporter.update(LLMEngine.get_metrics_statistics(engine))
         values = samples(exporter)
@@ -656,7 +656,7 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
 def test_large_batch_contexts_have_finite_buckets_through_exposition(
     phase, rows, context
 ):
-    exporter, _, _ = create_metrics_exporter()
+    exporter, _, _, _ = create_metrics_exporter()
     metrics = SchedulerMetrics(engine_role=phase, registry=exporter.registry)
     seqs = {i: SimpleNamespace(id=i) for i in range(rows)}
     scheduled = SimpleNamespace(
@@ -682,3 +682,21 @@ def test_large_batch_contexts_have_finite_buckets_through_exposition(
     assert values[(f"atom:{phase}_context_tokens_bucket", bucket_labels)] == 1
     assert values[(f"atom:{phase}_context_tokens_sum", labels)] == total
     assert values[(f"atom:{phase}_context_tokens_count", labels)] == 1
+
+
+def test_forward_to_output_records_first_emit_once(clock):
+    metrics = SchedulerMetrics()
+    seq = SimpleNamespace()
+    metrics.enqueue(seq)
+    clock[0] = 100.4
+    metrics.record_forward(
+        SimpleNamespace(req_ids=[1], is_dummy_run=False, total_seqs_num_decode=1),
+        {1: seq},
+    )
+    clock[0] = 100.45
+    metrics.record_first_scheduler_output(seq)
+    metrics.record_first_scheduler_output(seq)
+    assert histogram_values_by_name(metrics)["forward_to_output"][
+        "sum"
+    ] == pytest.approx(0.05)
+    assert seq.queue_timing.first_scheduler_output_wall_at is not None
