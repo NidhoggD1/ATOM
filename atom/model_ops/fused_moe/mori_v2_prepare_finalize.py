@@ -227,14 +227,37 @@ def init_mega_transport(
     swiglu_limit: float,
     situ_beta: torch.Tensor | None = None,
     situ_linear_beta: torch.Tensor | None = None,
+    triton_experts: bool = False,
 ) -> Any:
     """Create (and share) the MegaMoE that runs every MoE layer of this model.
 
     Everything here is per-model: the EP geometry, the cco arena, and the expert
     GEMM recipe. Only the weights differ per layer and those are forward()
     arguments, so one instance covers the whole model. Which dispatch kernel it
-    uses is aiter's own call (MEGA_DISPATCH=flydsl|mori).
+    uses is aiter's own call (MEGA_DISPATCH=flydsl|mori) unless the wire is
+    quantized, where this picks between mori and the TDM kernel.
+
+    ``triton_experts`` says our own Triton experts may run the middle of the
+    layer, which decides whether the TDM dispatch may compact its recv rows --
+    see the dispatch_backend/compact_plan pair below.
     """
+    # Only mori and the FlyDSL TDM kernel carry the scale row, so a quantizing
+    # wire has no other backend to run on. Named here rather than left to
+    # $MEGA_DISPATCH, whose default is flydsl: otherwise asking for fp4 is
+    # rejected at the first MoE layer for a reason the operator did not set.
+    _backend = None
+    if _MEGA_DISPATCH_WIRE in ("fp8", "fp4"):
+        _backend = "tdm" if envs.ATOM_MEGA_DISPATCH_TDM else "mori"
+    # Compact recv rows are an aiter-internal layout: the TDM dispatch writes
+    # disp_out already grouped per expert and hands GEMM1 the matching masked_m
+    # and psum. triton_mega_moe drives the transport from OUR side -- it reads
+    # mega._dispatch()'s recv rows and builds its own EpScatterGeometry from
+    # recv_idx -- and knows nothing of that layout, so compaction has to be off
+    # whenever the Triton experts can run. They are published per forward (decode
+    # only under ATOM_USE_TRITON_MOE_DECODE), so the test is "can they run at
+    # all", not "are they running now": the transport is built once and cannot
+    # change its recv layout between a prefill and a decode pass.
+    _compact = None if _backend != "tdm" else not triton_experts
     key = (
         ep_rank,
         ep_size,
@@ -250,8 +273,10 @@ def init_mega_transport(
         intermediate_pad,
         swiglu_limit,
         # Keyed on: the wire sets the payload width and whether the scale
-        # region exists.
+        # region exists, and the backend/compact pair sets the recv layout.
         _MEGA_DISPATCH_WIRE,
+        _backend,
+        _compact,
     )
     cached = _MEGA_TRANSPORTS.get(key)
     if cached is not None:
@@ -286,15 +311,8 @@ def init_mega_transport(
         # Passed, not left to aiter's own read of the env, so the key and the
         # transport cannot drift.
         dispatch_wire=_MEGA_DISPATCH_WIRE,
-        # Only mori's dispatch carries the scale row, so a quantizing wire has
-        # no other backend to run on. Named here rather than left to
-        # $MEGA_DISPATCH, whose default is flydsl: otherwise asking for fp4 is
-        # rejected at the first MoE layer for a reason the operator did not set.
-        **(
-            {"dispatch_backend": "mori"}
-            if _MEGA_DISPATCH_WIRE in ("fp8", "fp4")
-            else {}
-        ),
+        **({"dispatch_backend": _backend} if _backend else {}),
+        **({"compact_plan": _compact} if _compact is not None else {}),
     )
     # Peer-region stride in the flat symmetric VA. triton_mega_moe needs it to
     # address the combine staging window, and MegaMoE does not keep it.
@@ -310,7 +328,7 @@ def init_mega_transport(
     logger.info(
         "[MORI-V2] Created MegaMoE: ep_rank=%d ep_size=%d hidden=%d inter=%d "
         "experts=%d topk=%d M=%d act=%s gate=%s quant=%s pad=(%d,%d) "
-        "swiglu_limit=%s dispatch=%s wire=%s force_a8w4=%s",
+        "swiglu_limit=%s dispatch=%s wire=%s compact=%s force_a8w4=%s",
         ep_rank,
         ep_size,
         hidden_dim,
@@ -326,6 +344,7 @@ def init_mega_transport(
         swiglu_limit,
         mega._config.dispatch_backend,
         mega._config.dispatch_wire,
+        mega._config.compact_plan,
         # The other half of the pair: logged together so a mismatch is readable.
         os.environ.get("AITER_FORCE_A8W4", "0"),
     )
@@ -444,6 +463,10 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             swiglu_limit=float(getattr(layer, "swiglu_limit", 0.0)),
             situ_beta=getattr(layer, "activation_situ_beta", None),
             situ_linear_beta=getattr(layer, "activation_situ_linear_beta", None),
+            # Read from the quant method rather than a forward's kwargs: the
+            # recv layout is fixed here, before the first forward reveals which
+            # experts that pass publishes.
+            triton_experts=bool(getattr(quant_method, "use_triton_ep", False)),
         )
 
     @property
