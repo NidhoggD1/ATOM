@@ -1533,11 +1533,11 @@ def _q7_dp_hca_regular_config(T: int) -> tuple[int, int, int, int] | None:
     if requests <= 9:
         return 32, 2, 2, 16
     if requests == 10:
-        return 32, 7, 3, 16
+        return 32, 7, 2, 16
     if requests <= 12:
-        return 32, 3, 3, 16
+        return 32, 3, 2, 16
     if requests == 13:
-        return 32, 4, 3, 16
+        return 32, 4, 2, 16
     return 32, 2, 2, 16
 
 
