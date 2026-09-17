@@ -826,8 +826,17 @@ async def generate_async(
         )
 
     def do_preprocess():
-        return engine.io_processor.preprocess(
-            prompt_or_tokens,
+        # Encode here rather than letting preprocess() do it, so the tokenizer
+        # call can be timed apart from Sequence construction.
+        if isinstance(prompt_or_tokens, str):
+            tokenize_t0 = time.perf_counter()
+            tokens = engine.tokenizer.encode(prompt_or_tokens)
+            tokenize_s = time.perf_counter() - tokenize_t0
+        else:
+            tokens = prompt_or_tokens
+            tokenize_s = 0.0
+        seq = engine.io_processor.preprocess(
+            tokens,
             sampling_params,
             stream_callback=completion_callback,
             kv_transfer_params=kv_transfer_params,
@@ -1762,7 +1771,13 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             # again would cost the largest single slice of decode TTFT to
             # arrive at the same list -- see docs/ttft_breakdown_guide.md.
             prompt_or_tokens = pretokenized
+            if timing is not None:
+                # An explicit zero, so the histogram's count still matches the
+                # request count on a decode node and the skip reads as "0 ms"
+                # rather than as a missing metric.
+                _ttft_breakdown.observe_api_chat_template(0.0)
         else:
+            template_t0 = time.perf_counter()
             prompt_or_tokens = apply_chat_template(
                 tokenizer,
                 custom_message_encoder,

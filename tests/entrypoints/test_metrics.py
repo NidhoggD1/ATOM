@@ -119,7 +119,7 @@ def test_registration_never_reads_snapshots_or_live_process_metrics(monkeypatch)
     monkeypatch.setattr(
         "atom.entrypoints.openai.metrics_setup.longest_silence_seconds", unexpected_read
     )
-    exporter, _, _ = create_metrics_exporter()
+    exporter, _, _, _ = create_metrics_exporter()
     # Optional snapshot families must reserve their names before any samples.
     for name in (
         "atom:requests_running",
@@ -174,7 +174,7 @@ def test_async_scrapes_keep_live_state_on_loop_and_do_not_cache_responses(monkey
     monkeypatch.setattr(
         "atom.entrypoints.openai.metrics_setup.longest_silence_seconds", live_silence
     )
-    exporter, requests, streams = create_metrics_exporter()
+    exporter, requests, streams, _ = create_metrics_exporter()
     exporter.registry.register(
         type("Probe", (), {"collect": lambda _: thread_probe(exporter.read()[0])})()
     )

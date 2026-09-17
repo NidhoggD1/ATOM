@@ -17,13 +17,16 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from prometheus_client.parser import text_string_to_metric_families
 
 from atom.entrypoints.openai import api_server
+from atom.entrypoints.openai.metrics_setup import create_metrics_exporter
 from atom.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatMessage,
     CompletionRequest,
 )
+from atom.entrypoints.openai.request_timing import RequestTiming
 from atom.entrypoints.openai.serving_chat import build_chat_response_multi
 from atom.entrypoints.openai.serving_completion import build_completion_response_multi
 
@@ -137,6 +140,58 @@ class TestDecodeSkipsTheWorkPrefillAlreadyDid:
         )
 
         assert server.generate[0][0] == "hi"
+
+
+class TestTheSkipIsVisibleInTheChatTemplateHistogram:
+    """A skipped render observes 0, and a real render observes its own wall.
+
+    The zero matters as much as the measurement: without it the histogram's
+    count would not match the request count on a decode node, and "we skipped
+    the template" would be indistinguishable from "this build has no such
+    metric". These run under a request timing, which is the only state that
+    turns the observations on -- the tests above call the handler bare, so they
+    cannot see this code at all.
+    """
+
+    @staticmethod
+    def _timed(monkeypatch):
+        exporter, _, _, breakdown = create_metrics_exporter()
+        monkeypatch.setattr(api_server, "_ttft_breakdown", breakdown)
+        timing = RequestTiming(0.0, lambda _seconds, _streaming: None)
+        monkeypatch.setattr(api_server, "get_request_timing", lambda: timing)
+        return exporter
+
+    @staticmethod
+    def _template_samples(exporter):
+        return {
+            sample.name: sample.value
+            for family in text_string_to_metric_families(exporter.render().decode())
+            for sample in family.samples
+            if sample.name.startswith("atom:api_chat_template_seconds")
+            and sample.name.endswith(("_count", "_sum"))
+        }
+
+    def test_reused_ids_observe_a_zero(self, monkeypatch, server):
+        exporter = self._timed(monkeypatch)
+
+        asyncio.run(
+            api_server.chat_completions(_chat(prompt_token_ids=PROMPT_IDS), None)
+        )
+
+        samples = self._template_samples(exporter)
+        assert server.templates == 0
+        assert samples["atom:api_chat_template_seconds_count"] == 1
+        assert samples["atom:api_chat_template_seconds_sum"] == 0
+
+    def test_a_real_render_observes_its_own_wall_time(self, monkeypatch, server):
+        exporter = self._timed(monkeypatch)
+
+        asyncio.run(api_server.chat_completions(_chat(), None))
+
+        samples = self._template_samples(exporter)
+        assert server.templates == 1
+        assert samples["atom:api_chat_template_seconds_count"] == 1
+        assert samples["atom:api_chat_template_seconds_sum"] >= 0
 
 
 class TestPrefillEchoesItsTokenIds:

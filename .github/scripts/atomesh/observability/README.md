@@ -31,6 +31,23 @@ All metrics to inspect the full set. Desktop charts use two columns:
   land on different requests. Forward to output is a superset of GPU forward.
   Only streaming requests are sampled. See
   [the TTFT breakdown guide](../../../../docs/ttft_breakdown_guide.md).
+- API preprocess stages: body parse, chat template, tokenize, and preprocess
+  wait, per role. These subdivide the API preprocess stage above rather than
+  tiling the TTFT, and they are sampled on non-streaming requests too. A decode
+  node reusing the prefill's token ids observes an explicit 0 for chat template
+  and tokenize, so a flat zero line means the work was skipped, not unmeasured —
+  which is the whole point of the id handoff, since tokenize is the largest
+  single stage on the prefill side.
+- Decode API detokenize: incremental detokenize per streamed chunk. Inside the
+  callback-to-SSE stage for the first chunk and on the ITL delivery path after.
+- Prefill and Decode GPU sampling and GPU MTP propose: device-event durations for
+  sampling (including the TP/PCP broadcast of sampled ids) and for the whole MTP
+  `propose()`. GPU forward plus these two is the device time of one decode step,
+  which is what inter-token latency times the tokens per forward below has to
+  land on; the remainder is host time with no histogram of its own.
+- MTP tokens per forward: accepted tokens emitted per decode step, averaged over
+  the reporting engines. The multiplier between inter-token latency and step wall
+  time — multiply ITL by this, not by the MTP width, which is the ceiling.
 - Prefill and Decode request queues: running, waiting, and external KV waits.
 - Prefill and Decode queue time: engine receipt to first forward dispatch,
   including input queue residence, scheduling, and KV loading waits.
@@ -221,7 +238,9 @@ Python callers can use `collect_report(...)` to fetch data without writing files
 convenience API that does both. The JSON interface uses
 Unix timestamps in seconds, values in the panel's `unit` (default `ms` for older
 reports), and `null` for missing points. Gauge panels set `kind` to `queues` or
-`blocks` and use state names as series keys. See `report-data.example.json` for
+`blocks` and use state names as series keys. A plain gauge with no states sets
+`kind: "gauge"` and carries the single series key `mean`, because a gauge has no
+distribution to take quantiles of. See `report-data.example.json` for
 a small synthetic latency example.
 KV panels additionally carry `block_counts.used` and `block_counts.total`
 time series; older JSON without these fields displays unavailable counts as a dash.
