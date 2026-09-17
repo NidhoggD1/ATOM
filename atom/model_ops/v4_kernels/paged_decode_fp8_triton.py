@@ -237,15 +237,6 @@ def _paged_decode_fp8_2buff_fused_kernel(
             other=0,
         ).to(tl.int64)
 
-        kv_scale_64 = tl.load(
-            kv_packed_u8_ptr
-            + slot[:, None] * kv_stride_n
-            + PACK_OFF_SCALE
-            + 2 * scale64_offs[None, :],
-            mask=valid[:, None] & (scale64_offs < NUM_TILES)[None, :],
-            other=0,
-        )
-
         kv_nope_raw = tl.load(
             kv_packed_ptr + slot[:, None] * kv_stride_n + d_offs[None, :],
             mask=valid[:, None] & nope_mask[None, :],
@@ -280,24 +271,15 @@ def _paged_decode_fp8_2buff_fused_kernel(
                 tl.trans(kv_rope_mx),
             )
             scores *= qk_scale
-            if not USE_MXFP8_V:
-                kv_scale_full = tl.reshape(
-                    tl.broadcast_to(
-                        _e8m0_scale(kv_scale_64)[:, :, None],
-                        (BLOCK_K, 8, TILE),
-                    ),
-                    (BLOCK_K, BLOCK_D),
-                )
-                kv_nope = kv_nope_raw.to(tl.float32) * kv_scale_full
-                kv_rope = tl.load(
-                    kv_rope_ptr
-                    + slot[:, None] * kv_rope_stride_n
-                    + (d_offs - NOPE)[None, :],
-                    mask=valid[:, None] & rope_mask[None, :],
-                    other=0.0,
-                ).to(tl.float32)
-                kv = tl.where(nope_mask[None, :], kv_nope, kv_rope).to(tl.bfloat16)
         else:
+            kv_scale_64 = tl.load(
+                kv_packed_u8_ptr
+                + slot[:, None] * kv_stride_n
+                + PACK_OFF_SCALE
+                + 2 * scale64_offs[None, :],
+                mask=valid[:, None] & (scale64_offs < NUM_TILES)[None, :],
+                other=0,
+            )
             kv_scale_full = tl.reshape(
                 tl.broadcast_to(
                     _e8m0_scale(kv_scale_64)[:, :, None],
@@ -401,7 +383,48 @@ def _paged_decode_fp8_2buff_fused_kernel(
             )
             acc7 = acc7 * alpha[:, None] + tl.dot(p.to(tl.bfloat16), kv_rope_mx)
         else:
-            acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), kv)
+            if USE_MXFP8_QK:
+                # Reload V after softmax instead of keeping a full BF16
+                # [BLOCK_K, 512] tile live across the score reduction.  The
+                # extra read is cheaper than the occupancy loss on gfx950.
+                kv_nope_raw = tl.load(
+                    kv_packed_ptr + slot[:, None] * kv_stride_n + d_offs[None, :],
+                    mask=valid[:, None] & nope_mask[None, :],
+                    other=0.0,
+                    volatile=True,
+                )
+                kv_scale_64 = tl.load(
+                    kv_packed_u8_ptr
+                    + slot[:, None] * kv_stride_n
+                    + PACK_OFF_SCALE
+                    + 2 * scale64_offs[None, :],
+                    mask=valid[:, None] & (scale64_offs < NUM_TILES)[None, :],
+                    other=0,
+                    volatile=True,
+                )
+                kv_scale_full = tl.reshape(
+                    tl.broadcast_to(
+                        _e8m0_scale(kv_scale_64)[:, :, None],
+                        (BLOCK_K, 8, TILE),
+                    ),
+                    (BLOCK_K, BLOCK_D),
+                )
+                kv_nope = kv_nope_raw.to(tl.float32) * kv_scale_full
+                kv_rope = tl.load(
+                    kv_rope_ptr
+                    + slot[:, None] * kv_rope_stride_n
+                    + (d_offs - NOPE)[None, :],
+                    mask=valid[:, None] & rope_mask[None, :],
+                    other=0.0,
+                    volatile=True,
+                ).to(tl.bfloat16)
+                kv = tl.where(nope_mask[None, :], kv_nope, kv_rope).to(tl.bfloat16)
+            # Feed the rescaled online-softmax accumulator directly to the
+            # MFMA.  Keeping ``acc * alpha`` and a standalone dot result live
+            # at the same time nearly doubles AGPR pressure for the 64x512
+            # HCA tile and collapses occupancy on gfx950.
+            acc = acc * alpha[:, None]
+            acc = tl.dot(p.to(tl.bfloat16), kv, acc)
         m_i = m_new
         l_i = l_new
 
@@ -920,14 +943,6 @@ def _paged_decode_fp8_query_group_kernel(
             mask=valid,
             other=0,
         ).to(tl.int64)
-        kv_scale_64 = tl.load(
-            kv_packed_u8_ptr
-            + slot[:, None] * kv_stride_n
-            + PACK_OFF_SCALE
-            + 2 * scale64_offs[None, :],
-            mask=valid[:, None] & (scale64_offs < NUM_TILES)[None, :],
-            other=0,
-        )
         kv_raw = tl.load(
             kv_packed_ptr + slot[:, None] * kv_stride_n + d_offs[None, :],
             mask=valid[:, None] & nope_mask[None, :],
@@ -959,6 +974,14 @@ def _paged_decode_fp8_query_group_kernel(
             scores += tl.dot(q_rope_mx, tl.trans(kv_rope_mx))
             scores *= qk_scale
         else:
+            kv_scale_64 = tl.load(
+                kv_packed_u8_ptr
+                + slot[:, None] * kv_stride_n
+                + PACK_OFF_SCALE
+                + 2 * scale64_offs[None, :],
+                mask=valid[:, None] & (scale64_offs < NUM_TILES)[None, :],
+                other=0,
+            )
             kv_scale_full = tl.reshape(
                 tl.broadcast_to(
                     _e8m0_scale(kv_scale_64)[:, :, None],
@@ -976,7 +999,31 @@ def _paged_decode_fp8_query_group_kernel(
             ).to(tl.float32)
             kv = tl.where(nope_mask[None, :], kv_nope, kv_rope).to(tl.bfloat16)
             scores = tl.dot(q, tl.trans(kv)) * qk_scale
+        scores = tl.where(valid[None, :], scores, neg_large)
+        m_block = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_block)
+        alpha = tl.exp2(m_i - m_new)
+        p = tl.exp2(scores - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
         if USE_MXFP8_QK:
+            # Keep the gathered FP8 tile out of the score/softmax live range.
+            # Re-reading V costs bandwidth, but materially lowers register
+            # pressure for the 64x512 q4/head tile on gfx950.
+            kv_scale_64 = tl.load(
+                kv_packed_u8_ptr
+                + slot[:, None] * kv_stride_n
+                + PACK_OFF_SCALE
+                + 2 * scale64_offs[None, :],
+                mask=valid[:, None] & (scale64_offs < NUM_TILES)[None, :],
+                other=0,
+                volatile=True,
+            )
+            kv_raw = tl.load(
+                kv_packed_ptr + slot[:, None] * kv_stride_n + d_offs[None, :],
+                mask=valid[:, None] & nope_mask[None, :],
+                other=0.0,
+                volatile=True,
+            )
             kv_scale_full = tl.reshape(
                 tl.broadcast_to(
                     _e8m0_scale(kv_scale_64)[:, :, None],
@@ -991,15 +1038,11 @@ def _paged_decode_fp8_query_group_kernel(
                 + (d_offs - NOPE)[None, :],
                 mask=valid[:, None] & rope_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
+                volatile=True,
+            ).to(tl.bfloat16)
             kv = tl.where(nope_mask[None, :], kv_nope, kv_rope).to(tl.bfloat16)
-        scores = tl.where(valid[None, :], scores, neg_large)
-        m_block = tl.max(scores, axis=1)
-        m_new = tl.maximum(m_i, m_block)
-        alpha = tl.exp2(m_i - m_new)
-        p = tl.exp2(scores - m_new[:, None])
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), kv)
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(tl.bfloat16), kv, acc)
         m_i = m_new
 
     if KV_SPLITS > 1:
@@ -1091,8 +1134,8 @@ def sparse_attn_v4_paged_decode_fp8_triton(
         raise ValueError(f"kv_packed must be [P,{V4_DIM_QK_PACKED}]")
     if kv_rope.shape != (kv_packed.shape[0], V4_DIM_ROPE):
         raise ValueError("kv_rope must be [P,64]")
-    if block_h not in (8, 16):
-        raise ValueError("block_h must be 8 or 16")
+    if block_h not in (8, 16, 32, 64):
+        raise ValueError("block_h must be 8, 16, 32, or 64")
     if block_k not in (8, 16, 32, 64):
         raise ValueError("block_k must be one of 8, 16, 32, 64")
     if num_warps not in (2, 4, 8):
@@ -1107,8 +1150,8 @@ def sparse_attn_v4_paged_decode_fp8_triton(
         raise ValueError("reduce_d_chunk must be 64, 128, 256, or 512")
     if reduce_num_warps not in (1, 2, 4, 8):
         raise ValueError("reduce_num_warps must be 1, 2, 4, or 8")
-    if kv_splits not in (1, 2, 4, 8, 16):
-        raise ValueError("kv_splits must be one of 1, 2, 4, 8, 16")
+    if not 1 <= kv_splits <= 16:
+        raise ValueError("kv_splits must be in [1, 16]")
     if bf16_partials and fp16_partials:
         raise ValueError("at most one reduced-precision partial dtype may be selected")
     T, H, _ = q_packed.shape
@@ -1439,7 +1482,77 @@ def _q7_dp_auto_config(T: int, kv_kind: str) -> tuple[int, int, int]:
         return 64, 4, 1
     if requests <= 8:
         return 64, 2, 1
-    return 64, 1, 1
+    return 64, 4, 1
+
+
+def _q7_dp_csa_auto_config(T: int) -> tuple[int, int, int, int]:
+    """Return (block_k, splits, stages, matrix_nonkdim) for DP q7 CSA.
+
+    CSA has a fixed 1152-row gathered working set in the AgentX workload.  A
+    single query over 64 heads matches the hardware's qh64 decomposition and
+    avoids the occupancy cliffs of the 4-query x 16-head tile.  The split-K
+    choices below cover the exact per-rank request counts observed by the DP
+    scheduler; counts above the measured range use the stable no-split tile.
+    """
+    requests = T // 7
+    configs = {
+        1: (16, 16, 2, 16),
+        2: (16, 8, 2, 16),
+        3: (32, 4, 3, 16),
+        4: (32, 4, 3, 16),
+        5: (64, 4, 1, 0),
+        6: (32, 3, 3, 16),
+        7: (32, 2, 3, 16),
+        8: (32, 2, 3, 16),
+        9: (32, 2, 3, 16),
+        10: (32, 3, 2, 16),
+        11: (32, 3, 2, 16),
+        12: (32, 3, 2, 16),
+        13: (32, 4, 2, 16),
+    }
+    return configs.get(requests, (32, 1, 2, 16))
+
+
+def _q7_dp_hca_regular_config(T: int) -> tuple[int, int, int, int] | None:
+    """Return the regular qh64 config for the hot DP q7 HCA batches.
+
+    Once a rank has five or more requests, the extra parallelism from issuing
+    one program per query outweighs the KV reuse of the q4/h16 kernel.  The
+    bk32 variants are particularly important at B7--B9 and B14+, where the
+    old grouped path is 3--22% slower across the measured 384--4224 row HCA
+    windows.  B1--B4 keep query fusion because they do not expose enough
+    independent regular programs.
+    """
+    requests = T // 7
+    if requests < 5:
+        return None
+    if requests == 5:
+        return 64, 8, 1, 0
+    if requests == 6:
+        return 32, 8, 2, 16
+    if requests <= 9:
+        return 32, 2, 2, 16
+    if requests == 10:
+        return 32, 7, 3, 16
+    if requests <= 12:
+        return 32, 3, 3, 16
+    if requests == 13:
+        return 32, 4, 3, 16
+    return 32, 2, 2, 16
+
+
+def _dspark_auto_config(T: int) -> tuple[int, int, int]:
+    """Return (block_k, splits, stages) for the six-row DSpark draft block."""
+    requests = triton.cdiv(T, 6)
+    if requests <= 2:
+        return 16, 16, 2
+    if requests <= 5:
+        return 32, 8, 2
+    if requests <= 12:
+        return 16, 4, 2
+    if requests <= 24:
+        return 16, 2, 2
+    return 16, 1, 2
 
 
 def sparse_attn_v4_paged_decode_fp8_triton_auto(
@@ -1457,14 +1570,80 @@ def sparse_attn_v4_paged_decode_fp8_triton_auto(
 ) -> torch.Tensor:
     """Dispatch tuned Triton specializations without falling back to ASM."""
     T, H, _ = q_packed.shape
+    if kv_kind == "dspark" and H == 16:
+        block_k, kv_splits, stages = _dspark_auto_config(T)
+        return sparse_attn_v4_paged_decode_fp8_triton(
+            q_packed,
+            q_rope,
+            kv_packed,
+            kv_rope,
+            kv_indices,
+            kv_indptr,
+            attn_sink,
+            softmax_scale,
+            block_h=16,
+            block_k=block_k,
+            kv_splits=kv_splits,
+            num_stages=stages,
+            num_warps=4,
+            waves_per_eu=1,
+            matrix_instr_nonkdim=16,
+            use_mxfp8_qk=True,
+            reduce_d_chunk=512,
+            reduce_num_warps=1,
+            fp16_partials=True,
+        )
     if query_group == 7:
         if H == 128:
-            # DP attention keeps all query heads on every rank.  Fuse four
-            # DSpark verification rows inside each 16-head tile so the rows
-            # share one KV traversal without growing the accumulator beyond
-            # the proven 64x512 shape.  Scale split-K down as the per-rank
-            # request count grows; at eight requests/rank, the 16 head/query
-            # tiles already expose enough independent work that split=2 wins.
+            if kv_kind == "csa":
+                block_k, kv_splits, stages, matrix_nonkdim = _q7_dp_csa_auto_config(T)
+                return sparse_attn_v4_paged_decode_fp8_triton(
+                    q_packed,
+                    q_rope,
+                    kv_packed,
+                    kv_rope,
+                    kv_indices,
+                    kv_indptr,
+                    attn_sink,
+                    softmax_scale,
+                    block_h=64,
+                    block_k=block_k,
+                    kv_splits=kv_splits,
+                    num_stages=stages,
+                    num_warps=4,
+                    waves_per_eu=1,
+                    matrix_instr_nonkdim=matrix_nonkdim,
+                    use_mxfp8_qk=True,
+                    reduce_d_chunk=512,
+                    reduce_num_warps=1,
+                    fp16_partials=True,
+                )
+            hca_config = _q7_dp_hca_regular_config(T) if kv_kind == "hca" else None
+            if hca_config is not None:
+                block_k, kv_splits, stages, matrix_nonkdim = hca_config
+                return sparse_attn_v4_paged_decode_fp8_triton(
+                    q_packed,
+                    q_rope,
+                    kv_packed,
+                    kv_rope,
+                    kv_indices,
+                    kv_indptr,
+                    attn_sink,
+                    softmax_scale,
+                    block_h=64,
+                    block_k=block_k,
+                    kv_splits=kv_splits,
+                    num_stages=stages,
+                    num_warps=4,
+                    waves_per_eu=1,
+                    matrix_instr_nonkdim=matrix_nonkdim,
+                    use_mxfp8_qk=True,
+                    reduce_d_chunk=512,
+                    reduce_num_warps=1,
+                    fp16_partials=True,
+                )
+            # Low-batch DP attention still benefits from sharing each KV
+            # traversal across four adjacent verification queries.
             block_k, kv_splits, stages = _q7_dp_auto_config(T, kv_kind)
             return sparse_attn_v4_paged_decode_fp8_triton_query_group(
                 q_packed,
@@ -1483,7 +1662,7 @@ def sparse_attn_v4_paged_decode_fp8_triton_auto(
                 num_stages=stages,
                 num_warps=4,
                 waves_per_eu=1,
-                matrix_instr_nonkdim=16,
+                matrix_instr_nonkdim=0,
                 use_mxfp8_qk=True,
                 reduce_d_chunk=512,
                 reduce_num_warps=1,

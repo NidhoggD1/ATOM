@@ -558,7 +558,7 @@ def _paged_decode_reduce_kernel(
     dc = tl.program_id(2)
 
     d_offs = dc * D_CHUNK + tl.arange(0, D_CHUNK)
-    k_offs = tl.arange(0, KV_SPLITS)
+    k_offs = tl.arange(0, triton.next_power_of_2(KV_SPLITS))
     d_mask = d_offs < D
 
     neg_large = -3.4028234663852886e38
