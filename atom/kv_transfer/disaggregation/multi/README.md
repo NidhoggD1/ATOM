@@ -42,7 +42,7 @@ blocks / wake sequences.
                  |               v
 +=================================================+
 | KV CONNECTOR - moves KV bytes, no compute       |
-| KVConnectorBase (7 hooks) -> pick ONE:          |
+| Connector interfaces -> pick ONE:          |
 | moriio | mooncake | lmcache_offload | multi     |
 +=================================================+
             |                          |
@@ -53,14 +53,17 @@ blocks / wake sequences.
        (P/D xfer)                (LMCache)
 ```
 
-### The seven hooks (`base.py`)
+### Core hooks (`base.py`)
 
 | Side | Hook | Purpose |
 |---|---|---|
 | scheduler | `get_num_new_matched_tokens(seq)` | Does this seq have reusable KV (remote already computed / cached on CPU)? If so, park it and wait for the transfer. |
 | scheduler | `update_state_after_alloc(seq)` | After HBM blocks are allocated, record the "to recv / to save" intent. |
 | scheduler | `build_connector_meta()` | Pack this step's transfer requests into a `meta`. |
-| scheduler | `request_finished(seq)` | Clean up when a request finishes. |
+| scheduler | `request_finished(seq)` | Finish the request once and publish transfer metadata. |
+| scheduler | `process_completions(output)` | Apply owned events before the engine checks release. |
+| scheduler | `should_defer_free(seq)` | Keep the allocation while this connector needs it. |
+| scheduler | `source_blocks_released(seq)` | Retire a fully released allocation, including preemption plans. |
 | worker | `register_kv_caches(tensors)` | Once at init: hand the HBM KV tensor addresses to the connector (it reads/writes through these). |
 | worker | `start_load_kv(meta)` | Kick off the async transfers (load in / save out). |
 | worker | `get_finished()` | Report which req IDs finished sending / recving / saving / failed. |
@@ -187,7 +190,7 @@ real sub-connectors and fans out / merges per hook. Three classes:
 |                                                             |
 | register_kv_caches         | fan-out to ALL subs            |
 | start_load_kv(meta)        | route metas[i] -> subs[i]      |
-| get_finished()             | UNION, independent progress       |
+| get_finished()             | child-indexed, independent progress |
 +=============================================================+
             |                                       |
             v                                       v
@@ -228,35 +231,46 @@ return result
   (e.g. a hypothetical `multi=[mooncake-consumer, offload]` on the decode node).
   Then prefer putting cheaper local offload first.
 
-> Caveat: the loop calls `get_num_new_matched_tokens` on every sub (only the
-> first non-zero is returned). For offload this method has side effects (records
-> `_load_specs`, pins LMCache, appends `_lookup_in_step`). Harmless in the
-> producer topology (mooncake no-ops, offload is the winner). If you ever run a
-> node where both could match the same request, the non-winning sub still leaves
-> state; vLLM's MultiConnector avoids this with a `_requests_to_connector` owner
-> map — the current ATOM version does not track an owner.
+The composite records the winning child in `_load_winner` and cancels pending
+loads on losing children, since a lookup can already pin CPU KV. Later load
+decisions go to the winner; source retention still queries every child.
 
 ---
 
 ## 4. Block-free correctness: independent send/save progress
 
-The composite permits at most one producer, since send completions carry only
-a request ID. A producer's blocks must survive until both the P/D send and all offload saves
-have finished reading them. `MultiConnector.get_finished()` forwards each
-completion immediately: holding a save completion until the send finishes
-prevents the offload scheduler from issuing the next chunk's save.
+Each scheduler-side connector owns its source lifetime. Mooncake and MoRIIO
+share `PDSchedulerBase`: allocation records a send plan only for
+`do_remote_decode`; `request_finished` publishes that plan and retains its
+blocks until send completion. An unpublished plan can be discarded on
+preemption, and an early completion is remembered without re-arming the send.
+Aborted unsent requests and local-only requests do not acquire a send hold.
 
-The scheduler records `_awaiting_kv_send` on deferred producer requests. Both
-send and save completions check `_maybe_release_deferred`, which frees only
-when the send has finished and `should_defer_free` is false. The latter covers
-in-flight saves and computed suffixes that still need dispatch. A send reported
-before request postprocessing is remembered on the running sequence.
+Offload connectors retain their existing `should_defer_free` implementation,
+including in-flight saves, computed suffixes waiting for dispatch, and DSV4
+PAGE/SLOT work. `MultiConnectorScheduler.should_defer_free` ORs all children.
+The scheduler frees a finished request only when this predicate clears; it
+needs no producer-specific flag. A holding sender also prevents partial block
+release: its allocation cannot be narrowed to an offload save's source range.
 
-For PP, mooncake's send completion already represents every stage and goes
-straight to the scheduler. Offload saves still require a `PPKVAggregator`
-quorum for each operation. The head dispatches remaining save metadata even
-when no forward batch remains. Each new save refreshes its reclamation timer;
-a save timeout cannot release blocks while the P/D send is pending.
+`MultiConnector.get_finished()` reports each child's progress immediately in
+`child_outputs[index]`. TP and PP aggregate each owner independently, even if
+two children use identical operation IDs. The composite routes each completed
+snapshot to its owner, then merges the resulting request notifications. All
+owners update before the scheduler checks release. Holding a chunk's save
+completion until the P/D send finishes would prevent the next save dispatch.
+
+For PP, Mooncake's send completion already represents every stage. Offload
+saves still require a `PPKVAggregator` quorum for each operation. The head
+dispatches remaining save metadata even when no forward batch remains. Each
+new save refreshes its reclamation timer. On timeout, only offload work is
+abandoned; the same composite predicate keeps blocks needed by another child.
+
+The composite still permits at most one producer because the response and
+proxy protocol describe one P/D transfer target. Event routing no longer
+imposes that restriction. Supporting another connector requires implementing
+the ownership hooks, not adding a connector-specific scheduler branch; enabling
+multiple P/D targets would additionally require a response/proxy protocol change.
 
 ### HBM-hit + send + offload at the same time
 

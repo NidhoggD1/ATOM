@@ -29,10 +29,8 @@ from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 from atom.config import Config
 from atom.distributed.dcp_utils import get_dcp_group
-from atom.kv_transfer.disaggregation.base import (
-    KVConnectorBase,
-    KVConnectorSchedulerBase,
-)
+from atom.kv_transfer.disaggregation.base import KVConnectorBase
+from atom.kv_transfer.disaggregation.pd_scheduler import PDSchedulerBase
 from atom.kv_transfer.disaggregation.port_offset import (
     consumer_region_indices,
 )
@@ -334,8 +332,9 @@ def _ipv4_from_gid(gid: str) -> str | None:
 # ===================================================================
 
 
-class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
+class MooncakeConnectorScheduler(PDSchedulerBase):
     def __init__(self, config: Config) -> None:
+        super().__init__()
         kv_transfer_config = config.kv_transfer_config
         self.is_producer = (
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
@@ -435,6 +434,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         return meta
 
     def update_state_after_alloc(self, seq: Sequence) -> None:
+        self._plan_send(seq)
         params = seq.kv_transfer_params or {}
 
         if not self.is_producer:
@@ -503,6 +503,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             )
 
     def request_finished(self, seq: Sequence) -> None:
+        if self.is_producer and not self._publish_send(seq):
+            return
+
         first_token_id = seq.output_tokens[0] if seq.output_tokens else None
         drafts = getattr(seq, "spec_token_ids", None)
         draft_token_ids = (
@@ -536,6 +539,10 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             transfer_id = self.request_id_to_transfer_id.pop(seq.id, None)
             if transfer_id is not None:
                 self.transfer_id_to_request_id.pop(transfer_id, None)
+
+    def source_blocks_released(self, seq: Sequence) -> None:
+        super().source_blocks_released(seq)
+        self._reqs_need_save.pop(seq.id, None)
 
 
 # ===================================================================

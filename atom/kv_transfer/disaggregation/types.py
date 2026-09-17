@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -314,6 +314,9 @@ class KVConnectorOutput:
             channel owners interpret them after TP aggregation.
         expected_finished_count: How many finished notifications should be
             expected per request (used by the aggregator).
+        child_outputs: MultiConnector snapshots keyed by configured child index.
+            Keep this identity through TP/PP quorum and route to the owning
+            scheduler connector before merging request-level notifications.
     """
 
     finished_sending: set[ReqId] = field(default_factory=set)
@@ -324,6 +327,35 @@ class KVConnectorOutput:
     failed_loading: set[LoadCompletionId] = field(default_factory=set)
     expected_finished_count: int = 0
     connector_completions: set[ConnectorCompletion] = field(default_factory=set)
+    child_outputs: dict[int, KVConnectorOutput] = field(default_factory=dict)
+
+    completion_fields: ClassVar[tuple[str, ...]] = (
+        "finished_sending",
+        "finished_recving",
+        "failed_recving",
+        "finished_saving",
+        "finished_loading",
+        "failed_loading",
+        "connector_completions",
+    )
+
+    def select(self, *fields: str) -> KVConnectorOutput:
+        """Copy selected channels, preserving child ownership (e.g. for PP)."""
+        output = KVConnectorOutput(
+            **{name: set(getattr(self, name)) for name in fields}
+        )
+        for index, child in self.child_outputs.items():
+            selected = child.select(*fields)
+            if not selected.is_empty():
+                output.child_outputs[index] = selected
+        return output
+
+    def merge(self, other: KVConnectorOutput) -> None:
+        """Accumulate snapshots without discarding their connector identities."""
+        for name in self.completion_fields:
+            getattr(self, name).update(getattr(other, name))
+        for index, child in other.child_outputs.items():
+            self.child_outputs.setdefault(index, KVConnectorOutput()).merge(child)
 
     def is_empty(self) -> bool:
         """Return True if no transfers finished on this worker."""
@@ -335,6 +367,7 @@ class KVConnectorOutput:
             and not self.finished_loading
             and not self.failed_loading
             and not self.connector_completions
+            and all(child.is_empty() for child in self.child_outputs.values())
         )
 
     def __repr__(self) -> str:
@@ -345,7 +378,8 @@ class KVConnectorOutput:
             f"finished_saving={self.finished_saving}, "
             f"loading={self.finished_loading}, "
             f"failed_loading={self.failed_loading}, "
-            f"connector_completions={self.connector_completions})"
+            f"connector_completions={self.connector_completions}, "
+            f"child_outputs={self.child_outputs})"
         )
 
 

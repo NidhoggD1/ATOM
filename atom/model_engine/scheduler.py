@@ -951,7 +951,6 @@ class Scheduler:
     def _maybe_release_deferred(self, seq: Sequence) -> None:
         if (
             seq.id not in self.deferred_free_blocks
-            or getattr(seq, "_awaiting_kv_send", False)
             or getattr(seq, "_awaiting_aborted_load_cleanup", False)
             or self._connector_should_defer_free(seq)
         ):
@@ -988,10 +987,9 @@ class Scheduler:
         never-reported save keeps `has_pending_kv_work()` True forever and the
         engine busy-loops with every GPU idle.
 
-        A stalled save can be abandoned only after its producer's send has
-        finished. Otherwise reclamation would free the send's source blocks.
-        Notify the offload connector via `abandon_save` to retire its pending
-        work along with the blocks.
+        Abandon only the offload connector's work, then query the composite
+        ownership predicate again. Another child (for example a P/D sender)
+        may still need the allocation after the save expires.
 
         The complement of the K3 connector's stall escape
         (`kimi_k3.connector.save_stall_seconds()`), not a duplicate of it: that
@@ -1031,25 +1029,26 @@ class Scheduler:
             seq
             for seq in list(self.deferred_free_blocks.values())
             if getattr(seq, "_deferred_save_at", None) is not None
-            and not getattr(seq, "_awaiting_kv_send", False)
             and now - seq._deferred_save_at >= timeout
         ]
+        released = 0
         for seq in stalled:
-            self.deferred_free_blocks.pop(seq.id, None)
             self._connector_abandon_save(seq)
-            self.block_manager.deallocate(seq)
+            seq._deferred_save_at = None
             self._abandoned_saves += 1
+            self._maybe_release_deferred(seq)
+            released += seq.id not in self.deferred_free_blocks
         if stalled:
             logger.warning(
-                "Reclaimed %d offload save(s) still deferred after %.0fs with no "
-                "completion report (LMCache force-unpins a stalled save without "
-                "reporting it); freed their blocks so the engine does not stall. "
+                "Abandoned %d offload save(s) after %.0fs; released %d "
+                "allocation(s), retaining sources still owned by other transfers. "
                 "total abandoned_saves=%d",
                 len(stalled),
                 timeout,
+                released,
                 self._abandoned_saves,
             )
-        return len(stalled) + lease_reclaims
+        return released + lease_reclaims
 
     def _unschedulable_reason(self, seq: Sequence) -> str | None:
         """Return a human-readable reason if `seq` is permanently unschedulable.
@@ -2536,8 +2535,11 @@ class Scheduler:
         # surrendered blocks (the mutator half of `should_defer_free`'s escape).
         self._connector_release_stalled_save(seq)
         self.block_manager.deallocate(seq)
-        if hasattr(seq, "_awaiting_kv_send"):
-            del seq._awaiting_kv_send
+        callback = getattr(
+            getattr(self, "kv_connector", None), "source_blocks_released", None
+        )
+        if callable(callback):
+            callback(seq)
         self.waiting.appendleft(seq)
         return True
 
@@ -3080,19 +3082,7 @@ class Scheduler:
                 seq.is_partial_prefill = False
                 self._partial_prefill_count -= 1
             if self.kv_connector is not None:
-                if (
-                    self._connector_flag("is_producer")
-                    and seq.leave_reason != "aborted"
-                    and getattr(seq, "_awaiting_kv_send", True)
-                ):
-                    logger.debug(
-                        "Deferring block free for seq %s until KV send completes.",
-                        seq.id,
-                    )
-                    seq._awaiting_kv_send = True
-                    seq._deferred_save_at = time.monotonic()
-                    self.deferred_free_blocks[seq.id] = seq
-                elif self._connector_should_defer_free(seq):
+                if self._connector_should_defer_free(seq):
                     protected = self._connector_protected_block_ids(seq)
                     if protected is not None:
                         # Early block release: only the save's exact source
@@ -3123,8 +3113,8 @@ class Scheduler:
                         )
                     else:
                         logger.debug(
-                            "Deferring block free for seq %s until KV save "
-                            "completes.",
+                            "Deferring block free for seq %s until all KV "
+                            "owners release it.",
                             seq.id,
                         )
                         # Stamp when the save was deferred so the reconciler
@@ -3134,6 +3124,11 @@ class Scheduler:
                         self.deferred_free_blocks[seq.id] = seq
                 else:
                     self.block_manager.deallocate(seq)
+                    callback = getattr(
+                        self.kv_connector, "source_blocks_released", None
+                    )
+                    if callable(callback):
+                        callback(seq)
             else:
                 self.block_manager.deallocate(seq)
             self.running.remove(seq)
@@ -3422,20 +3417,6 @@ class Scheduler:
             self.failed_recving_kv_req_ids.append(req_id)
 
         finished_saving = kv_connector_output.finished_saving or ()
-        for req_id in kv_connector_output.finished_sending or ():
-            seq = self._deferred_sequence(req_id)
-            if seq is None:
-                # PP can report the send before postprocess defers the request.
-                seq = next(
-                    (
-                        s
-                        for s in getattr(self, "running", ())
-                        if str(s.id) == str(req_id)
-                    ),
-                    None,
-                )
-            if seq is not None:
-                seq._awaiting_kv_send = False
         completed_requests = set(kv_connector_output.finished_sending or ())
         completed_requests.update(finished_saving)
         for req_id in completed_requests:

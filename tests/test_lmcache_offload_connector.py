@@ -4718,9 +4718,12 @@ def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight(
     from atom.kv_transfer.disaggregation.multi.multi_connector import (
         MultiConnectorScheduler,
     )
+    from tests.pd_connector_stub import PDSchedulerStub
 
-    sender = SimpleNamespace(is_producer=True)
-    seq._awaiting_kv_send = True
+    sender = PDSchedulerStub()
+    seq.kv_transfer_params = {"do_remote_decode": True}
+    sender.update_state_after_alloc(seq)
+    sender.request_finished(seq)
     freed = []
     engine_sched = Scheduler.__new__(Scheduler)
     engine_sched.deferred_free_blocks = {seq.id: seq}
@@ -4739,11 +4742,19 @@ def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight(
     monkeypatch.setattr(composite, "save_abandon_timeout_s", lambda: 100.0)
     report = engine_sched._update_from_kv_xfer_finished
     if send_first:
-        report(KVConnectorOutput(finished_sending={seq.id}))
+        report(
+            KVConnectorOutput(
+                child_outputs={0: KVConnectorOutput(finished_sending={seq.id})}
+            )
+        )
         assert not freed
 
     first_save = meta1.requests[0].save_operation
-    report(KVConnectorOutput(finished_saving={first_save}))
+    report(
+        KVConnectorOutput(
+            child_outputs={1: KVConnectorOutput(finished_saving={first_save})}
+        )
+    )
     assert str(seq.id) not in sched._save_inflight
     assert not freed  # The undispatched suffix still owns the source blocks.
     clock[0] += 99
@@ -4760,12 +4771,26 @@ def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight(
     assert sched._save_inflight[str(seq.id)] == {meta3.requests[0].save_operation}
     assert not freed
 
-    report(KVConnectorOutput(finished_saving={first_save}))  # Stale generation.
+    report(
+        KVConnectorOutput(
+            child_outputs={1: KVConnectorOutput(finished_saving={first_save})}
+        )
+    )  # Stale generation.
     assert not freed
-    report(KVConnectorOutput(finished_saving={meta3.requests[0].save_operation}))
+    report(
+        KVConnectorOutput(
+            child_outputs={
+                1: KVConnectorOutput(finished_saving={meta3.requests[0].save_operation})
+            }
+        )
+    )
     if not send_first:
         assert not freed  # All saves finished, but the send still owns blocks.
-        report(KVConnectorOutput(finished_sending={seq.id}))
+        report(
+            KVConnectorOutput(
+                child_outputs={0: KVConnectorOutput(finished_sending={seq.id})}
+            )
+        )
     assert freed == [seq]
     assert not engine_sched.deferred_free_blocks
     assert str(seq.id) not in sched._save_tracker

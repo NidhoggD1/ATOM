@@ -5,7 +5,7 @@
 
 Pure-Python: sub-connectors are mocked, so no GPU / lmcache / moriio runtime is
 needed. Covers the merge strategy (first-hit-wins, fan-out, metadata routing,
-completion union) and independent send/save progress. The scheduler owns the
+completion routing) and independent send/save progress. The scheduler owns the
 barrier that protects blocks until both transfers finish.
 """
 
@@ -428,49 +428,114 @@ def test_process_completions_reaches_the_offload_sub():
     sched = _sched([moriio, off])
 
     op = SaveOperationId(9, 1)
-    out = sched.process_completions(KVConnectorOutput(finished_saving={op}))
+    out = sched.process_completions(
+        KVConnectorOutput(child_outputs={1: KVConnectorOutput(finished_saving={op})})
+    )
 
     assert off.saved == [op]
     assert out.finished_saving == {9}
 
 
-def test_process_completions_refuses_two_offload_subs():
-    # [dense, kimi_k3]: BOTH subs define process_completions, and the mixin is
-    # destructive over the FULL sets it is handed -- it cannot partition. There
-    # is no shared key by which the composite could split the completions per
-    # sub, so one sub would retire the other's saves and clear its channels.
-    # That composite is refused at startup (`_offload_subconfig`); reaching this
-    # method with two offload handlers is a should-never-happen guarded loudly,
-    # because silently corrupting saves is the worse failure.
-    dense = DestructiveSub(owned_load="dense_load", owned_channel="dense_ch")
-    k3 = DestructiveSub(owned_load="k3_load", owned_channel="k3_state_index")
-    sched = _sched([dense, k3])
-
-    with pytest.raises(RuntimeError, match="cannot be partitioned"):
-        sched.process_completions(
-            KVConnectorOutput(finished_loading={"dense_load", "k3_load"})
-        )
-
-
-def test_process_completions_single_offload_sub_is_called_directly():
-    # The common [producer, offload] shape has exactly one process_completions
-    # handler. That must stay the direct, copy-free path so its in-place
-    # rewrites reach the caller unchanged.
-    only = DestructiveSub(owned_load="x", owned_channel="ch")
-    sched = _sched([FakeSchedSub(is_producer=True), only])
-
+def test_process_completions_isolates_destructive_handlers_with_colliding_ids():
+    # Even equal channels / operation IDs belong to different connectors.
+    left = DestructiveSub(owned_load="same", owned_channel="ch")
+    right = DestructiveSub(owned_load="same", owned_channel="ch")
+    sched = _sched([left, right])
+    event = ConnectorCompletion("ch", SaveOperationId(3, 0), True)
     out = sched.process_completions(
         KVConnectorOutput(
-            finished_loading={"x", "y"},
-            connector_completions={
-                ConnectorCompletion("ch", SaveOperationId(3, 0), True)
-            },
+            child_outputs={
+                0: KVConnectorOutput(
+                    finished_loading={"same"}, connector_completions={event}
+                ),
+                1: KVConnectorOutput(
+                    finished_loading={"same"}, connector_completions={event}
+                ),
+            }
         )
     )
+    assert out.finished_loading == {"same"}
+    assert not out.connector_completions
+    assert left.settled_channels == right.settled_channels == ["ch"]
 
-    assert out.finished_loading == {"x"}
-    assert only.settled_channels == ["ch"]
-    assert out.connector_completions == set()
+    sched.process_completions(
+        KVConnectorOutput(
+            child_outputs={
+                0: KVConnectorOutput(connector_completions={event}),
+            }
+        )
+    )
+    assert left.settled_channels == ["ch", "ch"]
+    assert right.settled_channels == ["ch"]
+
+
+def test_process_completions_rejects_events_without_an_owner():
+    sched = _sched([FakeSchedSub(is_producer=True), FakeSchedSub(offload_methods=True)])
+    with pytest.raises(ValueError, match="identify their child"):
+        sched.process_completions(KVConnectorOutput(finished_sending={9}))
+
+
+@pytest.mark.parametrize("first_owner", [0, 1])
+def test_scheduler_releases_only_after_every_owner_is_done(first_owner):
+    from atom.model_engine.scheduler import Scheduler
+
+    class Reader(FakeSchedSub):
+        def process_completions(self, output):
+            if output.finished_saving:
+                self.defer = False
+            return super().process_completions(output)
+
+    children = [Reader(offload_methods=True, has_state_tier=False) for _ in range(2)]
+    for child in children:
+        child.defer = True
+    composite = _sched(children)
+    seq = SimpleNamespace(id=7)
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.kv_connector = composite
+    scheduler.deferred_free_blocks = {seq.id: seq}
+    released = []
+    scheduler.block_manager = SimpleNamespace(
+        deallocate=lambda seq: released.append(seq.id)
+    )
+    operation = SaveOperationId(seq.id, 0)
+
+    def report(owner):
+        scheduler._update_from_kv_xfer_finished(
+            KVConnectorOutput(
+                child_outputs={
+                    owner: KVConnectorOutput(finished_saving={operation}),
+                }
+            )
+        )
+
+    report(first_owner)
+    assert not released
+    report(first_owner)  # A duplicate cannot complete the other owner.
+    assert not released
+    report(1 - first_owner)
+    assert released == [seq.id]
+
+
+def test_published_sender_prevents_partial_release_of_offload_sources():
+    from tests.pd_connector_stub import PDSchedulerStub
+
+    sender = PDSchedulerStub()
+    seq = SimpleNamespace(id=7, kv_transfer_params={"do_remote_decode": True})
+    sender.update_state_after_alloc(seq)
+    sender.request_finished(seq)
+    offload = FakeSchedSub(offload_methods=True)
+    offload.defer = True
+    offload.protected_block_ids = lambda seq: frozenset({1})
+    composite = _sched([sender, offload])
+    assert composite.protected_block_ids(seq) is None
+    composite.process_completions(
+        KVConnectorOutput(
+            child_outputs={
+                0: KVConnectorOutput(finished_sending={seq.id}),
+            }
+        )
+    )
+    assert composite.protected_block_ids(seq) == frozenset({1})
 
 
 def test_offload_methods_default_when_no_sub_implements():
@@ -519,7 +584,7 @@ def test_start_load_kv_routes_by_index():
     assert b.loaded_meta is m1
 
 
-def test_get_finished_unions_and_normalizes_tuple():
+def test_get_finished_preserves_owner_and_normalizes_tuple():
     # moriio returns a legacy tuple; offload returns KVConnectorOutput.
     moriio = FakeWorkerSub(finished=(set(), {"d1"}))  # recving d1
     off = FakeWorkerSub(
@@ -527,8 +592,9 @@ def test_get_finished_unions_and_normalizes_tuple():
     )
     w = _worker([moriio, off])  # not producer
     out = w.get_finished()
-    assert out.finished_recving == {"d1", "d2"}
-    assert out.failed_recving == {"f1"}
+    assert out.child_outputs[0].finished_recving == {"d1"}
+    assert out.child_outputs[1].finished_recving == {"d2"}
+    assert out.child_outputs[1].failed_recving == {"f1"}
 
 
 def test_get_finished_carries_connector_completions():
@@ -539,7 +605,7 @@ def test_get_finished_carries_connector_completions():
     moriio = FakeWorkerSub(finished=(set(), set()))
     off = FakeWorkerSub(finished=KVConnectorOutput(connector_completions={done}))
     w = _worker([moriio, off])  # not producer: pass-through path
-    assert w.get_finished().connector_completions == {done}
+    assert w.get_finished().child_outputs[1].connector_completions == {done}
 
 
 def test_producer_get_finished_carries_connector_completions():
@@ -549,7 +615,7 @@ def test_producer_get_finished_carries_connector_completions():
         is_producer=True, finished=KVConnectorOutput(connector_completions={done})
     )
     w = _worker([off])
-    assert w.get_finished().connector_completions == {done}
+    assert w.get_finished().child_outputs[0].connector_completions == {done}
 
 
 def test_producer_offload_load_completion_uses_loading_state():
@@ -563,8 +629,8 @@ def test_producer_offload_load_completion_uses_loading_state():
 
     assert out.finished_recving == set()
     assert out.failed_recving == set()
-    assert out.finished_loading == {"l1"}
-    assert out.failed_loading == {"f1"}
+    assert out.child_outputs[1].finished_loading == {"l1"}
+    assert out.child_outputs[1].failed_loading == {"f1"}
 
 
 def test_state_loads_go_to_the_sub_that_can_carry_them():
@@ -743,14 +809,14 @@ def test_non_producer_passes_saving_through():
     off = FakeWorkerSub(finished=KVConnectorOutput(finished_saving={"s1"}))
     w = _worker([off])  # is_producer False
     out = w.get_finished()
-    assert out.finished_saving == {"s1"}
+    assert out.child_outputs[0].finished_saving == {"s1"}
 
 
 def test_send_without_pending_save_is_released_immediately():
     moriio = FakeWorkerSub(is_producer=True, finished=({"r1"}, set()))
     w = _worker([moriio])
     out = w.get_finished()
-    assert out.finished_sending == {"r1"}
+    assert out.child_outputs[0].finished_sending == {"r1"}
 
 
 @pytest.mark.parametrize("save_first", [False, True])
@@ -765,14 +831,22 @@ def test_send_and_save_are_reported_independently(save_first):
     moriio._finished = (set() if save_first else {9}, set())
     off._finished = KVConnectorOutput(finished_saving={9} if save_first else set())
     first = w.get_finished()
-    assert first.finished_sending == (set() if save_first else {9})
-    assert first.finished_saving == ({9} if save_first else set())
+    assert first.child_outputs.get(0, KVConnectorOutput()).finished_sending == (
+        set() if save_first else {9}
+    )
+    assert first.child_outputs.get(1, KVConnectorOutput()).finished_saving == (
+        {9} if save_first else set()
+    )
 
     moriio._finished = ({9} if save_first else set(), set())
     off._finished = KVConnectorOutput(finished_saving=set() if save_first else {9})
     second = w.get_finished()
-    assert second.finished_sending == ({9} if save_first else set())
-    assert second.finished_saving == (set() if save_first else {9})
+    assert second.child_outputs.get(0, KVConnectorOutput()).finished_sending == (
+        {9} if save_first else set()
+    )
+    assert second.child_outputs.get(1, KVConnectorOutput()).finished_saving == (
+        set() if save_first else {9}
+    )
 
 
 def test_send_and_save_keep_their_distinct_operation_ids():
@@ -786,8 +860,8 @@ def test_send_and_save_keep_their_distinct_operation_ids():
     moriio._finished = ({9}, set())
     off._finished = KVConnectorOutput(finished_saving={op})
     out = w.get_finished()
-    assert out.finished_sending == {9}
-    assert out.finished_saving == {op}
+    assert out.child_outputs[0].finished_sending == {9}
+    assert out.child_outputs[1].finished_saving == {op}
 
 
 def test_each_save_generation_is_reported_as_it_finishes():
@@ -799,9 +873,9 @@ def test_each_save_generation_is_reported_as_it_finishes():
         MultiConnectorMetadata([ConnectorMetadata(), _save_operation_meta(op0, op1)])
     )
     off._finished = KVConnectorOutput(finished_saving={op0})
-    assert w.get_finished().finished_saving == {op0}
+    assert w.get_finished().child_outputs[1].finished_saving == {op0}
     off._finished = KVConnectorOutput(finished_saving={op1})
-    assert w.get_finished().finished_saving == {op1}
+    assert w.get_finished().child_outputs[1].finished_saving == {op1}
 
 
 @pytest.mark.parametrize("pp_rank", [0, 1])
@@ -816,7 +890,7 @@ def test_producer_progress_is_independent_on_every_pp_stage(monkeypatch, pp_rank
     )
     w.start_load_kv(MultiConnectorMetadata([ConnectorMetadata(), _save_meta(9)]))
     out = w.get_finished()
-    assert out.finished_saving == {9}
+    assert out.child_outputs[1].finished_saving == {9}
     assert out.finished_sending == set()
 
 

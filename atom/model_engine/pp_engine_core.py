@@ -264,76 +264,36 @@ class PPEngineCoreProc(EngineCore):
         if not self.kv_transfer_enabled:
             return
 
-        # Reclaim any offload save whose completion report never came (worker
-        # crash, dropped completion, LMCache force-unpin). This override fully
-        # replaces the base `_poll_kv_transfer_progress`, whose getattr-guarded
-        # call is the reclaimer's only caller repo-wide; without mirroring it
-        # here, under `pp_size > 1` a stalled save stays in
-        # `Scheduler.deferred_free_blocks` forever -- `has_pending_kv_work()`
-        # stays True, so the engine busy-loops with every GPU idle, the blocks
-        # never return to the pool, and `_drain_kv_work_at_exit` spins to
-        # `KV_SHUTDOWN_DRAIN_TIMEOUT_S` on every shutdown. Self-throttled, so
-        # calling it each poll is cheap; placed above the has_offload /
-        # pp_messages early-returns so a quiet poll still reclaims.
-        reconcile = getattr(self.scheduler, "_reconcile_stalled_deferred_saves", None)
-        if callable(reconcile):
-            reconcile()
-
-        # Collect local TP-aggregated output.
         kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
         if kvoutput is None:
             kvoutput = KVConnectorOutput()
 
-        # Mooncake's send already has PP-wide completion semantics. Report it
-        # independently of saves: the scheduler owns the joint release barrier,
-        # including suffix saves that have not been dispatched yet.
-        non_offload = KVConnectorOutput(
-            finished_sending=kvoutput.finished_sending,
-            finished_recving=kvoutput.finished_recving,
-            failed_recving=kvoutput.failed_recving,
+        # P/D backends already report PP-wide sends/receives. Preserve child
+        # identity while separating these from per-stage offload progress.
+        result = kvoutput.select(
+            "finished_sending", "finished_recving", "failed_recving"
         )
-        if not non_offload.is_empty():
-            self.scheduler._update_from_kv_xfer_finished(non_offload)
-
-        # Offload fields go through PP aggregator.
-        has_offload = (
-            kvoutput.finished_loading
-            or kvoutput.failed_loading
-            or kvoutput.finished_saving
-            # connector_completions are offload channel events (kimi_k3 state
-            # dispositions, dsv4 checkpoint boundaries). They too span all PP
-            # stages, so they must reach the aggregator rather than the
-            # scheduler directly -- and count as "offload work" so this poll
-            # does not early-return and strand them.
-            or kvoutput.connector_completions
+        offload_local = kvoutput.select(
+            "finished_loading",
+            "failed_loading",
+            "finished_saving",
+            "connector_completions",
         )
         pp_messages = self.pp_transport.recv_kv_status(timeout_ms=0)
+        if not offload_local.is_empty() or pp_messages:
+            if self._pp_kv_aggregator is None:
+                self._pp_kv_aggregator = PPKVAggregator(self.pp_size)
+            result.merge(self._pp_kv_aggregator.ingest(0, offload_local))
+            for pp_rank, downstream_output in pp_messages:
+                result.merge(self._pp_kv_aggregator.ingest(pp_rank, downstream_output))
 
-        if not has_offload and not pp_messages:
-            return
-
-        if self._pp_kv_aggregator is None:
-            self._pp_kv_aggregator = PPKVAggregator(self.pp_size)
-
-        # Ingest head (stage 0) offload output.
-        offload_local = KVConnectorOutput(
-            finished_loading=kvoutput.finished_loading,
-            failed_loading=kvoutput.failed_loading,
-            finished_saving=kvoutput.finished_saving,
-            connector_completions=kvoutput.connector_completions,
-        )
-        if not offload_local.is_empty():
-            self._ingest_and_release(offload_local, 0)
-
-        # Ingest downstream PP stages' offload output.
-        for pp_rank, downstream_output in pp_messages:
-            self._ingest_and_release(downstream_output, pp_rank)
-
-    def _ingest_and_release(self, output: KVConnectorOutput, pp_rank: int):
-        result = self._pp_kv_aggregator.ingest(pp_rank, output)
-        if result.is_empty():
-            return
-        self.scheduler._update_from_kv_xfer_finished(result)
+        # Apply all owners' progress before checking release, and consume fresh
+        # completions before the timeout check (as the non-PP engine does).
+        if not result.is_empty():
+            self.scheduler._update_from_kv_xfer_finished(result)
+        reconcile = getattr(self.scheduler, "_reconcile_stalled_deferred_saves", None)
+        if callable(reconcile):
+            reconcile()
 
     # -- Downstream busy loop ------------------------------------------------
 

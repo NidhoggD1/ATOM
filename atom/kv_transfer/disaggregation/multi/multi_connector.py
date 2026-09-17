@@ -36,8 +36,8 @@ Merge strategy mirrors vLLM's ``MultiConnector``, adapted to ATOM's
 * ``build_connector_meta`` — returns :class:`MultiConnectorMetadata` carrying one
   sub-metadata per connector, in connector order. The worker de-multiplexes by
   index in ``start_load_kv``.
-* ``get_finished`` — union the completion sets without delaying incremental
-  save progress.
+* ``get_finished`` — report child-indexed snapshots without delaying incremental
+  save progress; resolve ownership before merging request-level notifications.
 * ``_state_tier`` — the state offload tier, if a sub built one, re-exposed on
   the composite by ``_adopt_state_tier`` at ``register_kv_caches`` time (which
   also refuses a config that lists two offload subs). Mirroring the sub's tier
@@ -47,8 +47,8 @@ Merge strategy mirrors vLLM's ``MultiConnector``, adapted to ATOM's
 Send/save lifetime
 ------------------
 Completion reports describe individual operations, not permission to free a
-request. The scheduler retains blocks until the send finishes and the
-composite ``should_defer_free`` predicate clears, including computed chunks
+request. The scheduler retains blocks until the composite
+``should_defer_free`` predicate clears for every child, including computed chunks
 whose save has not yet been dispatched. Holding a chunk's ``finished_saving``
 until the send finishes prevents the scheduler from issuing the next chunk's
 save. Forward both kinds of progress immediately; TP/PP aggregation still
@@ -117,11 +117,11 @@ def _build_subconnectors(config: Any, role: str) -> list:
             sub["kv_connector"],
             role,
         )
-    # Request-ID send completions cannot distinguish multiple send owners.
+    # The response metadata / proxy protocol still describes one P/D target.
     if sum(bool(getattr(c, "is_producer", False)) for c in connectors) > 1:
         raise ValueError(
             "multi permits at most one is_producer/send connector: "
-            "request-ID completion sets cannot identify multiple send owners"
+            "the response metadata supports only one P/D transfer target"
         )
     return connectors
 
@@ -286,32 +286,12 @@ class MultiConnector(KVConnectorBase):
                 callback(req_ids)
 
     def get_finished(self) -> KVConnectorOutput:
-        recv: set = set()
-        failed: set = set()
-        loaded: set = set()
-        load_failed: set = set()
-        send_now: list = []
-        save_now: list = []
-        completions: set = set()
-        for c in self._connectors:
-            o = _normalize_finished(c.get_finished())
-            recv |= o.finished_recving
-            failed |= o.failed_recving
-            loaded |= o.finished_loading
-            load_failed |= o.failed_loading
-            send_now.extend(o.finished_sending)
-            save_now.extend(o.finished_saving)
-            completions |= o.connector_completions
-
-        return KVConnectorOutput(
-            finished_sending=set(send_now),
-            finished_saving=set(save_now),
-            finished_recving=recv,
-            failed_recving=failed,
-            finished_loading=loaded,
-            failed_loading=load_failed,
-            connector_completions=completions,
-        )
+        output = KVConnectorOutput()
+        for index, connector in enumerate(self._connectors):
+            child = _normalize_finished(connector.get_finished())
+            if not child.is_empty():
+                output.child_outputs[index] = child
+        return output
 
     def get_finished_recv_blocks(self) -> list[int]:
         blocks: list[int] = []
@@ -676,43 +656,24 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         )
 
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
-        """Let the one offload sub apply its own completions and normalize output.
+        """Apply each owner's events, then merge request-level notifications.
 
-        Only offload defines this. Without the fan-out its save/load
-        bookkeeping never clears and raw operation ids reach the scheduler,
-        which looks requests up by bare id.
-
-        `OffloadSchedulerMixin.process_completions` is *destructive* and cannot
-        partition: it replaces `finished_loading`/`failed_loading`/
-        `finished_saving` with only the operations it recognises and `.clear()`s
-        `connector_completions` wholesale, over the full sets it is handed. Two
-        offload subs would each be handed the other's completions -- one sub
-        retiring the other's `_save_inflight` (both key by `str(seq.id)`), whose
-        `_maybe_release_deferred` then frees blocks the other is still reading,
-        plus a WARNING per foreign completion at steady state. There is no shared
-        key by which the composite could split the sets per sub.
-
-        That case is now unrepresentable: `_offload_subconfig` refuses two
-        `lmcache_offload` sub-connectors at startup, and only `lmcache_offload`
-        subs define `process_completions`, so `handlers` is 0 or 1. The direct
-        call is byte-for-byte the single-offload (`[producer, offload]`)
-        behaviour. `>1` is guarded loudly in case that refusal is ever bypassed
-        -- silently corrupting saves is the worse failure.
+        Child handlers may destructively consume/filter their snapshot. Never
+        give them a sibling's events, even when operation IDs happen to match.
+        All handlers run before the scheduler can check should_defer_free.
         """
-        handlers = [
-            handler
-            for c in self._connectors
-            if callable(handler := getattr(c, "process_completions", None))
-        ]
-        if not handlers:
-            return output
-        if len(handlers) > 1:
-            raise RuntimeError(
-                "multi has >1 offload sub-connector with process_completions; "
-                "their completion sets cannot be partitioned per sub and this "
-                "composite is refused at startup (_offload_subconfig)."
-            )
-        return handlers[0](output)
+        if any(getattr(output, name) for name in output.completion_fields):
+            raise ValueError("multi completions must identify their child connector")
+        result = KVConnectorOutput()
+        for index, child_output in output.child_outputs.items():
+            if not 0 <= index < len(self._connectors):
+                raise ValueError(f"unknown child connector index: {index}")
+            connector = self._connectors[index]
+            handler = getattr(connector, "process_completions", None)
+            if callable(handler):
+                child_output = handler(child_output)
+            result.merge(child_output)
+        return result
 
     def save_finished(self, req_id: Any) -> None:
         for c in self._connectors:

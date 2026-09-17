@@ -65,6 +65,66 @@ def _head(pp_size, local_outputs, downstream_messages=()):
     return proc
 
 
+def test_child_identity_survives_tp_and_pp_with_independent_send_progress():
+    from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
+
+    operation = SaveOperationId(7, 0)
+
+    def stage_report(owner):
+        # Use the real TP aggregator on each stage, as the runner manager does.
+        return KVOutputAggregator(2).aggregate(
+            [
+                KVConnectorOutput(
+                    child_outputs={
+                        owner: KVConnectorOutput(finished_saving={operation}),
+                        0: KVConnectorOutput(finished_sending={7}),
+                    }
+                )
+                for _ in range(2)
+            ]
+        )
+
+    proc = _head(
+        2,
+        [stage_report(1), stage_report(2)],
+        [
+            [(1, stage_report(2))],
+            [(1, stage_report(1))],
+        ],
+    )
+    proc._poll_kv_transfer_progress()
+    first = proc.scheduler.outputs[0]
+    assert set(first.child_outputs) == {0}
+    assert first.child_outputs[0].finished_sending == {7}
+    assert proc._pp_kv_aggregator.has_pending()
+    proc._poll_kv_transfer_progress()
+    # Every child's progress is delivered together before the release check.
+    assert len(proc.scheduler.outputs) == 2
+    second = proc.scheduler.outputs[1]
+    assert second.child_outputs[1].finished_saving == {operation}
+    assert second.child_outputs[2].finished_saving == {operation}
+    assert not proc._pp_kv_aggregator.has_pending()
+    proc._pp_kv_aggregator.reset()
+    assert not proc._pp_kv_aggregator.has_pending()
+
+
+def test_pp_applies_completions_before_reconciling_timeouts():
+    proc = _head(
+        2,
+        [KVConnectorOutput(finished_saving={7})],
+        [
+            [(1, KVConnectorOutput(finished_saving={7}))],
+        ],
+    )
+    order = []
+    proc.scheduler._update_from_kv_xfer_finished = lambda output: order.append(
+        "complete"
+    )
+    proc.scheduler._reconcile_stalled_deferred_saves = lambda: order.append("reconcile")
+    proc._poll_kv_transfer_progress()
+    assert order == ["complete", "reconcile"]
+
+
 def test_send_is_reported_while_save_waits_for_every_pp_stage():
     proc = _head(
         pp_size=3,

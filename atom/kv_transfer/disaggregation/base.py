@@ -102,3 +102,28 @@ class KVConnectorSchedulerBase(ABC):
     def request_finished(self, seq: Any) -> None:
         """Populate KV transfer output metadata when a request completes."""
         ...
+
+    @abstractmethod
+    def should_defer_free(self, seq: Any) -> bool:
+        """Whether this connector still needs the sequence's allocation.
+
+        Applies both at request finish and before preemption. Include reads,
+        writes, and pending work that cannot be cancelled on source release.
+        A composite must retain the allocation while ANY child needs it.
+        """
+        ...
+
+    def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
+        """Apply this connector's events before the engine checks for release.
+
+        Return request-level notifications; operation identities and ownership
+        are resolved here, after TP/PP quorum, never in the scheduler.
+        """
+        return output
+
+    def source_blocks_released(self, seq: Any) -> None:
+        """Forget a fully released allocation, including cancellable plans.
+
+        This is not a second request_finished call and is not invoked for a
+        partial release whose remaining blocks are protected by save leases.
+        """

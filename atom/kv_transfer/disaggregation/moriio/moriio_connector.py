@@ -25,10 +25,7 @@ import zmq
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 from atom.config import Config
-from atom.kv_transfer.disaggregation.base import (
-    KVConnectorBase,
-    KVConnectorSchedulerBase,
-)
+from atom.kv_transfer.disaggregation.base import KVConnectorBase
 from atom.kv_transfer.disaggregation.moriio.moriio_common import (
     _MORIIO_AVAILABLE,
     MoRIIOAgentMetadata,
@@ -36,6 +33,7 @@ from atom.kv_transfer.disaggregation.moriio.moriio_common import (
     get_port_offset,
 )
 from atom.kv_transfer.disaggregation.moriio.moriio_engine import MoRIIOWrapper
+from atom.kv_transfer.disaggregation.pd_scheduler import PDSchedulerBase
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     EngineId,
@@ -866,7 +864,7 @@ class MoRIIOConnector(KVConnectorBase):
 # ===================================================================
 
 
-class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
+class MoRIIOConnectorScheduler(PDSchedulerBase):
     """Scheduler-side KV connector that tracks transfer lifecycle.
 
     Runs in the scheduler process (not in TP workers).  Responsible for:
@@ -879,6 +877,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
     """
 
     def __init__(self, config: Config) -> None:
+        super().__init__()
         kv_transfer_config = config.kv_transfer_config
         self.is_producer = (
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
@@ -946,6 +945,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         For the decode (consumer) side, this records the transfer_id <->
         request_id mapping and queues the request for KV loading.
         """
+        self._plan_send(seq)
         params = seq.kv_transfer_params or {}
 
         if not self.is_producer:
@@ -975,6 +975,9 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         the transfer_id mapping.
         """
         # Attach output metadata for the proxy to relay
+        if self.is_producer and not self._publish_send(seq):
+            return
+
         first_token_id = seq.output_tokens[0] if seq.output_tokens else None
         drafts = getattr(seq, "spec_token_ids", None)
         draft_token_ids = (
@@ -996,7 +999,6 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             "prefix_cache_hit_tokens": getattr(seq, "prefix_cache_hit_tokens", 0),
         }
 
-        # Clean up transfer ID mapping on the consumer side
         if not self.is_producer:
             transfer_id = self.request_id_to_transfer_id.pop(seq.id, None)
             if transfer_id is not None:

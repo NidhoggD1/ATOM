@@ -42,6 +42,7 @@ class PPKVAggregator:
         if pp_size <= 0:
             raise ValueError(f"pp_size must be positive, got {pp_size}")
         self._pp_size = pp_size
+        self._children: dict[int, PPKVAggregator] = {}
         self._loading: dict[ReqId, set[int]] = {}
         self._saving: dict[ReqId, set[int]] = {}
         self._failed_loading: dict[ReqId, set[int]] = {}
@@ -107,12 +108,19 @@ class PPKVAggregator:
             self._connector.pop(key, None)
             self._connector_failed.discard(key)
 
-        return KVConnectorOutput(
+        result = KVConnectorOutput(
             finished_loading=done_loading,
             failed_loading=failed,
             finished_saving=done_saving,
             connector_completions=connector_completions,
         )
+        for index, child_output in output.child_outputs.items():
+            if index not in self._children:
+                self._children[index] = PPKVAggregator(self._pp_size)
+            child = self._children[index].ingest(pp_rank, child_output)
+            if not child.is_empty():
+                result.child_outputs[index] = child
+        return result
 
     def has_pending(self) -> bool:
         """True while any request is still short of its per-stage quorum.
@@ -121,7 +129,11 @@ class PPKVAggregator:
         the tallies only drain when the missing stages report in.
         """
         return bool(
-            self._loading or self._saving or self._failed_loading or self._connector
+            self._loading
+            or self._saving
+            or self._failed_loading
+            or self._connector
+            or any(child.has_pending() for child in self._children.values())
         )
 
     def reset(self) -> None:
@@ -130,3 +142,4 @@ class PPKVAggregator:
         self._failed_loading.clear()
         self._connector.clear()
         self._connector_failed.clear()
+        self._children.clear()

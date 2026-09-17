@@ -23,6 +23,39 @@ from atom.kv_transfer.offload.hybrid.dsv4.connector import (
 _TEST_COMPLETION_CHANNEL = "test.connector.completion"
 
 
+@pytest.mark.parametrize("field", KVConnectorOutput.completion_fields)
+def test_child_quorums_preserve_owner_and_worker_identity(field):
+    agg = KVOutputAggregator(world_size=2)
+    operation = SaveOperationId(9, 0)
+    value = (
+        ConnectorCompletion("same_channel", operation, False)
+        if field == "connector_completions"
+        else operation
+    )
+
+    def report(index):
+        return KVConnectorOutput(
+            child_outputs={index: KVConnectorOutput(**{field: {value}})}
+        )
+
+    # Same identity, different owners: these two workers have not agreed.
+    assert agg.aggregate([report(0), report(1)]).is_empty()
+    # Repeating worker 1 with no child from worker 0 must not renumber it.
+    assert agg.aggregate([KVConnectorOutput(), report(1)]).is_empty()
+    assert sum(agg.pending_count) == 2
+    result = agg.aggregate([report(1), KVConnectorOutput()])
+    assert set(result.child_outputs) == {1}
+    assert getattr(result.child_outputs[1], field) == {value}
+    assert sum(agg.pending_count) == 1
+    result = agg.aggregate([KVConnectorOutput(), report(0)])
+    assert set(result.child_outputs) == {0}
+    assert getattr(result.child_outputs[0], field) == {value}
+    assert agg.pending_count == (0, 0)
+    agg.reset()
+    assert agg.terminal_tombstone_count == (0, 0)
+    assert agg.terminal_load_tombstone_count == 0
+
+
 def _completion(channel, operation_id, *, succeeded=True):
     return ConnectorCompletion(
         channel=channel,

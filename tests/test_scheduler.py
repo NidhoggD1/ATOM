@@ -25,6 +25,7 @@ from atom.model_engine.scheduler import (
 )
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.sampling_params import SamplingParams
+from tests.pd_connector_stub import PDSchedulerStub
 
 
 class _OffloadMixinStub(OffloadSchedulerMixin):
@@ -1997,7 +1998,9 @@ class TestPostprocess:
     ):
         sched = Scheduler(MockConfig(pipeline_parallel_size=pp_size))
         seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
-        connector = SimpleNamespace(is_producer=True, request_finished=mock.Mock())
+        connector = PDSchedulerStub()
+        seq.kv_transfer_params = {"do_remote_decode": True}
+        connector.update_state_after_alloc(seq)
         sched.kv_connector = connector
         completion = KVConnectorOutput(finished_sending={seq.id})
         if send_before_postprocess:
@@ -2017,13 +2020,9 @@ class TestPostprocess:
         self, scheduler, seq_factory
     ):
         seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
-        scheduler.kv_connector = SimpleNamespace(
-            is_producer=True,
-            request_finished=mock.Mock(),
-            get_num_new_matched_tokens=lambda seq: (0, False),
-            update_state_after_alloc=mock.Mock(),
-            build_connector_meta=lambda: None,
-        )
+        scheduler.kv_connector = PDSchedulerStub()
+        seq.kv_transfer_params = {"do_remote_decode": True}
+        scheduler.kv_connector.update_state_after_alloc(seq)
         scheduler._update_from_kv_xfer_finished(
             KVConnectorOutput(finished_sending={seq.id})
         )
@@ -2557,18 +2556,37 @@ class TestStalledOffloadSaveReclaim:
             id=1,
             _deferred_save_at=_time.monotonic() - 500.0,
         )
-        seq._awaiting_kv_send = True
-        connector = SimpleNamespace(
-            is_producer=True, save_abandon_timeout_s=lambda: 100.0
+        sender = PDSchedulerStub()
+        seq.kv_transfer_params = {"do_remote_decode": True}
+        sender.update_state_after_alloc(seq)
+        sender.request_finished(seq)
+        from atom.kv_transfer.disaggregation.multi.multi_connector import (
+            MultiConnectorScheduler,
         )
+
+        connector = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
+        offload = SimpleNamespace(
+            save_abandon_timeout_s=lambda: 100.0,
+            abandon_save=mock.Mock(),
+        )
+        connector._connectors = [sender, offload]
         s, freed = self._sched(monkeypatch, [seq], connector)
         assert s._reconcile_stalled_deferred_saves() == 0
         assert not freed
         assert seq.id in s.deferred_free_blocks
 
-        seq._awaiting_kv_send = False
+        offload.abandon_save.assert_called_once_with("1")
+        assert s._abandoned_saves == 1
         s._next_save_reconcile_at = 0
-        assert s._reconcile_stalled_deferred_saves() == 1
+        assert s._reconcile_stalled_deferred_saves() == 0
+        offload.abandon_save.assert_called_once_with("1")
+        s._update_from_kv_xfer_finished(
+            KVConnectorOutput(
+                child_outputs={
+                    0: KVConnectorOutput(finished_sending={seq.id}),
+                }
+            )
+        )
         assert freed == [seq.id]
 
     def test_it_self_throttles_so_a_1ms_poll_is_cheap(self, monkeypatch):

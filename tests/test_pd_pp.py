@@ -146,6 +146,7 @@ def test_producer_advertises_remote_pp_size():
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
     sched = object.__new__(mc.MooncakeConnectorScheduler)
+    sched._send_sources = {}
     sched.pp_size = 4
     sched.tp_size = 1
     sched.hash_block_size = 64
@@ -159,6 +160,7 @@ def test_producer_advertises_remote_pp_size():
     sched.is_producer = True
 
     seq = SimpleNamespace(
+        kv_transfer_params={"do_remote_decode": True},
         output_tokens=[7],
         spec_token_ids=None,
         block_table=[1, 2, 3],
@@ -176,6 +178,7 @@ def test_producer_advertises_remote_pp_size():
 
 def _mooncake_consumer_scheduler(mc, block_size=64, dcp_size=1):
     sched = object.__new__(mc.MooncakeConnectorScheduler)
+    sched._send_sources = {}
     sched.is_producer = False
     sched.block_size = block_size
     sched.dcp_size = dcp_size

@@ -137,6 +137,8 @@ class KVOutputAggregator:
         if terminal_tombstone_limit <= 0:
             raise ValueError("terminal_tombstone_limit must be positive")
         self._world_size = world_size
+        self._terminal_tombstone_limit = terminal_tombstone_limit
+        self._children: dict[int, KVOutputAggregator] = {}
         self._sending = _TPCompletionGroup[ReqId](
             world_size,
             terminal_tombstone_limit,
@@ -235,7 +237,7 @@ class KVOutputAggregator:
             for key in keys
         }
 
-        return KVConnectorOutput(
+        result = KVConnectorOutput(
             finished_sending=done_sending,
             finished_recving=done_recving,
             failed_recving=failed_recving,
@@ -244,6 +246,22 @@ class KVOutputAggregator:
             failed_loading=failed_loading,
             connector_completions=connector_completions,
         )
+        for index in {i for output in worker_outputs for i in output.child_outputs}:
+            if index not in self._children:
+                self._children[index] = KVOutputAggregator(
+                    self._world_size, self._terminal_tombstone_limit
+                )
+            # Keep actual worker indices: dropping absent children could turn
+            # worker 1's duplicate into worker 0's vote in a later poll.
+            child = self._children[index].aggregate(
+                [
+                    output.child_outputs.get(index, KVConnectorOutput())
+                    for output in worker_outputs
+                ]
+            )
+            if not child.is_empty():
+                result.child_outputs[index] = child
+        return result
 
     def reset(self) -> None:
         """Clear all internal tracking state."""
@@ -252,22 +270,34 @@ class KVOutputAggregator:
         self._saving.reset()
         self._loading.reset()
         self._connector_completions.reset()
+        self._children.clear()
 
     @property
     def terminal_tombstone_count(self) -> tuple[int, int]:
-        return self._saving.tombstone_count, self._connector_completions.tombstone_count
+        child_counts = [
+            child.terminal_tombstone_count for child in self._children.values()
+        ]
+        return (
+            self._saving.tombstone_count + sum(count[0] for count in child_counts),
+            self._connector_completions.tombstone_count
+            + sum(count[1] for count in child_counts),
+        )
 
     @property
     def terminal_load_tombstone_count(self) -> int:
-        return self._loading.tombstone_count
+        return self._loading.tombstone_count + sum(
+            child.terminal_load_tombstone_count for child in self._children.values()
+        )
 
     @property
     def pending_count(self) -> tuple[int, int]:
         """Return ``(num_pending_sending, num_pending_other_transfers)``."""
+        child_counts = [child.pending_count for child in self._children.values()]
         return (
-            self._sending.pending_count,
+            self._sending.pending_count + sum(count[0] for count in child_counts),
             self._receiving.pending_count
             + self._saving.pending_count
             + self._loading.pending_count
-            + self._connector_completions.pending_count,
+            + self._connector_completions.pending_count
+            + sum(count[1] for count in child_counts),
         )
