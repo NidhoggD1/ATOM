@@ -1896,9 +1896,18 @@ class Scheduler:
             return False
 
         seq.status = SequenceStatus.WAITING
-        if not self._connector_flag("is_offload"):
+        is_offload = self._connector_flag("is_offload")
+        if not is_offload:
             self._uncount_inflight_load(seq)
-        if seq.offload_joint.load_hash != -1 or seq.offload_joint.boundary_tokens:
+            # A P/D consumer allocates the destination table before starting
+            # the remote receive.  Failed transfers must release that table
+            # before local-prefill fallback re-enters can_allocate/allocate;
+            # unlike the offload resume path, it cannot reuse partially
+            # received KV.
+            self.block_manager.deallocate(seq)
+        if is_offload and (
+            seq.offload_joint.load_hash != -1 or seq.offload_joint.boundary_tokens
+        ):
             # The state never arrived, so the boundary is not this request's
             # history. Disown it exactly as `BlockManager.allocate` does at
             # admission, otherwise the resume runs with `num_cached_tokens > 0`

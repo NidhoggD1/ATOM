@@ -421,14 +421,22 @@ def test_failed_pd_transfer_does_not_record_successful_cache_admission():
     scheduler._update_from_kv_xfer_finished(KVConnectorOutput(failed_recving={seq.id}))
     assert scheduler.engine_stats.total_requests == 0
     # At the failure/success branch, choose fallback without counting a PD hit.
-    # Local prefill admission is covered separately; block recovery is not part
-    # of this metrics change.
     assert scheduler._resolve_waiting_remote_kv(seq, deque()) is False
     assert scheduler.engine_stats.total_requests == 0
     assert scheduler.engine_stats.total_full_tokens == 0
     assert scheduler.engine_stats.total_cached_tokens == 0
     assert scheduler.engine_stats.total_offload_tokens == 0
     assert seq.num_tokens == 16  # P's first output token was not injected.
+    assert not seq.block_table
+    assert seq.num_cached_tokens == 0
+
+    # The failed receive's destination blocks must not reach allocate() again.
+    batch, _ = scheduler.schedule()
+
+    assert batch.total_seqs_num_prefill == 1
+    assert seq in scheduler.running
+    assert seq.block_table
+    assert seq.prefix_cache_hit_tokens == 0
 
 
 def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
