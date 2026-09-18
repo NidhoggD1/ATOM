@@ -67,9 +67,6 @@ from atom.kv_transfer.disaggregation.base import (
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     KVConnectorOutput,
-    SaveCompletionId,
-    StateStoreOperationId,
-    completion_req_key,
     connector_metadata_has_work,
 )
 
@@ -118,6 +115,20 @@ def _build_subconnectors(config: Any, role: str) -> list:
             i,
             sub["kv_connector"],
             role,
+        )
+    # Completion reports name a request, not a connector: with two senders the
+    # first `finished_sending` would retire both claims and free the source
+    # under the other's live RDMA read. Refuse the config rather than grow
+    # per-child completion identities for a topology nobody runs. (Two offload
+    # subs are refused separately, by `_offload_subconfig`.)
+    if sum(bool(getattr(c, "is_producer", False)) for c in connectors) > 1:
+        raise ValueError(
+            "multi permits at most one producer/send sub-connector; got "
+            + ", ".join(
+                sub["kv_connector"]
+                for sub, c in zip(subs, connectors)
+                if getattr(c, "is_producer", False)
+            )
         )
     return connectors
 
@@ -243,16 +254,6 @@ class MultiConnector(KVConnectorBase):
         # resolve, not raise `AttributeError`.
         self._state_tier = None
 
-    @property
-    def _pairs_send_and_save(self) -> bool:
-        """Whether this rank has a send to pair its saves against.
-
-        Only a producer's PP stage 0 does: mooncake reports done_sending on
-        stage 0 alone (via ``_record_release``). Every other rank passes both
-        completions straight through and must keep no pairing state.
-        """
-        return self.is_producer and self._pp_is_head
-
     def register_kv_caches(
         self,
         kv_caches: dict[str, Any],
@@ -296,22 +297,6 @@ class MultiConnector(KVConnectorBase):
         for c, m in zip(self._connectors, metas):
             if m is None:
                 continue
-            # Remember what offload is about to save, so get_finished can hold
-            # the send until it finishes.
-            if self._pairs_send_and_save:
-                reqs = getattr(m, "requests", None)
-                if reqs:
-                    for req in reqs:
-                        has_save = (
-                            getattr(req, "save_spec", None) is not None
-                            or getattr(req, "slot_save_spec", None) is not None
-                        )
-                        if not has_save:
-                            continue
-                        operation = getattr(req, "save_operation", None)
-                        self._pending_save_ops.setdefault(
-                            completion_req_key(req.req_id), set()
-                        ).add(operation if operation is not None else req.req_id)
             c.start_load_kv(m)
 
     def record_kv_cache_ready(self, req_ids: list) -> None:
@@ -339,7 +324,9 @@ class MultiConnector(KVConnectorBase):
             save_now.extend(o.finished_saving)
             completions |= o.connector_completions
 
-        out = KVConnectorOutput(
+        return KVConnectorOutput(
+            finished_sending=set(send_now),
+            finished_saving=set(save_now),
             finished_recving=recv,
             failed_recving=failed,
             finished_loading=loaded,
@@ -726,9 +713,8 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
                 callback(count)
 
     def has_pending_work(self) -> bool:
-        # Scheduler-side only: the send/save pairing state lives on the worker
-        # instance, and a pending send is already visible to the engine through
-        # the scheduler's deferred_free_blocks.
+        # A pending send is visible to the engine through the scheduler's
+        # deferred_free_blocks; sub-connectors report their offload work here.
         return any(
             c.has_pending_work()
             for c in self._connectors
@@ -778,6 +764,13 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         for c in self._connectors:
             if hasattr(c, "save_finished"):
                 c.save_finished(req_id)
+
+    def send_finished(self, req_id: Any) -> None:
+        # Only the producer sub defines this; fanning out saves the composite
+        # from tracking which index that is.
+        for c in self._connectors:
+            if hasattr(c, "send_finished"):
+                c.send_finished(req_id)
 
     def load_failed(self, req_id: Any) -> None:
         for c in self._connectors:
