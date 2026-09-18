@@ -143,6 +143,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         # metadata rather than as one of vLLM's two id sets.
         self._save_reports: dict[str, int] = {}
         self._load_failure_reports: dict[str, int] = {}
+        # vLLM's GPU block pool, handed over at `bind_gpu_block_pool`. Holding a
+        # refcount on exactly the blocks a save is still reading is what lets
+        # the rest of a finished request's table go back immediately.
+        self._gpu_block_pool = None
         self._world_size = max(
             1, int(getattr(vllm_config.parallel_config, "world_size", 1) or 1)
         )
@@ -628,6 +632,24 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         self._absorb_worker_meta(
             getattr(connector_output, "kv_connector_worker_meta", None)
         )
+        # Return the shares whose save reported, then force-return any whose
+        # save never did. `reclaim_stale_leases` is ATOM's own bounded fallback
+        # and it is given the same window as the whole-request deferral above,
+        # so a lease can never outlive the deferral it replaced.
+        if self._gpu_block_pool is not None:
+            drain = getattr(self._scheduler, "take_source_safe_releases", None)
+            if drain is not None:
+                self._release_lease_sets(drain())
+            reclaim = getattr(self._scheduler, "reclaim_stale_leases", None)
+            if reclaim is not None:
+                stale = reclaim(self._save_abandon_timeout_s())
+                if stale:
+                    logger.warning(
+                        "ATOM LMCache offload: force-releasing %d stale block "
+                        "lease set(s) -- their saves never reported",
+                        len(stale),
+                    )
+                    self._release_lease_sets(stale)
         for req_id in connector_output.finished_recving or ():
             rid = str(req_id)
             self._promised_loads.pop(rid, None)
@@ -680,6 +702,41 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
             if quorums:
                 self._scheduler.save_finished_by_request(rid)
 
+    def bind_gpu_block_pool(self, gpu_block_pool) -> None:
+        """Keep vLLM's block pool so a finished request can leave exact leases.
+
+        vLLM calls this unconditionally on the scheduler half before any
+        request runs. Only the scheduler half may touch the pool; the worker
+        half never sees this call and its `_gpu_block_pool` stays None, which
+        is also what keeps the fallback below correct on a vLLM too old to
+        call it at all.
+        """
+        self._gpu_block_pool = gpu_block_pool
+
+    def _release_lease_sets(self, block_id_sets) -> None:
+        """Drop the refcount shares a lease transferred to this connector.
+
+        Tail-first within each set, matching vLLM's own convention for the same
+        operation, so a shared prefix is the last thing eligible for eviction.
+
+        One share per block per emission. The scheduler keys leases by
+        ``id(seq)`` and every release path (`_mark_source_safe`,
+        `_release_operation_lease`, `abandon_save`, `reclaim_stale_leases`)
+        removes what it emits from that request's lease set first, so a block
+        arrives here exactly once per `activate_block_leases` call that
+        contained it. That pairs 1:1 with the `touch` in `request_finished`,
+        including when two requests protect the same shared block -- which then
+        stays alive until the last of them reports.
+        """
+        pool = self._gpu_block_pool
+        if pool is None:
+            return
+        for block_ids in block_id_sets or ():
+            if not block_ids:
+                continue
+            ordered = sorted(block_ids, reverse=True)
+            pool.free_blocks([pool.blocks[block_id] for block_id in ordered])
+
     def request_finished(self, request, block_ids) -> tuple[bool, dict | None]:
         req_id = request.request_id
         self._promised_loads.pop(req_id, None)
@@ -688,6 +745,26 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
             self._scheduler.request_finished(seq)
             # Blocks may still be pinned by an in-flight save; ATOM says when.
             if self._scheduler.should_defer_free(seq):
+                # Ask for the exact blocks first. `protected_block_ids` returns
+                # None when it cannot narrow the protection -- the layout has no
+                # early-release support, or a load is in flight -- and only then
+                # is holding the whole table the right answer.
+                protected = None
+                if self._gpu_block_pool is not None:
+                    getter = getattr(self._scheduler, "protected_block_ids", None)
+                    if getter is not None:
+                        protected = getter(seq)
+                if protected is not None:
+                    pool = self._gpu_block_pool
+                    if protected:
+                        pool.touch([pool.blocks[block_id] for block_id in protected])
+                    self._scheduler.activate_block_leases(seq, frozenset(protected))
+                    self._seqs.drop(req_id)
+                    # False: vLLM frees the table now, and the refcounts taken
+                    # above keep exactly the blocks the save still reads.
+                    # `has_pending_work()` already counts `_save_lease_blocks`,
+                    # so the engine keeps stepping until they are handed back.
+                    return False, None
                 # vLLM will not ask a second time -- it holds the blocks until
                 # the connector names the id in `finished_sending`, and
                 # `_collect_releases` is what eventually produces that.
