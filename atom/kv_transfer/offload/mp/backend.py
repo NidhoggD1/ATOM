@@ -906,7 +906,7 @@ class LMCacheMPConnector(KVConnectorBase):
             )
             submit = getattr(
                 self._adapter,
-                "submit_store_request_with_source_events",
+                "submit_store_request_with_chunk_events",
                 self._adapter.submit_store_request,
             )
             transfer = submit(
@@ -951,7 +951,7 @@ class LMCacheMPConnector(KVConnectorBase):
             # represented by None, while LMCache's missing-registration path
             # returns an event-free terminal False future.
             for operation_id, pending in list(self._pending_saves.items()):
-                take_ranges = getattr(pending.future, "take_source_safe_ranges", None)
+                take_ranges = getattr(pending.future, "take_completed_ranges", None)
                 if callable(take_ranges) and isinstance(
                     pending.completion, SaveOperationId
                 ):

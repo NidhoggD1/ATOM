@@ -48,7 +48,7 @@ class Future:
     def result(self, timeout=0):
         return self.value
 
-    def take_source_safe_ranges(self):
+    def take_completed_ranges(self):
         ranges, self.source_ranges = self.source_ranges, []
         return tuple(ranges)
 

@@ -250,7 +250,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             if loading
             else getattr(
                 self._adapter,
-                "submit_store_request_with_source_events",
+                "submit_store_request_with_chunk_events",
                 self._adapter.submit_store_request,
             )
         )
@@ -335,7 +335,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         output = KVConnectorOutput()
         with self._lock:
             for operation_id, pending in list(self._native_saves.items()):
-                take_ranges = getattr(pending.future, "take_source_safe_ranges", None)
+                take_ranges = getattr(pending.future, "take_completed_ranges", None)
                 if callable(take_ranges):
                     try:
                         self._emit_native_source_safe(
