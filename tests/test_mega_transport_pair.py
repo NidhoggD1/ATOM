@@ -12,8 +12,12 @@ claim to validate collectives, arena bytes or graph replay.
 from types import SimpleNamespace
 
 import pytest
+from import_guard import skip_if_dependency_missing
 
-from atom.model_ops.fused_moe import mori_v2_prepare_finalize as mv2
+try:
+    from atom.model_ops.fused_moe import mori_v2_prepare_finalize as mv2
+except ImportError as _e:  # aiter absent under bare non-GPU pytest
+    skip_if_dependency_missing(_e, "requires full atom import env")
 
 PREFILL_CAPACITY = 16384
 CAPTURE_SIZES = [1, 2, 4, 8, 16, 32, 48, 64, 128, 256]
@@ -93,7 +97,9 @@ def runtime(monkeypatch):
         )
 
     monkeypatch.setattr(mv2, "_init_cco_comm", fake_comm)
-    monkeypatch.setattr(mv2, "get_dp_group", lambda: SimpleNamespace(world_size=DP_SIZE))
+    monkeypatch.setattr(
+        mv2, "get_dp_group", lambda: SimpleNamespace(world_size=DP_SIZE)
+    )
     monkeypatch.setattr(
         mv2,
         "get_forward_context",
@@ -226,7 +232,9 @@ def test_triton_experts_veto_the_compact_transport(runtime):
     assert prefill._config.compact_plan is False
 
 
-@pytest.mark.parametrize("capture_sizes", [[], [PREFILL_CAPACITY], [PREFILL_CAPACITY * 2]])
+@pytest.mark.parametrize(
+    "capture_sizes", [[], [PREFILL_CAPACITY], [PREFILL_CAPACITY * 2]]
+)
 def test_a_decode_capacity_that_does_not_shrink_is_not_built(runtime, capture_sizes):
     runtime.capture_sizes = capture_sizes
 

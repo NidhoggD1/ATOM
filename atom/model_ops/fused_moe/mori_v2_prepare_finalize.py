@@ -477,11 +477,7 @@ def build_mega_transports(
         want_compact=False,
         **recipe,
     )
-    if (
-        triton_experts
-        or not envs.ATOM_MEGA_DECODE_COMPACT
-        or not _wire_is_quantized()
-    ):
+    if triton_experts or not envs.ATOM_MEGA_DECODE_COMPACT or not _wire_is_quantized():
         return prefill, None
     decode_capacity = _decode_token_capacity(max_num_inp_token_per_rank)
     if decode_capacity <= 0:
