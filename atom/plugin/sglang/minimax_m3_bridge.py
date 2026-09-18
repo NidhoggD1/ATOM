@@ -56,9 +56,16 @@ def minimax_m3_num_idx_heads(config: Any, tp_size: int) -> int:
     """
     heads = int(getattr(_text_config(config), "num_key_value_heads", 1))
     try:
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
+        from sglang.srt.distributed.parallel_state import (
+            get_attn_tensor_model_parallel_world_size as get_attention_tp_size,
+        )
     except ImportError:  # an sglang without the dp-attention split
-        pass
+        try:
+            from sglang.srt.layers.dp_attention import get_attention_tp_size
+        except ImportError:
+            pass
+        else:
+            tp_size = get_attention_tp_size()
     else:
         # Only the import is guarded. This runs inside a forward, where the
         # attention group is up -- unlike `_local_kv_heads`, which answers the
@@ -90,7 +97,7 @@ def _resolve_m3_index_cache_dtype(fallback: torch.dtype) -> torch.dtype:
         index_cache_dtype = getattr(
             get_current_atom_config(), "index_cache_dtype", None
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         index_cache_dtype = None
 
     if str(index_cache_dtype).startswith("fp8"):
@@ -243,100 +250,23 @@ class ATOMMiniMaxM3SGLangKVPool:
 
 
 def install_minimax_m3_pool_patch() -> None:
-    """Patch older SGLang builds that lack MiniMaxSparseKVPool support."""
+    """No-op on SGLang 0.5.17+ where MiniMaxSparseKVPool is built in.
 
-    import sglang.srt.model_executor.model_runner_kv_cache_mixin as mixin
+    Older builds without the upstream pool used ``ModelRunnerKVCacheMixin``;
+    that module was removed when pool construction moved to
+    ``KVCacheConfigurator``. Keep this entry point for call-site compatibility.
+    """
 
-    if getattr(mixin.ModelRunnerKVCacheMixin, "_atom_minimax_m3_pool_patched", False):
+    try:
+        from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool  # noqa: F401
+    except ImportError:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "MiniMaxSparseKVPool is unavailable in this SGLang build; "
+            "ATOM MiniMax-M3 SGLang pool shim is not installed"
+        )
         return
-
-    original_resolve = mixin.ModelRunnerKVCacheMixin._resolve_memory_pool_config
-    original_init_pools = mixin.ModelRunnerKVCacheMixin._init_pools
-
-    def _is_m3_runner(runner) -> bool:
-        return is_minimax_m3_config(getattr(runner.model_config, "hf_config", None))
-
-    def _local_kv_heads(runner) -> int:
-        try:
-            from sglang.srt.layers.dp_attention import get_attention_tp_size
-
-            return int(runner.model_config.get_num_kv_heads(get_attention_tp_size()))
-        except Exception:
-            hf_config = _text_config(runner.model_config.hf_config)
-            tp_size = max(1, int(getattr(runner, "tp_size", 1)))
-            return max(1, int(getattr(hf_config, "num_key_value_heads", 1)) // tp_size)
-
-    def _resolve_memory_pool_config(self, pre_model_load_memory: int):
-        config = original_resolve(self, pre_model_load_memory)
-        if not _is_m3_runner(self):
-            return config
-
-        hf_config = _text_config(self.model_config.hf_config)
-        kv_dtype = self.kv_cache_dtype
-        use_fp8_scales = _is_fp8_dtype(self.kv_cache_dtype) or str(
-            self.kv_cache_dtype
-        ).startswith("fp8")
-        index_dtype = _resolve_m3_index_cache_dtype(
-            getattr(self, "dtype", getattr(self, "torch_dtype", torch.bfloat16))
-        )
-        num_layers = int(
-            getattr(self, "num_effective_layers", hf_config.num_hidden_layers)
-        )
-        main_bytes = (
-            2
-            * num_layers
-            * _local_kv_heads(self)
-            * int(hf_config.head_dim)
-            * _dtype_size(kv_dtype)
-        )
-        index_bytes = (
-            len(_m3_sparse_layer_ids(self.model_config.hf_config))
-            * _m3_index_dim(self.model_config.hf_config)
-            * _dtype_size(index_dtype)
-        )
-        scale_bytes = 0
-        if use_fp8_scales:
-            scale_bytes = (
-                2 * num_layers * _local_kv_heads(self) * _dtype_size(torch.float32)
-            )
-        extra_bytes = index_bytes + scale_bytes
-        if main_bytes <= 0 or extra_bytes <= 0:
-            return config
-
-        old_tokens = int(config.max_total_num_tokens)
-        new_tokens = (old_tokens * main_bytes) // (main_bytes + extra_bytes)
-        page_size = int(self.server_args.page_size)
-        new_tokens = max(page_size, (new_tokens // page_size) * page_size)
-        if new_tokens < old_tokens:
-            config.max_total_num_tokens = new_tokens
-            config.max_running_requests = self._resolve_max_num_reqs(new_tokens)
-        return config
-
-    def _init_pools(self):
-        original_init_pools(self)
-        if not _is_m3_runner(self):
-            return
-        pool = getattr(self, "token_to_kv_pool", None)
-        if pool is None or hasattr(pool, "get_kv_scale_buffer"):
-            return
-        use_fp8_scales = _is_fp8_dtype(self.kv_cache_dtype) or str(
-            self.kv_cache_dtype
-        ).startswith("fp8")
-        index_dtype = _resolve_m3_index_cache_dtype(
-            getattr(self, "dtype", getattr(self, "torch_dtype", torch.bfloat16))
-        )
-        self.token_to_kv_pool = ATOMMiniMaxM3SGLangKVPool(
-            pool,
-            self.model_config.hf_config,
-            index_dtype,
-            use_fp8_scales=use_fp8_scales,
-        )
-
-    mixin.ModelRunnerKVCacheMixin._resolve_memory_pool_config = (
-        _resolve_memory_pool_config
-    )
-    mixin.ModelRunnerKVCacheMixin._init_pools = _init_pools
-    mixin.ModelRunnerKVCacheMixin._atom_minimax_m3_pool_patched = True
 
 
 def maybe_get_minimax_m3_pools_from_sglang_batch(forward_batch=None):
@@ -408,7 +338,7 @@ def _page_size(token_to_kv_pool) -> int:
 def _is_stream_capturing() -> bool:
     try:
         return bool(torch.cuda.is_current_stream_capturing())
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
