@@ -232,6 +232,27 @@ not inherit the parent's rank. For an established session, load accounting
 charges only positive prompt-length growth rather than repeatedly charging the
 complete cached conversation.
 
+
+`ATOM_DP_PREFIX_ROUTING=1` enables experimental prefix-aware placement for new
+sessions and requires `ATOM_DP_SESSION_AFFINITY=1`. It uses cumulative 128-bit
+BLAKE2b hashes at 8192-token boundaries, computed from the existing int32 prompt
+buffer outside the routing lock. No prompt text or token buffers are retained.
+The score becomes `queued_prefill_tokens + request_equivalent * requests -
+estimated_cached_prefix_tokens`. Candidates whose pre-admission request count
+exceeds the least busy rank by more than `ATOM_DP_PREFIX_MAX_REQUEST_SKEW`
+(default 8) are excluded when a prefix match exists. This gate applies only to
+new sessions; explicit rank hints and existing owners retain priority.
+
+Prefix hints are published after the first streaming model output, expire per
+rank after 600 seconds, and have a 65536-entry LRU bound. Pending hints are
+removed on cancellation, rejection, or transport rollback. These are estimates
+of recent prefill work, not confirmations of current GPU cache residency. The
+engine still verifies its real prefix cache, so stale hints may affect placement
+and performance but cannot substitute incorrect KV state. The router logs its
+first four and every 128th prefix-based placement, including estimated reusable
+tokens. Offline completions do not populate these hints. This option is off by
+default and needs workload-specific performance validation.
+
 The OpenAI server reads the session ID from `X-Dynamo-Session-ID`, falling back
 to `X-Correlation-ID`; `X-Dynamo-Parent-Session-ID` is retained for routing
 observability. For AIPerf agentic workloads, the normal correlation header is
@@ -262,6 +283,11 @@ drained and warns if it is invoked while requests are still charged.
 - Env: `ATOM_DP_LB_REQ_EQUIV` (int, default `512`): token-equivalent cost of one in-flight request for `least_tokens`.
 - Env: `ATOM_DP_SESSION_AFFINITY` (bool, default `0`): load-place each new
   session once, then keep all later turns on its cache owner without spill.
+
+- Env: `ATOM_DP_PREFIX_ROUTING` (bool, default `0`): use recent token-prefix
+  hints when placing new sessions; requires session affinity.
+- Env: `ATOM_DP_PREFIX_MAX_REQUEST_SKEW` (int, default `8`): pre-admission
+  request-count gap allowed when considering a cached rank for a new session.
 
 ## Expert Parallelism (EP)
 
@@ -365,6 +391,8 @@ The block configuration adapts to the batch type: prefill uses `block_num=128, w
 | `ATOM_DP_MASTER_PORT` | int | `29500` | Port for DP Gloo rendezvous |
 | `ATOM_DP_LB_REQ_EQUIV` | int | `512` | Token-equivalent cost of one in-flight request for the `least_tokens` DP load-balance strategy |
 | `ATOM_DP_SESSION_AFFINITY` | bool | `0` | Load-place a new session, then keep later turns on its immutable prefix-cache owner |
+| `ATOM_DP_PREFIX_ROUTING` | bool | `0` | Experimental recent-prefix hints for new-session placement; requires session affinity |
+| `ATOM_DP_PREFIX_MAX_REQUEST_SKEW` | int | `8` | Maximum pre-admission request-count gap for prefix-aware new-session placement |
 | ~~`ATOM_ENFORCE_EAGER`~~ | | | Removed. Use CLI flag `--enforce-eager` instead. |
 | `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | bool | `False` | Fuse QK-norm + RoPE + cache quant for Qwen3 dense and MoE models |
 

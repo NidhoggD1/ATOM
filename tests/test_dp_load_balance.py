@@ -10,7 +10,9 @@
 # conftest.py supplies the atom.* / zmq stubs the import chain needs.
 
 import pickle
+from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock, Thread
+from types import SimpleNamespace
 
 import pytest
 
@@ -54,6 +56,10 @@ def _make_mgr(
     mgr._dp_lb_strategy = strategy
     mgr._dp_lb_req_equiv = req_equiv
     mgr._dp_session_affinity_enabled = session_affinity
+    mgr._dp_prefix_hints = None
+    mgr._pending_dp_prefix_hints = {}
+    mgr._dp_prefix_routed_total = 0
+    mgr._dp_prefix_estimated_tokens = 0
     mgr._dp_session_owners = {}
     mgr._dp_session_prompt_tokens = {}
     mgr._dp_route_counters = {
@@ -528,6 +534,7 @@ def test_decode_bookkeeping_does_not_wait_for_an_unrelated_router_lock():
     assert sum(mgr._rank_tokens) == 20
     mgr._mark_seq_prefill_complete(seq.id)
     assert sum(mgr._rank_tokens) == 0
+
     completed = Event()
 
     def receive_decode_token():
@@ -542,3 +549,210 @@ def test_decode_bookkeeping_does_not_wait_for_an_unrelated_router_lock():
     assert progressed_while_router_locked
     assert sum(mgr._rank_reqs) == 1
     assert sum(mgr._rank_tokens) == 0
+
+
+@pytest.fixture
+def prefix_router(monkeypatch):
+    from atom.model_engine import engine_core_mgr
+    from atom.model_engine.prefix_route_hints import PrefixRouteHints
+
+    mgr = _make_mgr(2, req_equiv=0, session_affinity=True)
+    mgr._dp_prefix_hints = PrefixRouteHints(2, block_tokens=4, ttl_seconds=10)
+    sent = []
+    now = [0.0]
+    monkeypatch.setattr(engine_core_mgr.time, "monotonic", lambda: now[0])
+
+    def send(rank, payload):
+        _, seqs = pickle.loads(payload)
+        sent.extend((seq.id, rank) for seq in seqs)
+
+    mgr._send_request = send
+    return mgr, sent, now
+
+
+def _prefix_seq(seq_id, tokens, session=None, rank=None):
+    import array
+
+    seq = _FakeSeq(seq_id, len(tokens), rank, session)
+    seq.token_ids = array.array("i", tokens)
+    return seq
+
+
+def _seed_prefix(mgr, tokens=None):
+    tokens = list(range(8)) if tokens is None else tokens
+    seq = _prefix_seq("seed", tokens, "root", 0)
+    mgr._dispatch_to_dp_ranks([seq])
+    mgr._mark_seq_prefill_complete(seq.id)
+    mgr._release_seq_load(seq.id)
+    return seq
+
+
+def test_prefix_learns_on_output_then_places_new_session_and_discounts_debt(
+    prefix_router,
+):
+    mgr, sent, now = prefix_router
+    root = _prefix_seq("root", list(range(8)), "root", 0)
+    mgr._dispatch_to_dp_ranks([root])
+    keys = mgr._dp_prefix_hints.fingerprints(root.token_ids, 8)
+    assert mgr._dp_prefix_hints.match(keys, now[0]) == [0, 0]
+    mgr._mark_seq_prefill_complete(root.id)
+    assert mgr._dp_prefix_hints.match(keys, now[0]) == [8, 0]
+
+    mgr._dispatch_to_dp_ranks([_prefix_seq("busy", [90, 91, 92], "busy", 0)])
+    mgr._dispatch_to_dp_ranks([_prefix_seq("child", list(range(8)) + [99], "child")])
+    # rank 0 has debt 3 but saves 8 incoming tokens: 3 - 8 < rank 1's 0.
+    assert sent[-1] == ("child", 0)
+    assert mgr._rank_tokens == [4, 0]  # debt 3 + one uncached child token
+    assert mgr._dp_prefix_routed_total == 1
+    assert mgr._dp_prefix_estimated_tokens == 8
+
+
+def test_prefix_credit_does_not_override_larger_pending_work_or_existing_owner(
+    prefix_router,
+):
+    mgr, sent, _ = prefix_router
+    _seed_prefix(mgr)
+    mgr._dispatch_to_dp_ranks([_prefix_seq("busy0", [90] * 20, "busy0", 0)])
+    child = _prefix_seq("child", list(range(8)) + [99], "child")
+    mgr._dispatch_to_dp_ranks([child])
+    assert sent[-1] == ("child", 1)  # 20 - 8 > 0
+    assert mgr._rank_tokens == [20, 9]
+    mgr._mark_seq_prefill_complete(child.id)
+    mgr._dispatch_to_dp_ranks([_prefix_seq("busy1", [91] * 40, "busy1", 1)])
+    mgr._dispatch_to_dp_ranks(
+        [_prefix_seq("next", list(range(8)) + [99, 100], "child")]
+    )
+    assert sent[-1] == ("next", 1)  # existing owner remains immutable
+
+
+def test_prefix_request_skew_gate_prevents_large_prefix_from_attracting_burst(
+    prefix_router,
+):
+    mgr, sent, _ = prefix_router
+    mgr._dp_prefix_hints.max_request_skew = 1
+    _seed_prefix(mgr, list(range(64)))
+    mgr._dispatch_to_dp_ranks(
+        [_prefix_seq("busy-a", [90], "a", 0), _prefix_seq("busy-b", [91], "b", 0)]
+    )
+    mgr._dispatch_to_dp_ranks([_prefix_seq("child", list(range(64)) + [99], "child")])
+    assert sent[-1] == ("child", 1)
+    assert mgr._rank_tokens == [2, 65]
+
+
+def test_prefix_explicit_hint_wins_and_is_new_owner(prefix_router):
+    mgr, sent, _ = prefix_router
+    _seed_prefix(mgr)
+    mgr._dispatch_to_dp_ranks([_prefix_seq("forced", list(range(8)), "child", 1)])
+    assert sent[-1] == ("forced", 1)
+    assert mgr._dp_session_owners["child"] == 1
+    assert mgr._dp_prefix_routed_total == 0
+
+
+def test_prefix_send_failure_discards_unpublished_hashes_and_debt(prefix_router):
+    mgr, _, now = prefix_router
+    seq = _prefix_seq("failed", list(range(8)), "s", 0)
+
+    def fail_send(rank, payload):
+        raise RuntimeError("transport failed")
+
+    mgr._send_request = fail_send
+    with pytest.raises(RuntimeError, match="transport failed"):
+        mgr._dispatch_to_dp_ranks([seq])
+    assert mgr._pending_dp_prefix_hints == {}
+    assert mgr._rank_tokens == [0, 0]
+    assert mgr._rank_reqs == [0, 0]
+    keys = mgr._dp_prefix_hints.fingerprints(seq.token_ids, 8)
+    assert mgr._dp_prefix_hints.match(keys, now[0]) == [0, 0]
+
+
+def test_prefix_cancel_before_output_does_not_publish_and_reset_clears_hints(
+    prefix_router,
+):
+    mgr, _, now = prefix_router
+    seq = _prefix_seq("cancelled", list(range(8)), "s", 0)
+    mgr._dispatch_to_dp_ranks([seq])
+    mgr._release_seq_load(seq.id)
+    mgr._mark_seq_prefill_complete(seq.id)  # late output is ignored
+    keys = mgr._dp_prefix_hints.fingerprints(seq.token_ids, 8)
+    assert mgr._pending_dp_prefix_hints == {}
+    assert mgr._dp_prefix_hints.match(keys, now[0]) == [0, 0]
+    _seed_prefix(mgr)
+    mgr.reset_dp_router()
+    assert mgr._dp_prefix_hints.match(keys, now[0]) == [0, 0]
+
+
+def test_prefix_zero_debt_first_output_refreshes_hint_without_decode_lock_wait(
+    prefix_router,
+):
+    mgr, _, now = prefix_router
+    root = _seed_prefix(mgr)
+    now[0] = 9
+    seq = _prefix_seq("cached", list(range(8)), "child")
+    mgr._dispatch_to_dp_ranks([seq])
+    assert mgr._seq_load[seq.id] == (0, 1, 0)
+    mgr._mark_seq_prefill_complete(seq.id)
+    keys = mgr._dp_prefix_hints.fingerprints(root.token_ids, 8)
+    assert mgr._dp_prefix_hints.match(keys, 10) == [8, 0]
+
+    completed = Event()
+
+    def decode_output():
+        mgr._mark_seq_prefill_complete(seq.id)
+        completed.set()
+
+    with mgr._lb_lock:
+        worker = Thread(target=decode_output)
+        worker.start()
+        progressed = completed.wait(timeout=2)
+    worker.join(timeout=2)
+    assert progressed
+
+
+def test_prefix_concurrent_dispatch_charges_before_next_placement(prefix_router):
+    mgr, sent, _ = prefix_router
+    mgr._dp_lb_req_equiv = 16
+    _seed_prefix(mgr)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                mgr._dispatch_to_dp_ranks,
+                [_prefix_seq(name, list(range(8)) + [99], name)],
+            )
+            for name in ("a", "b")
+        ]
+        for future in futures:
+            future.result(timeout=2)
+    assert sorted(rank for name, rank in sent if name in ("a", "b")) == [0, 1]
+    assert mgr._rank_reqs == [1, 1]
+
+
+@pytest.mark.parametrize("session_affinity", [False, True])
+def test_prefix_option_requires_affinity_and_initializes_global_rank_count(
+    monkeypatch, session_affinity
+):
+    from atom.utils import envs
+
+    monkeypatch.setattr(envs, "ATOM_DP_PREFIX_ROUTING", True)
+    monkeypatch.setattr(envs, "ATOM_DP_SESSION_AFFINITY", session_affinity)
+    mgr = CoreManager.__new__(CoreManager)
+    try:
+        if not session_affinity:
+            with pytest.raises(ValueError, match="requires session affinity"):
+                mgr._init_shared_state(
+                    SimpleNamespace(dp_load_balance="least_tokens"),
+                    label="prefix-test",
+                    local_engine_count=2,
+                    global_engine_count=8,
+                )
+        else:
+            mgr._init_shared_state(
+                SimpleNamespace(dp_load_balance="least_tokens"),
+                label="prefix-test",
+                local_engine_count=2,
+                global_engine_count=8,
+            )
+            assert mgr._dp_prefix_hints.num_ranks == 8
+            assert len(mgr._rank_reqs) == 8
+            assert mgr._pending_dp_prefix_hints == {}
+    finally:
+        mgr.ctx.term()

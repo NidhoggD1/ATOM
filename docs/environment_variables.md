@@ -13,6 +13,8 @@ This document describes the environment variables used in the ATOM project.
 | **ATOM_DP_MASTER_PORT** | int | 29500 | Master port for DP ranks coordination. |
 | **ATOM_DP_LB_REQ_EQUIV** | int | 512 | Token-equivalent decode pressure assigned to each in-flight request by `least_tokens` routing. |
 | **ATOM_DP_SESSION_AFFINITY** | bool | false | Load-place each new session, then keep later turns on the same prefix-cache owner. Reads `X-Dynamo-Session-ID`, falling back to `X-Correlation-ID`. |
+| **ATOM_DP_PREFIX_ROUTING** | bool | false | Experimental prefix-aware placement of new sticky sessions. Requires session affinity. Observes completed prefills, estimates reusable prefixes, and retains immutable owners. |
+| **ATOM_DP_PREFIX_MAX_REQUEST_SKEW** | int | 8 | With prefix hits, exclude candidate ranks whose pre-admission in-flight request count exceeds the minimum by more than this amount. Existing sessions and explicit ranks bypass this gate. |
 
 ## Prefill delayer (DP attention)
 

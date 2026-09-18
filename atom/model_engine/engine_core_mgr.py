@@ -9,6 +9,7 @@ import multiprocessing.shared_memory
 import os
 import pickle
 import queue
+import time
 import weakref
 from dataclasses import dataclass
 from threading import Lock, Thread
@@ -18,6 +19,7 @@ import zmq.asyncio
 
 from atom.config import Config
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
+from atom.model_engine.prefix_route_hints import PrefixRouteHints
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.utils import (
@@ -219,6 +221,28 @@ class CoreManager:
         # is built after env/args are finalized), not a runtime-tunable knob.
         self._dp_lb_req_equiv = envs.ATOM_DP_LB_REQ_EQUIV
         self._dp_session_affinity_enabled = envs.ATOM_DP_SESSION_AFFINITY
+        self._dp_prefix_hints = None
+        if envs.ATOM_DP_PREFIX_ROUTING:
+            if not self._dp_session_affinity_enabled:
+                raise ValueError("ATOM_DP_PREFIX_ROUTING requires session affinity")
+            self._dp_prefix_hints = PrefixRouteHints(
+                self.global_engine_count,
+                max_request_skew=envs.ATOM_DP_PREFIX_MAX_REQUEST_SKEW,
+            )
+            logger.info(
+                "%s: DP prefix routing enabled: block_tokens=%d capacity=%d "
+                "ttl_s=%s max_request_skew=%d",
+                self.label,
+                self._dp_prefix_hints.block_tokens,
+                self._dp_prefix_hints.max_entries,
+                self._dp_prefix_hints.ttl_seconds,
+                self._dp_prefix_hints.max_request_skew,
+            )
+        # Hashes remain pending until a first model output proves that prefill
+        # ran. Abort/rejection/send rollback must discard unpublished hints.
+        self._pending_dp_prefix_hints = {}
+        self._dp_prefix_routed_total = 0
+        self._dp_prefix_estimated_tokens = 0
         # Session id -> rank whose local prefix cache owns the session. Owners
         # are immutable for the lifetime of the process: moving one turn to a
         # light rank discards the dominant optimization in agentic workloads,
@@ -912,6 +936,16 @@ class CoreManager:
         # getattr/int pass per seq.
         hints = self._resolve_and_validate_hints(seqs)
 
+        prefix_hints = self._dp_prefix_hints
+        prefix_keys = None
+        if prefix_hints is not None:
+            # Hash the existing int32 buffers outside the lock, without
+            # retaining prompts or scanning boxed Python token integers.
+            prefix_keys = [
+                prefix_hints.fingerprints(seq.token_ids, seq.num_prompt_tokens)
+                for seq in seqs
+            ]
+
         # round_robin normally skips load bookkeeping. Session affinity still
         # needs queued-prefill counters even if the fallback strategy is RR.
         track_load = (
@@ -921,10 +955,39 @@ class CoreManager:
         dp_seqs = [[] for _ in range(engine_count)]
         reqs_snapshot = tokens_snapshot = None
         with self._lb_lock:
-            for seq, hint in zip(seqs, hints):
-                dp_rank = self._select_dp_rank_for_seq_locked(seq, hint)
+            for index, (seq, hint) in enumerate(zip(seqs, hints)):
+                cached_tokens = None
+                if prefix_keys is not None and hint is None:
+                    session_id = getattr(seq, "dp_session_id", None)
+                    owner = self._dp_session_owners.get(session_id)
+                    if session_id and (owner is None or not 0 <= owner < engine_count):
+                        cached_tokens = prefix_hints.match(
+                            prefix_keys[index], time.monotonic()
+                        )
+                dp_rank = self._select_dp_rank_for_seq_locked(seq, hint, cached_tokens)
+                prefix_credit = cached_tokens[dp_rank] if cached_tokens else 0
                 if track_load:
-                    self._charge_seq_load_locked(seq, dp_rank)
+                    self._charge_seq_load_locked(seq, dp_rank, prefix_credit)
+                if prefix_keys is not None and prefix_keys[index]:
+                    self._pending_dp_prefix_hints[seq.id] = (
+                        dp_rank,
+                        prefix_keys[index],
+                    )
+                if prefix_credit:
+                    self._dp_prefix_routed_total += 1
+                    self._dp_prefix_estimated_tokens += prefix_credit
+                    if self._dp_prefix_routed_total <= 4 or (
+                        self._dp_prefix_routed_total % 128 == 0
+                    ):
+                        logger.info(
+                            "%s: prefix route rank=%d estimated_cached_tokens=%d "
+                            "routes=%d estimated_cached_tokens_total=%d",
+                            self.label,
+                            dp_rank,
+                            prefix_credit,
+                            self._dp_prefix_routed_total,
+                            self._dp_prefix_estimated_tokens,
+                        )
                 dp_seqs[dp_rank].append(seq)
             # Copy the counters under the lock so the snapshot log below is a
             # consistent instant, not a torn read racing _release_seq_load.
@@ -1045,23 +1108,35 @@ class CoreManager:
                 best_score = score
         return best_rank
 
-    def _select_new_session_rank_locked(self, session_id: str) -> int:
+    def _select_new_session_rank_locked(
+        self, session_id: str, cached_tokens: list[int] | None = None
+    ) -> int:
         """Place a new sticky session on the lightest DP rank.
 
-        Existing sessions never call this function: locality wins once an
-        owner has cache state.  Before that first placement there is no cache
-        to preserve, so use estimated outstanding prefill debt plus the
-        configured token-equivalent decode pressure.  Rendezvous hashing is
-        only the deterministic tie-breaker; it must not override real load.
+        Existing sessions never call this function. Optional recent-prefix
+        hints discount the incoming prompt's estimated work on each rank.
+        The incoming prompt length is common to all scores and is omitted:
+        load + prompt_length - cached_length has the same ordering as
+        load - cached_length. Rendezvous hashing only breaks exact ties.
         """
         session_key = str(session_id).encode("utf-8")
         best_rank = 0
         best_load = None
         best_hash = -1
+        max_reqs = None
+        if cached_tokens is not None and any(cached_tokens):
+            max_reqs = (
+                min(self._rank_reqs[: self._routable_engine_count])
+                + self._dp_prefix_hints.max_request_skew
+            )
         for rank in range(self._routable_engine_count):
+            if max_reqs is not None and self._rank_reqs[rank] > max_reqs:
+                continue
             load = (
                 self._rank_tokens[rank] + self._dp_lb_req_equiv * self._rank_reqs[rank]
             )
+            if cached_tokens is not None:
+                load -= cached_tokens[rank]
             tie_hash = int.from_bytes(
                 hashlib.blake2b(
                     session_key + rank.to_bytes(4, "little"), digest_size=8
@@ -1085,7 +1160,10 @@ class CoreManager:
         return rank
 
     def _select_dp_rank_for_seq_locked(
-        self, seq: Sequence, explicit_rank: int | None
+        self,
+        seq: Sequence,
+        explicit_rank: int | None,
+        cached_tokens: list[int] | None = None,
     ) -> int:
         """Route one sequence using explicit hint, strict owner, then load.
 
@@ -1094,9 +1172,10 @@ class CoreManager:
         every later turn stays there. Load cannot move an existing session;
         doing so turns a cheap cache hit into a potentially huge prefill.
 
-        Parent lineage does not affect placement. Each child correlation id is
-        its own sticky session, preventing sibling subagents from dogpiling the
-        root's rank. Requests without a session retain normal load balancing.
+        Parent lineage alone does not affect placement. Optional prefix hints
+        require actual token-prefix equality and compete with queued work in
+        the load score. Every child still becomes its own immutable session.
+        Requests without a session retain normal load balancing.
         """
         if explicit_rank is not None:
             if self._dp_session_affinity_enabled:
@@ -1119,7 +1198,7 @@ class CoreManager:
 
         owner = self._dp_session_owners.get(session_id)
         if owner is None or not 0 <= owner < self._routable_engine_count:
-            owner = self._select_new_session_rank_locked(session_id)
+            owner = self._select_new_session_rank_locked(session_id, cached_tokens)
             self._dp_session_owners[session_id] = owner
             if parent_id:
                 self._dp_route_counters["affinity_parent_ignored_total"] += 1
@@ -1155,11 +1234,13 @@ class CoreManager:
                 "session_count_per_rank": sessions_per_rank,
             }
 
-    def _charge_seq_load_locked(self, seq: Sequence, dp_rank: int) -> None:
+    def _charge_seq_load_locked(
+        self, seq: Sequence, dp_rank: int, cached_prefix_tokens: int = 0
+    ) -> None:
         """Record a seq's in-flight load on dp_rank. Caller must hold _lb_lock."""
         req_cost = 1
         prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
-        tok_cost = prompt_tokens
+        tok_cost = max(0, prompt_tokens - cached_prefix_tokens)
         session_id = getattr(seq, "dp_session_id", None)
         if self._dp_session_affinity_enabled and session_id:
             previous_prompt_tokens = self._dp_session_prompt_tokens.get(session_id)
@@ -1221,6 +1302,8 @@ class CoreManager:
         call (e.g. finish followed by abort) is a no-op.
         """
         with self._lb_lock:
+            if self._dp_prefix_hints is not None:
+                self._pending_dp_prefix_hints.pop(seq_id, None)
             entry = self._seq_load.pop(seq_id, None)
             if entry is None:
                 return
@@ -1238,13 +1321,20 @@ class CoreManager:
         if entry is None:
             return
         _, _, tok_cost = entry
-        if tok_cost == 0:
+        if tok_cost == 0 and (
+            self._dp_prefix_hints is None or seq_id not in self._pending_dp_prefix_hints
+        ):
             return
         with self._lb_lock:
             entry = self._seq_load.get(seq_id)
             if entry is None:
                 return
             dp_rank, req_cost, tok_cost = entry
+            if self._dp_prefix_hints is not None:
+                pending = self._pending_dp_prefix_hints.pop(seq_id, None)
+                if pending is not None:
+                    rank, keys = pending
+                    self._dp_prefix_hints.observe(keys, rank, time.monotonic())
             if tok_cost == 0:
                 return
             self._rank_tokens[dp_rank] -= tok_cost
@@ -1278,6 +1368,9 @@ class CoreManager:
             self._seq_load.clear()
             self._dp_session_owners.clear()
             self._dp_session_prompt_tokens.clear()
+            self._pending_dp_prefix_hints.clear()
+            if self._dp_prefix_hints is not None:
+                self._dp_prefix_hints.clear()
 
     def send_utility_command(self, cmd: str, dp_rank: int | None = None):
         if dp_rank is None:

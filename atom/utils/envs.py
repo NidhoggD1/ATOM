@@ -52,6 +52,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_DP_SESSION_AFFINITY", "0"
     ).lower()
     in {"1", "true", "yes", "on"},
+    # Optional recent-prefix hints for placing NEW sticky sessions. Engines
+    # still check actual cache residency; existing session owners never move.
+    "ATOM_DP_PREFIX_ROUTING": lambda: os.getenv("ATOM_DP_PREFIX_ROUTING", "0").lower()
+    in {"1", "true", "yes", "on"},
+    "ATOM_DP_PREFIX_MAX_REQUEST_SKEW": lambda: int(
+        os.getenv("ATOM_DP_PREFIX_MAX_REQUEST_SKEW", "8")
+    ),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # SGLang's GLM-5.2 and DeepSeek V4 prefill CP paths still force
