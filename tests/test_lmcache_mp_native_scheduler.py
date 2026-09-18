@@ -266,7 +266,9 @@ def test_load_queries_safe_chunk_boundary_before_reserving_state(monkeypatch, pr
     if expected == 0:
         assert adapter.queries == []
         return
-    assert adapter.queries == [(str(seq.id), list(seq.token_ids[:expected]))]
+    assert adapter.queries == [
+        (f"atom-offload-dp0:{seq.id}", list(seq.token_ids[:expected]))
+    ]
     scheduler.update_state_after_alloc(seq)
     assert scheduler.should_park_for_load_after_alloc(seq)
     operation = seq._load_operation
@@ -401,7 +403,7 @@ def test_load_failure_and_cancellation_wait_for_exact_terminal_report(monkeypatc
     assert scheduler.load_failed(request.load_operation)
     assert checkpoints.store.pool.num_free == 30
     assert scheduler._pinned_state_bytes == 0
-    assert adapter.ended == [str(seq.id)]
+    assert adapter.ended == [f"atom-offload-dp0:{seq.id}"]
     assert not scheduler.should_defer_free(seq)
 
 

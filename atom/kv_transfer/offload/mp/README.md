@@ -115,8 +115,18 @@ heartbeat failure do not free DMA sources or destinations.
 
 ## Current scope and constraints
 
-- Native ATOM, one MP server, TP only. DP/PP/PCP/DCP and engine-driven transfers
-  are rejected.
+- Native ATOM with one MP server supports TP, single-host DP, and single-host
+  DP-attention with EP. Each DP replica keeps a private request-session scope
+  while sharing the same content-addressed model namespace, so equal prefixes
+  remain reusable across replicas. Under DP-attention, ATOM folds TP into DP;
+  each EngineCore therefore uses a one-worker LMCache group and early-free
+  quorum of one.
+- Multi-node DP, PP, PCP, DCP, and engine-driven transfers are rejected.
+  Multi-node DP needs one GPU-local LMCache server per host plus server routing;
+  one server cannot import GPU IPC allocations from another host.
+- PAGE tensors are registered as zero-copy `uint8` views. They are opaque cache
+  storage, so byte views preserve FP8/BF16 bit patterns and keep ROCm's
+  raw-pointer fallback from applying numerical dtype conversions.
 - DSv4 declares both PAGE and native STATE byte-identical across TP ranks.
   `lmcache.mp.tp_rank_collapse=auto` therefore collapses TP automatically;
   explicit `true` is also accepted after the worker validates both declarations.

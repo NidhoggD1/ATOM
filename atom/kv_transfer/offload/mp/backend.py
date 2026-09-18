@@ -44,7 +44,7 @@ from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReq
 
 logger = logging.getLogger("atom")
 
-_MP_LAYOUT_VERSION = 2
+_MP_LAYOUT_VERSION = 3
 _OPERATION_TOMBSTONE_LIMIT = 4096
 
 
@@ -68,6 +68,12 @@ def _storage_kv_transfer_config(config: Any) -> dict[str, Any]:
             if not (isinstance(key, str) and key.startswith("lmcache.mp."))
         }
     return kvc
+
+
+def _mp_session_id(config: Any, request_id: Any) -> str:
+    """Scope one LMCache MP request session to its global DP replica."""
+
+    return f"{offcfg.lmcache_engine_id(config)}:{request_id}"
 
 
 def _transfer_mode(config: Any) -> str:
@@ -123,14 +129,24 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
         or 1,
         minimum=1,
     )
+    dp_size_local = offcfg._strict_integer(
+        "data_parallel_size_local",
+        getattr(parallel_config, "data_parallel_size_local", dp_size) or dp_size,
+        minimum=1,
+    )
     if pp_size != 1:
         raise NotImplementedError("lmcache_mp does not support PP yet")
     if dcp_size != 1:
         raise NotImplementedError("lmcache_mp does not support DCP yet")
     if pcp_size != 1:
         raise NotImplementedError("lmcache_mp does not support PCP yet")
-    if dp_size != 1 or bool(getattr(config, "enable_dp_attention", False)):
-        raise NotImplementedError("lmcache_mp currently supports TP-only deployments")
+    if dp_size_local != dp_size:
+        raise NotImplementedError(
+            "lmcache_mp supports DP and DP-attention only within one host; "
+            "multi-node DP requires one LMCache server per host and local "
+            "server routing "
+            f"(data_parallel_size={dp_size}, local={dp_size_local})"
+        )
 
     _transfer_mode(config)
     return tp_size, pp_size
@@ -420,9 +436,16 @@ def _build_cache_views(
         if bool(getattr(region, "reverse_indexed", False)):
             raise ValueError("lmcache_mp PAGE regions cannot be reverse-indexed")
 
+        # LMCache receives these tensors as opaque PAGE storage, not numerical
+        # values.  Publish a zero-copy byte view so every transfer path copies
+        # the exact bit pattern.  This is especially important on ROCm, where
+        # LMCache's Python raw-pointer fallback cannot express FP8 through the
+        # CUDA array interface and would otherwise reconstruct the destination
+        # as uint8 while keeping the staging object as FP8.
+        byte_view = view.view(torch.uint8)
         role = str(getattr(region, "semantic_role", None) or f"plane_{index}")
-        tensors[f"page.{index}.{role}"] = view
-        layout = (view.dtype, tuple(int(dim) for dim in view.shape[1:]))
+        tensors[f"page.{index}.{role}"] = byte_view
+        layout = (byte_view.dtype, tuple(int(dim) for dim in byte_view.shape[1:]))
         indices_by_layout.setdefault(layout, []).append(index)
         devices.add(view.device)
         bytes_per_block += unit_bytes
@@ -505,10 +528,18 @@ class _MPLookupClient:
 
     token_database = None
 
-    def __init__(self, adapter: Any, *, timeout: float, poll_interval: float) -> None:
+    def __init__(
+        self,
+        adapter: Any,
+        *,
+        config: Any,
+        timeout: float,
+        poll_interval: float,
+    ) -> None:
         if timeout <= 0 or poll_interval <= 0:
             raise ValueError("LMCache MP lookup timeout and poll interval must be > 0")
         self._adapter = adapter
+        self._config = config
         self._timeout = timeout
         self._poll_interval = poll_interval
         self._lookups: dict[str, _LookupState] = {}
@@ -516,10 +547,11 @@ class _MPLookupClient:
     def lookup(self, token_ids: list[int], lookup_id: str) -> int:
         state = _LookupState(token_ids=list(token_ids))
         self._lookups[lookup_id] = state
-        self._adapter.maybe_submit_lookup_request(lookup_id, token_ids)
+        request_id = _mp_session_id(self._config, lookup_id)
+        self._adapter.maybe_submit_lookup_request(request_id, token_ids)
         deadline = time.monotonic() + self._timeout
         while True:
-            result = self._adapter.check_lookup_result(lookup_id)
+            result = self._adapter.check_lookup_result(request_id)
             if result is not None:
                 hit = int(result)
                 state.hit = hit
@@ -554,6 +586,7 @@ class _MPLookupClient:
                 f"invalid retrieve range for {lookup_id}: start={start}, end={end}"
             )
         state = self._lookups.get(lookup_id)
+        request_id = _mp_session_id(self._config, lookup_id)
         if (
             state is not None
             and state.hit is not None
@@ -568,7 +601,7 @@ class _MPLookupClient:
                 token_ids=state.token_ids,
                 start=0,
                 end=min(start, state.hit),
-                request_id=lookup_id,
+                request_id=request_id,
             )
         if (
             state is not None
@@ -580,12 +613,12 @@ class _MPLookupClient:
                 token_ids=state.token_ids,
                 start=end,
                 end=state.hit,
-                request_id=lookup_id,
+                request_id=request_id,
             )
         if state is not None:
             state.retrieve_start = start
             state.retrieve_end = end
-        self._adapter.cleanup_lookup_result(lookup_id)
+        self._adapter.cleanup_lookup_result(request_id)
 
     def complete_retrieve(self, lookup_id: str, *, succeeded: bool) -> None:
         # Once a retrieve is submitted, LMCache owns the remaining lookup
@@ -595,7 +628,7 @@ class _MPLookupClient:
         # scheduler cannot distinguish a pre-submit failure; that rarer case is
         # left to request end_session/server TTL cleanup instead.
         self._lookups.pop(lookup_id, None)
-        self._adapter.cleanup_lookup_result(lookup_id)
+        self._adapter.cleanup_lookup_result(_mp_session_id(self._config, lookup_id))
 
     def hit_tokens(self, lookup_id: str) -> int | None:
         state = self._lookups.get(lookup_id)
@@ -603,8 +636,9 @@ class _MPLookupClient:
 
     def clear_lookup_status(self, lookup_id: str) -> None:
         state = self._lookups.pop(lookup_id, None)
+        request_id = _mp_session_id(self._config, lookup_id)
         if state is not None and state.hit is None:
-            result = self._adapter.check_lookup_result(lookup_id)
+            result = self._adapter.check_lookup_result(request_id)
             if result is None:
                 logger.warning(
                     "LMCache MP lookup for request %s is still pending during "
@@ -612,7 +646,7 @@ class _MPLookupClient:
                     "cleanup releases any eventual locks",
                     lookup_id,
                 )
-                self._adapter.cleanup_lookup_result(lookup_id)
+                self._adapter.cleanup_lookup_result(request_id)
                 return
             state.hit = int(result)
         # Once retrieve has started, the transfer owns the remaining read
@@ -627,9 +661,9 @@ class _MPLookupClient:
                 token_ids=state.token_ids,
                 start=0,
                 end=state.hit,
-                request_id=lookup_id,
+                request_id=request_id,
             )
-        self._adapter.cleanup_lookup_result(lookup_id)
+        self._adapter.cleanup_lookup_result(request_id)
 
 
 class LMCacheMPConnector(KVConnectorBase):
@@ -807,7 +841,7 @@ class LMCacheMPConnector(KVConnectorBase):
 
         assert req.load_spec is not None
         completion = req.load_operation or req.req_id
-        request_id = str(req.req_id)
+        request_id = _mp_session_id(self._config, req.req_id)
         operation_id = _transfer_operation_id("load", completion)
         with self._lock:
             if (
@@ -869,7 +903,7 @@ class LMCacheMPConnector(KVConnectorBase):
 
         assert req.save_spec is not None
         completion = req.save_operation or req.req_id
-        request_id = str(req.req_id)
+        request_id = _mp_session_id(self._config, req.req_id)
         operation_id = _transfer_operation_id("save", completion)
         with self._lock:
             if (
@@ -1103,6 +1137,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             poll_interval = float(extra.get("lmcache.mp.lookup_poll_interval", 0.01))
             lookup_client = _MPLookupClient(
                 adapter,
+                config=config,
                 timeout=timeout,
                 poll_interval=poll_interval,
             )
@@ -1198,7 +1233,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     def request_finished(self, seq: Any) -> None:
         super().request_finished(seq)
         try:
-            self._mp_adapter.end_session(str(seq.id))
+            self._mp_adapter.end_session(_mp_session_id(self._config, seq.id))
         except Exception:
             logger.warning(
                 "LMCache MP end_session failed for request %s",

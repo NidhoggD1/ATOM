@@ -26,6 +26,7 @@ from atom.kv_transfer.offload.metadata import LMCacheReqMeta, NativeStateTransfe
 from atom.kv_transfer.offload.mp.backend import (
     LMCacheMPConnector,
     _make_worker_adapter,
+    _mp_session_id,
     _published_tp_replication_factor,
     _remember_operation_tombstone,
     _storage_kv_transfer_config,
@@ -255,7 +256,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             )
         )
         try:
-            future = submit(str(req.req_id), spec, event)
+            future = submit(_mp_session_id(self._config, req.req_id), spec, event)
         except Exception:
             # Retain the exact source/destination lease. The server might have
             # received the request before the connection raised an exception.

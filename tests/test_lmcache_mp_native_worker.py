@@ -88,9 +88,11 @@ def worker():
     )
     instance.chunk_size = 8
     instance.submitted = []
+    instance.submitted_request_ids = []
     instance.future = Future()
 
     def submit(request_id, op, event):
+        instance.submitted_request_ids.append(request_id)
         instance.submitted.append(op)
         return instance.future
 
@@ -116,7 +118,13 @@ def request(*, loading=False, units=(0, 25, 31), generation=1, hbm=0):
 def test_store_transmits_page_zero_as_real_native_unit(worker):
     req = request()
     worker._submit_save(req, object())
-    assert worker.submitted[0].block_ids == [[1, 2, 3, 4], [-1, 0], [-1, 25], [-1, 31]]
+    assert worker.submitted_request_ids == ["atom-offload-dp0:7"]
+    assert worker.submitted[0].block_ids == [
+        [1, 2, 3, 4],
+        [-1, 0],
+        [-1, 25],
+        [-1, 31],
+    ]
     assert not worker.get_finished().connector_completions
     worker.future.ready = True
     finished = worker.get_finished()
