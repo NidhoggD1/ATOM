@@ -213,6 +213,10 @@ EOF
     # FlyDSL otherwise tries to create caches under /app/aiter-test, which is
     # read-only for the Slurm uid required by Spur's Docker template.
     -e FLYDSL_RUNTIME_CACHE_DIR="/tmp/atomesh-cache-${JOB_ID}-${rank}/flydsl"
+    # aiter hardcodes the merged tuned-config directory as /tmp/aiter_configs
+    # with no env override. Images that import aiter at build time bake it in
+    # root-owned, so the Slurm uid cannot take the file lock inside it.
+    --tmpfs /tmp/aiter_configs:rw,mode=1777
     -e NCCL_NET_PLUGIN=none
     -e NCCL_IB_HCA=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
     -e NCCL_IB_GID_INDEX=1
