@@ -462,7 +462,7 @@ models:
 
   Kimi-K3-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/Kimi-K3"
+    model_path: "${ATOMESH_MODEL_ROOT}/moonshotai/Kimi-K3"
     precision: MXFP4
     env:
       common:
@@ -515,7 +515,7 @@ models:
                 max_num_seqs: 32
                 max_num_batched_tokens: 8192
                 method: dspark
-                draft_model: "${ATOMESH_MODEL_ROOT}/Kimi-K3-DSpark"
+                draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark"
                 num_speculative_tokens: 7
                 spec_decode_acceptance_length: 3.84
             prefill:
@@ -557,7 +557,7 @@ models:
               max_num_seqs: 32
               max_num_batched_tokens: 8192
               method: dspark
-              draft_model: "${ATOMESH_MODEL_ROOT}/Kimi-K3-DSpark"
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark"
               num_speculative_tokens: 3
               spec_decode_acceptance_length: 3.00
           prefill:
@@ -668,9 +668,6 @@ models:
           name: kimi-k3-mxfp4-agg-tp8-dcp8-agentic-lmcache-1m-c64
           topology: agg
           display_topology: AGG-TP8-DCP8
-          # Placement only; `topology: agg` above is what says there is no
-          # prefill/decode split to place. The other single_node cells halve the
-          # node between two services, so this one keeps all 8 GPUs at TP8.
           pd_worker_layout: single_node
           concurrency: [64]
           # Unused here; the aggregated server is configured by the decode block.
