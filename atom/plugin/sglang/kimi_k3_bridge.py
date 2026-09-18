@@ -12,6 +12,8 @@ import torch
 # plus the rotary lane: kv_lora_rank (512) + qk_rope_head_dim (64).
 KIMI_K3_MLA_CACHE_ENTRY_DIM = 576
 logger = logging.getLogger(__name__)
+# KVCacheConfigurator is a slots dataclass; instance flags AttributeError.
+_KIMI_K3_MEM_FRACTION_RESTORED: set[int] = set()
 
 
 def is_kimi_k3_config(config: Any) -> bool:
@@ -31,8 +33,10 @@ def _restore_kimi_k3_mem_fraction(owner: Any) -> None:
     through ``RuntimeContext.override`` instead of mutating ``server_args``.
     """
 
-    if getattr(owner, "_atom_kimi_k3_mem_fraction_restored", False):
+    owner_id = id(owner)
+    if owner_id in _KIMI_K3_MEM_FRACTION_RESTORED:
         return
+    _KIMI_K3_MEM_FRACTION_RESTORED.add(owner_id)
 
     model_config = getattr(owner, "model_config", None)
     context_len = int(getattr(model_config, "context_len", 0) or 0)
@@ -45,35 +49,22 @@ def _restore_kimi_k3_mem_fraction(owner: Any) -> None:
         )
         current = float(schedule.mem_fraction_static)
     except Exception:  # noqa: BLE001 - fall back when context is unpublished
-        server_args = getattr(owner, "server_args", None)
-        if server_args is None:
-            owner._atom_kimi_k3_mem_fraction_restored = True
-            return
-        attention_backend = str(getattr(server_args, "attention_backend", ""))
-        current = float(
-            getattr(owner, "mem_fraction_static", server_args.mem_fraction_static)
-        )
-        schedule = None
+        return
 
     if attention_backend == "aiter" and context_len > 8192:
         restored = current / 0.85
         if restored <= 1.0:
-            if schedule is not None:
-                from sglang.srt.runtime_context import get_context
+            from sglang.srt.runtime_context import get_context
 
-                get_context().override(
-                    "atom-kimi-k3-mem-fraction", mem_fraction_static=restored
-                )
-            else:
-                owner.mem_fraction_static = restored
-                owner.server_args.mem_fraction_static = restored
+            get_context().override(
+                "atom-kimi-k3-mem-fraction", mem_fraction_static=restored
+            )
             logger.info(
                 "Kimi-K3 restored mem_fraction_static %.4f -> %.4f after "
                 "SGLang AITER long-context reserve",
                 current,
                 restored,
             )
-    owner._atom_kimi_k3_mem_fraction_restored = True
 
 
 def install_kimi_k3_pool_patch() -> None:

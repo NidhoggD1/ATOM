@@ -249,16 +249,37 @@ class ATOMMiniMaxM3SGLangKVPool:
         return self.k_scale_buffer[mapped], self.v_scale_buffer[mapped]
 
 
-def install_minimax_m3_pool_patch() -> None:
-    """No-op on SGLang 0.5.17+ where MiniMaxSparseKVPool is built in.
+def _minimax_sparse_kv_scale_buffer(self, layer_id: int):
+    """FP8/MXFP4 scale view that MiniMaxSparseKVPool does not expose.
 
-    Older builds without the upstream pool used ``ModelRunnerKVCacheMixin``;
-    that module was removed when pool construction moved to
-    ``KVCacheConfigurator``. Keep this entry point for call-site compatibility.
+    Index-K already lives on the upstream pool (``get_index_k_buffer``).
+    Scale tensors live on ``main_pool`` when SGLang quantized the KV cache;
+    otherwise return ``(None, None)`` so BF16/PTPC does not invent buffers.
+    """
+
+    main = self.main_pool
+    getter = getattr(main, "get_kv_scale_buffer", None)
+    if getter is not None:
+        return getter(layer_id)
+    k_buf = getattr(main, "k_scale_buffer", None)
+    v_buf = getattr(main, "v_scale_buffer", None)
+    if not k_buf or not v_buf:
+        return None, None
+    idx = int(layer_id) - int(getattr(main, "start_layer", 0) or 0)
+    return k_buf[idx], v_buf[idx]
+
+
+def install_minimax_m3_pool_patch() -> None:
+    """Attach the scale ABI; do not wrap the pool when upstream already has it.
+
+    ``maybe_get_minimax_m3_pools_from_sglang_batch`` reads whatever pool
+    SGLang published. It does not require ``ATOMMiniMaxM3SGLangKVPool``.
+    Index-K comes from ``MiniMaxSparseKVPool.get_index_k_buffer``. The old
+    wrapper's extra job was ``get_kv_scale_buffer`` for MXFP4/FP8 accuracy.
     """
 
     try:
-        from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool  # noqa: F401
+        from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
     except ImportError:
         import logging
 
@@ -267,6 +288,9 @@ def install_minimax_m3_pool_patch() -> None:
             "ATOM MiniMax-M3 SGLang pool shim is not installed"
         )
         return
+
+    if not hasattr(MiniMaxSparseKVPool, "get_kv_scale_buffer"):
+        MiniMaxSparseKVPool.get_kv_scale_buffer = _minimax_sparse_kv_scale_buffer
 
 
 def maybe_get_minimax_m3_pools_from_sglang_batch(forward_batch=None):
@@ -648,6 +672,7 @@ def _get_index_cache_view(
 
 
 def bind_minimax_m3_sparse_cache_views(model, token_to_kv_pool) -> bool:
+    install_minimax_m3_pool_patch()
     if token_to_kv_pool is None or not hasattr(token_to_kv_pool, "get_kv_buffer"):
         return False
 
