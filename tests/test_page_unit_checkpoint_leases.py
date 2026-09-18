@@ -169,6 +169,64 @@ def test_external_load_reserves_raw_image_units_without_publishing_checkpoint():
     assert c.store.pool.num_free == 3
 
 
+def test_completed_external_load_is_adopted_as_ready_without_free_list_window():
+    c = coordinator(num_units=3)
+    owner = ("request-a", 1)
+    units = c.reserve_transfer_units(owner)
+    assert units is not None
+    assert c.store.pool.num_free == 0
+
+    assert c.adopt_transfer_units(owner, 101)
+    assert c.contains(101)
+    checkpoint_id = c.store.lookup(101)
+    record = c.store.records[checkpoint_id]
+    assert record.unit_ids == units
+    assert record.pin_count == 0
+    assert c.store.pool.num_free == 0
+    assert not c.store._offload_ready
+
+    c.unindex(101)
+    assert c.store.pool.num_free == 3
+
+
+def test_duplicate_external_load_adoption_releases_incoming_units():
+    c = coordinator(num_units=6)
+    canonical = ready(c, 101)
+    owner = ("request-a", 1)
+    incoming = c.reserve_transfer_units(owner)
+    assert incoming is not None and incoming != canonical
+    assert c.store.pool.num_free == 0
+
+    assert not c.adopt_transfer_units(owner, 101)
+    assert c.store.records[c.store.lookup(101)].unit_ids == canonical
+    assert c.store.pool.num_free == 3
+
+
+def test_suspended_restore_can_resume_or_release_its_source_pin():
+    c = coordinator(num_units=3)
+    ready(c, 101)
+    checkpoint_id = c.store.lookup(101)
+
+    assert c.begin_restore(101, dst_slot=9)
+    suspended = c.suspend_queued_restore(9)
+    assert suspended is not None
+    assert c.take_checkpoint_ops()[1] == ()
+    assert c.store.records[checkpoint_id].pin_count == 1
+
+    c.resume_suspended_restore(suspended)
+    [restore] = c.take_checkpoint_ops()[1]
+    assert restore.dst_slot == 9
+    c.complete_previous_batch()
+    assert c.store.records[checkpoint_id].pin_count == 0
+
+    assert c.begin_restore(101, dst_slot=10)
+    suspended = c.suspend_queued_restore(10)
+    assert suspended is not None
+    c.release_suspended_restore(suspended)
+    assert c.store.records[checkpoint_id].pin_count == 0
+    assert c.take_checkpoint_ops()[1] == ()
+
+
 def test_external_load_evicts_only_available_checkpoint_sources():
     c = coordinator(num_units=6)
     ready(c, 101)

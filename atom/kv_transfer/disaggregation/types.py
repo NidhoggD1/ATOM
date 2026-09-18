@@ -260,6 +260,10 @@ class KVTransferTensors:
     # neither field asks the connector to snapshot a complete live SLOT.
     paged_state_checkpoint_spec: object | None = None
     execute_paged_state_copies: Callable[..., None] | None = None
+    # Same declaration for PAGE-backed native state checkpoint images. Kept
+    # separate so future layouts can describe PAGE and recurrent-state
+    # replication independently. Appended for positional compatibility.
+    native_state_tp_replication_factor: int = 1
     # Scheduler blocks the PAGE regions are addressed in. `init=False` because
     # a backend cannot answer it: `req.block_ids` is the scheduler's id space,
     # and a backend counts in its own page -- a different unit even where it is

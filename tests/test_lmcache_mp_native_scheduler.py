@@ -287,24 +287,90 @@ def test_load_queries_safe_chunk_boundary_before_reserving_state(monkeypatch, pr
     assert scheduler._pinned_state_bytes == 30
     assert scheduler.load_finished(operation) is True
     assert scheduler._pinned_state_bytes == 0
-    assert checkpoints.store.pool.num_free == 30
+    # The completed transfer is now a reusable, unpinned READY checkpoint.
+    assert checkpoints.store.pool.num_free == 27
+    assert checkpoints.contains(request.native_state.prefix_hash)
+    checkpoint_id = checkpoints.store.lookup(request.native_state.prefix_hash)
+    assert checkpoints.store.records[checkpoint_id].pin_count == 0
     assert scheduler.load_finished(operation) is False
 
 
-@pytest.mark.parametrize("hbm_tokens", [4, 8])
-def test_hbm_hit_after_allocation_falls_back_without_native_reservation(
-    monkeypatch, hbm_tokens
-):
+def test_aligned_hbm_hit_uses_incremental_native_restore(monkeypatch):
     scheduler, checkpoints, _ = make_scheduler(monkeypatch)
     seq = sequence(computed=0)
     assert scheduler.get_num_new_matched_tokens(seq) == (16, True)
-    seq.num_cached_tokens = hbm_tokens
+    seq.num_cached_tokens = 8
+    scheduler.update_state_after_alloc(seq)
+    assert scheduler.should_park_for_load_after_alloc(seq) is True
+    [request] = scheduler.build_connector_meta().requests
+    assert request.load_spec.hbm_cached_tokens == 8
+    assert request.load_spec.lmcache_cached_tokens == 16
+    assert request.token_ids == list(seq.token_ids[:16])
+    assert seq.offload_load_start_tokens == 8
+    assert scheduler._pinned_state_bytes == 30
+    assert checkpoints.store.pool.num_free == 27
+
+
+def test_unaligned_hbm_hit_prefills_to_chunk_then_uses_native_restore(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence(computed=0)
+    assert scheduler.get_num_new_matched_tokens(seq) == (16, True)
+    seq.num_cached_tokens = 4
     scheduler.update_state_after_alloc(seq)
     assert scheduler.should_park_for_load_after_alloc(seq) is False
     assert scheduler.build_connector_meta().requests == []
-    assert scheduler._pinned_state_bytes == 0
-    assert checkpoints.store.pool.num_free == 30
+    assert scheduler._handoff_loads == {str(seq.id)}
+    assert scheduler.adjust_prefill_chunk_after_alloc(seq, 16) == 4
+
+    # The local prefill reaches the next LMCache chunk boundary. The same
+    # lookup lease is then handed off to an incremental [8, 16) retrieve.
+    seq.num_cached_tokens = 8
+    assert scheduler.should_park_partial_prefill_for_load(seq) is True
+    [request] = scheduler.build_connector_meta().requests
+    assert request.load_spec.hbm_cached_tokens == 8
+    assert request.load_spec.lmcache_cached_tokens == 16
+    assert seq.offload_load_start_tokens == 8
     assert scheduler._handoff_loads == set()
+    assert checkpoints.store.pool.num_free == 27
+
+
+def test_incremental_restore_supersedes_queued_local_state_restore(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence(computed=0)
+    local_hash, _ = checkpoint(scheduler, checkpoints, seq, 8)
+    assert checkpoints.begin_restore(local_hash, seq.state_slot)
+    local_id = checkpoints.store.lookup(local_hash)
+    assert checkpoints.store.records[local_id].pin_count == 1
+
+    assert scheduler.get_num_new_matched_tokens(seq) == (16, True)
+    seq.num_cached_tokens = 8
+    scheduler.update_state_after_alloc(seq)
+    assert scheduler.should_park_for_load_after_alloc(seq)
+    assert not checkpoints.restore_queued_for(seq.state_slot)
+    [request] = scheduler.build_connector_meta().requests
+
+    assert scheduler.load_finished(request.load_operation)
+    assert checkpoints.store.records[local_id].pin_count == 0
+    assert checkpoints.contains(request.native_state.prefix_hash)
+
+
+def test_incremental_restore_failure_resumes_queued_local_state_restore(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence(computed=0)
+    local_hash, _ = checkpoint(scheduler, checkpoints, seq, 8)
+    assert checkpoints.begin_restore(local_hash, seq.state_slot)
+
+    scheduler.get_num_new_matched_tokens(seq)
+    seq.num_cached_tokens = 8
+    scheduler.update_state_after_alloc(seq)
+    assert scheduler.should_park_for_load_after_alloc(seq)
+    [request] = scheduler.build_connector_meta().requests
+    assert not checkpoints.restore_queued_for(seq.state_slot)
+
+    assert scheduler.load_failed(request.load_operation)
+    assert checkpoints.restore_queued_for(seq.state_slot)
+    [restore] = checkpoints.take_checkpoint_ops()[1]
+    assert restore.dst_slot == seq.state_slot
 
 
 def test_load_capacity_failure_never_parks_or_claims_missing_state(monkeypatch):
@@ -445,7 +511,11 @@ def test_engine_allocates_then_parks_and_wakes_at_exact_native_boundary(monkeypa
         KVConnectorOutput(finished_loading={request.load_operation})
     )
     assert connector._pinned_state_bytes == 0
-    assert engine.block_manager.kv.num_free == 34
+    # The three transfer units remain as an unpinned READY checkpoint.
+    assert engine.block_manager.kv.num_free == 31
+    assert engine.block_manager.paged_state_checkpoints.contains(
+        request.native_state.prefix_hash
+    )
     batch, scheduled = engine.schedule()
     assert scheduled[seq.id] is seq
     assert seq.num_cached_tokens == 16
@@ -482,7 +552,14 @@ def test_engine_aborted_load_keeps_page_units_and_slot_until_terminal(
     assert seq.id not in engine.deferred_free_blocks
     assert list(seq.block_table) == []
     assert seq.state_slot == -1
-    assert engine.block_manager.kv.num_free == 40
+    expected_free = 37 if succeeded else 40
+    assert engine.block_manager.kv.num_free == expected_free
+    assert (
+        engine.block_manager.paged_state_checkpoints.contains(
+            request.native_state.prefix_hash
+        )
+        is succeeded
+    )
     assert engine._num_parked_remote_kv == 0
 
 
@@ -540,7 +617,11 @@ def test_engine_releases_retired_request_when_unpinned_candidate_is_evicted(
         batch=batch,
     )
     assert seq.status == SequenceStatus.FINISHED
-    assert engine.deferred_free_blocks[seq.id] is seq
+    # A not-yet-admitted candidate owns no PAGE lease. The request's KV blocks
+    # and active SLOT are therefore released immediately.
+    assert seq.id not in engine.deferred_free_blocks
+    assert seq.state_slot == -1
+    assert list(seq.block_table) == []
     assert connector._native_saves == {}
     checkpoint_id = checkpoints.store.lookup(prefix_hash)
     assert checkpoints.store.records[checkpoint_id].pin_count == 0
@@ -551,8 +632,6 @@ def test_engine_releases_retired_request_when_unpinned_candidate_is_evicted(
     assert connector.has_pending_work()
     engine._update_from_kv_xfer_finished(KVConnectorOutput())
     assert seq.id not in engine.deferred_free_blocks
-    assert seq.state_slot == -1
-    assert list(seq.block_table) == []
     assert bm.kv.num_free == 40
     assert connector._retired_requests == {}
     assert connector._save_tracker == {}

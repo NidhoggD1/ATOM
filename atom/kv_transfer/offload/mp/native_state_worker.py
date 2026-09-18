@@ -12,16 +12,25 @@ from typing import Any
 
 import torch
 
-from atom.kv_transfer.disaggregation.types import ConnectorCompletion, KVConnectorOutput
+from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
+    KVConnectorOutput,
+    SaveSourceGroupId,
+)
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import max_pending_saves
+from atom.kv_transfer.offload.chunked_scheduler import (
+    DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+)
 from atom.kv_transfer.offload.metadata import LMCacheReqMeta, NativeStateTransfer
 from atom.kv_transfer.offload.mp.backend import (
     LMCacheMPConnector,
     _make_worker_adapter,
+    _published_tp_replication_factor,
     _remember_operation_tombstone,
     _storage_kv_transfer_config,
     _terminal_future_result,
+    _tp_replication_factor,
     _transfer_operation_id,
     _validate_mp_config,
 )
@@ -32,6 +41,7 @@ from atom.model_engine.page_unit_checkpoint import CheckpointRestoreOp
 
 logger = logging.getLogger("atom")
 NATIVE_STATE_MP_STORE_CHANNEL = "native_state_mp_store"
+NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL = "native_state_mp_state_source_safe"
 
 
 def require_native_state_server(adapter: Any, config: Any = None) -> None:
@@ -61,6 +71,9 @@ class _NativePending:
     future: Any
     restore_event: Any = None
     restore_succeeded: bool = False
+    descriptor_slot: int | None = None
+    immediate_success: bool = False
+    state_source_safe: bool = False
 
 
 class NativeStateLMCacheMPConnector(LMCacheMPConnector):
@@ -72,7 +85,8 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         self._native_loads: dict[str, _NativePending] = {}
         self._native_layout = None
         self._native_copy = None
-        self._compute_stream = None
+        self._restore_stream = None
+        self._restore_descriptor_slots: list[int] = []
         self._max_pending_saves = max_pending_saves(
             int(os.environ.get("OFFLOAD_COPY_WORKERS", "1"))
         )
@@ -91,8 +105,24 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             raise ValueError(
                 "native-state LMCache MP needs checkpoint geometry and a copy callback"
             )
-        _validate_mp_config(self._config)
+        tp_size, _ = _validate_mp_config(self._config)
         rank = int(get_tp_group().rank_in_group)
+        requested_replication = _tp_replication_factor(self._config, native_state=True)
+        published_page_replication = _published_tp_replication_factor(
+            transfer_tensors, tp_size=tp_size
+        )
+        published_state_replication = _published_tp_replication_factor(
+            transfer_tensors, tp_size=tp_size, native_state=True
+        )
+        if requested_replication > min(
+            published_page_replication, published_state_replication
+        ):
+            raise ValueError(
+                "LMCache MP native TP rank collapse was requested, but the "
+                "attention backend did not declare both PAGE and STATE fully "
+                "replicated"
+            )
+        self._is_kv_writer = rank % requested_replication == 0
         adapter = _make_worker_adapter(self._config, rank, checkpoint_spec=spec)
         try:
             require_native_state_server(adapter, self._config)
@@ -117,7 +147,10 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         self.chunk_size = chunk_size
         self._native_layout = layout
         self._native_copy = native_copy
-        self._compute_stream = torch.cuda.current_stream()
+        self._restore_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+        self._restore_descriptor_slots = list(
+            range(1, max(2, self._max_pending_saves) + 1)
+        )
         logger.info(
             "LMCache MP native state registered rank=%d native_image=%d "
             "units=%d groups=%d chunk=%d",
@@ -147,10 +180,8 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             )
         if state.boundary_tokens != end or len(req.token_ids) != end:
             raise ValueError("native STATE and PAGE endpoints must match")
-        if loading and (start != 0 or state.destination_slot is None):
-            raise ValueError(
-                "native-state restore requires HBM=0 and a destination SLOT"
-            )
+        if loading and state.destination_slot is None:
+            raise ValueError("native-state restore requires a destination SLOT")
         if not loading and state.destination_slot is not None:
             raise ValueError("native-state save must refer to immutable PAGE units")
         self._native_layout.image_plan(state.unit_ids)
@@ -182,6 +213,11 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 raise RuntimeError(
                     f"duplicate native-state LMCache MP operation {operation_id!r}"
                 )
+            if not loading and not self._is_kv_writer:
+                pending[operation_id] = _NativePending(
+                    req, None, immediate_success=True
+                )
+                return
             if not loading and len(pending) >= self._max_pending_saves:
                 # The scheduler has the same bound. Refuse before transport;
                 # a terminal False safely returns the logical admission credit.
@@ -212,7 +248,11 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         submit = (
             self._adapter.submit_retrieve_request
             if loading
-            else self._adapter.submit_store_request
+            else getattr(
+                self._adapter,
+                "submit_store_request_with_source_events",
+                self._adapter.submit_store_request,
+            )
         )
         try:
             future = submit(str(req.req_id), spec, event)
@@ -233,15 +273,16 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
     def _submit_save(self, req: LMCacheReqMeta, event: Any) -> None:
         self._submit_native(req, event, loading=False)
 
-    def _begin_restore(self, pending: _NativePending) -> None:
+    def _begin_restore(self, pending: _NativePending) -> bool:
+        if not self._restore_descriptor_slots:
+            return False
         state: NativeStateTransfer = pending.request.native_state
         spec = self._native_layout.checkpoint_spec
         event = torch.cuda.Event()
+        descriptor_slot = self._restore_descriptor_slots.pop()
         pending.restore_event = event
-        with torch.cuda.stream(self._compute_stream):
-            # The native callback shares its pinned descriptor with forward.
-            # Its CPU writes must not race the previous descriptor's async H2D.
-            self._compute_stream.synchronize()
+        pending.descriptor_slot = descriptor_slot
+        with torch.cuda.stream(self._restore_stream):
             try:
                 self._native_copy(
                     (),
@@ -253,23 +294,72 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                             layout_id=spec.layout_id,
                         ),
                     ),
+                    descriptor_slot=descriptor_slot,
                 )
                 pending.restore_succeeded = True
             except Exception:
                 logger.exception("LMCache MP native restore failed")
             finally:
-                event.record(self._compute_stream)
-                # Also protect this descriptor from the next forward's host
-                # rewrite. This fences only the local native gather, never MP.
-                self._compute_stream.synchronize()
+                event.record(self._restore_stream)
+        return True
+
+    def _emit_native_source_safe(
+        self,
+        output: KVConnectorOutput,
+        pending: _NativePending,
+        ranges: tuple[tuple[int, int], ...],
+    ) -> None:
+        operation = pending.request.save_operation
+        if operation is None or not ranges:
+            return
+        for token_range in ranges:
+            output.connector_completions.add(
+                ConnectorCompletion(
+                    DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+                    SaveSourceGroupId(operation, (token_range,)),
+                    True,
+                )
+            )
+        boundary = int(pending.request.native_state.boundary_tokens)
+        if not pending.state_source_safe and any(end >= boundary for _, end in ranges):
+            output.connector_completions.add(
+                ConnectorCompletion(
+                    NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL,
+                    operation,
+                    True,
+                )
+            )
+            pending.state_source_safe = True
 
     def get_finished(self) -> KVConnectorOutput:
         output = KVConnectorOutput()
         with self._lock:
             for operation_id, pending in list(self._native_saves.items()):
-                terminal, result = _terminal_future_result(pending.future)
+                take_ranges = getattr(pending.future, "take_source_safe_ranges", None)
+                if callable(take_ranges):
+                    try:
+                        self._emit_native_source_safe(
+                            output, pending, tuple(take_ranges())
+                        )
+                    except Exception:
+                        logger.warning(
+                            "LMCache MP source-safe event polling failed",
+                            exc_info=True,
+                        )
+                if pending.immediate_success:
+                    terminal, result = True, True
+                else:
+                    terminal, result = _terminal_future_result(pending.future)
                 if not terminal:
                     continue
+                save_spec = pending.request.save_spec
+                start = 0 if save_spec is None else int(save_spec.skip_leading_tokens)
+                end = len(pending.request.token_ids)
+                terminal_ranges = tuple(
+                    (chunk_start, min(chunk_start + self.chunk_size, end))
+                    for chunk_start in range(start, end, self.chunk_size)
+                )
+                self._emit_native_source_safe(output, pending, terminal_ranges)
                 output.connector_completions.add(
                     ConnectorCompletion(
                         NATIVE_STATE_MP_STORE_CHANNEL,
@@ -290,7 +380,8 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                         continue
                     if result is True:
                         try:
-                            self._begin_restore(pending)
+                            if not self._begin_restore(pending):
+                                continue
                         except Exception:
                             logger.exception(
                                 "LMCache MP native restore safety unknown; "
@@ -310,6 +401,9 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                         )
                         continue
                 completion = pending.request.load_operation
+                if pending.descriptor_slot is not None:
+                    self._restore_descriptor_slots.append(pending.descriptor_slot)
+                    pending.descriptor_slot = None
                 target = (
                     output.finished_loading
                     if pending.restore_succeeded
@@ -326,6 +420,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
 
 
 __all__ = [
+    "NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL",
     "NATIVE_STATE_MP_STORE_CHANNEL",
     "NativeStateLMCacheMPConnector",
     "require_native_state_server",

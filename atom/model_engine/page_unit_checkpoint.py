@@ -116,6 +116,14 @@ class CheckpointRecord:
     pin_count: int = 0
 
 
+@dataclass(frozen=True)
+class SuspendedCheckpointRestore:
+    """A queued restore removed from execution while retaining its source pin."""
+
+    checkpoint_id: int
+    operation: CheckpointRestoreOp
+
+
 @dataclass
 class _OffloadPin:
     """A store that has been dispatched to the worker but not yet indexed.
@@ -384,6 +392,40 @@ class PageUnitCheckpointStore:
             else:
                 kept.append((checkpoint_id, op))
         self._queued_restores = kept
+
+    def suspend_queued_restore(
+        self, dst_slot: int
+    ) -> SuspendedCheckpointRestore | None:
+        """Remove one queued restore without releasing its checkpoint pin.
+
+        An external full-snapshot restore uses this to prevent an older local
+        checkpoint copy from overwriting the destination SLOT later.  The
+        caller must eventually either resume or release the returned lease.
+        """
+        found: SuspendedCheckpointRestore | None = None
+        kept: list[tuple[int, CheckpointRestoreOp]] = []
+        for checkpoint_id, op in self._queued_restores:
+            if op.dst_slot == dst_slot:
+                if found is not None:
+                    raise AssertionError(
+                        f"multiple queued checkpoint restores target slot {dst_slot}"
+                    )
+                found = SuspendedCheckpointRestore(checkpoint_id, op)
+            else:
+                kept.append((checkpoint_id, op))
+        self._queued_restores = kept
+        return found
+
+    def resume_suspended_restore(self, restore: SuspendedCheckpointRestore) -> None:
+        """Put a suspended restore back on the next maintenance batch."""
+        record = self.records.get(restore.checkpoint_id)
+        if record is None or record.pin_count <= 0:
+            raise AssertionError("suspended checkpoint restore lost its source pin")
+        self._queued_restores.append((restore.checkpoint_id, restore.operation))
+
+    def release_suspended_restore(self, restore: SuspendedCheckpointRestore) -> None:
+        """Release a suspended restore whose destination was filled elsewhere."""
+        self._release_restore_pin(restore.checkpoint_id)
 
     def complete_inflight(self) -> None:
         stores, self._inflight_stores = self._inflight_stores, []
@@ -994,6 +1036,48 @@ class PagedStateCheckpointCoordinator:
         units = self._transfer_units.pop(owner, None)
         if units is not None:
             self.store.pool.release_units(units, ("state-transfer", owner))
+
+    def adopt_transfer_units(self, owner: Hashable, prefix_hash: int) -> bool:
+        """Publish a completed external image without exposing it to reuse.
+
+        Returns ``True`` when the transfer's units became the canonical READY
+        checkpoint. If the same hash was published concurrently, the incoming
+        units are released and ``False`` is returned. The adopted checkpoint is
+        deliberately not nominated for offload: it just arrived from that tier.
+        """
+        units = self._transfer_units.pop(owner, None)
+        if units is None:
+            return False
+        if self.store.contains_or_pending(prefix_hash):
+            self.store.pool.release_units(units, ("state-transfer", owner))
+            return False
+        checkpoint_id = self.store._new_identity()
+        checkpoint_owner = ("state-checkpoint", checkpoint_id)
+        self.store.pool.rekey_units(
+            units,
+            ("state-transfer", owner),
+            checkpoint_owner,
+        )
+        record = CheckpointRecord(
+            prefix_hash=int(prefix_hash),
+            unit_ids=tuple(units),
+            state=READY,
+        )
+        self.store.records[checkpoint_id] = record
+        self.store.hash_to_checkpoint[record.prefix_hash] = checkpoint_id
+        self.store._lru[checkpoint_id] = None
+        return True
+
+    def suspend_queued_restore(
+        self, dst_slot: int
+    ) -> SuspendedCheckpointRestore | None:
+        return self.store.suspend_queued_restore(dst_slot)
+
+    def resume_suspended_restore(self, restore: SuspendedCheckpointRestore) -> None:
+        self.store.resume_suspended_restore(restore)
+
+    def release_suspended_restore(self, restore: SuspendedCheckpointRestore) -> None:
+        self.store.release_suspended_restore(restore)
 
     def contains(self, h: int) -> bool:
         """Whether HBM holds a READY image for `h` right now.

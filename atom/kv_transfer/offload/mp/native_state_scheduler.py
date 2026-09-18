@@ -13,6 +13,7 @@ from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     LoadOperationId,
     SaveOperationId,
+    SaveSourceGroupId,
     StateStoreOperationId,
 )
 from atom.kv_transfer.offload import config as offcfg
@@ -27,9 +28,11 @@ from atom.kv_transfer.offload.mp.backend import (
     _validate_mp_config,
 )
 from atom.kv_transfer.offload.mp.native_state_worker import (
+    NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL,
     NATIVE_STATE_MP_STORE_CHANNEL,
     require_native_state_server,
 )
+from atom.model_engine.page_unit_checkpoint import SuspendedCheckpointRestore
 
 _MAX_SAVE_ATTEMPTS = 3
 
@@ -40,12 +43,15 @@ class _NativeSave:
     source: StateStoreOperationId
     saved_before: int
     boundary: int
+    source_safe: bool = False
 
 
 @dataclass
 class _NativeLoad:
     seq: Any
     transfer: NativeStateTransfer
+    hbm_cached_tokens: int
+    local_restore: SuspendedCheckpointRestore | None = None
     dispatched: bool = False
 
 
@@ -57,6 +63,8 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
     for the worker's terminal transfer-and-restore report. Neither side recycles
     these units in response to elapsed time.
     """
+
+    _supports_early_block_release = True
 
     def __init__(self, config: Any) -> None:
         # The layout is known only after BlockManager builds the native pool.
@@ -157,8 +165,6 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
         if not getattr(seq, "has_per_req_cache", False):
             return 0, False
-        if int(seq.num_cached_tokens) != 0:
-            return 0, False
         previous = self._native_load_operations.get(str(seq.id))
         if previous is not None:
             return 0, False
@@ -186,6 +192,13 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             if self._checkpoints.contains(self._boundary_hash(seq, boundary)):
                 return boundary
         return 0
+
+    def _late_save_frontier(self, seq: Any, saved: int, available: int) -> int:
+        available = self._chunk_floor(available)
+        for boundary in range(available, saved, -self.chunk_size):
+            if self._checkpoints.contains(self._boundary_hash(seq, boundary)):
+                return boundary
+        return saved
 
     def _may_emit_save(self) -> bool:
         return (
@@ -224,7 +237,14 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         lease = self._native_saves.pop(operation, None)
         if lease is None:
             return
-        self._checkpoints.release_offload_store_source(lease.source)
+        # A terminal MP event is a backstop source fence even if an older
+        # server did not provide per-chunk milestones, or those notifications
+        # were coalesced/lost before reaching the scheduler.
+        self._source_group_finished(
+            SaveSourceGroupId(operation, ((lease.saved_before, lease.boundary),))
+        )
+        if not lease.source_safe:
+            self._checkpoints.release_offload_store_source(lease.source)
         self._checkpoints.settle_offload_store(lease.source)
         self._pinned_state_bytes -= self._image_reservation_bytes
         sid = str(operation.req_id)
@@ -241,14 +261,22 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             entry = self._save_tracker.get(sid)
             if entry is not None and entry[0] is lease.seq:
                 entry[1] = min(int(entry[1]), lease.saved_before)
-            self._cancel_save_statistics(operation)
-        super().save_finished(operation)
+        self._store_finished(operation, succeeded=succeeded)
 
     def save_finished(self, req_id: Any) -> None:
         if isinstance(req_id, SaveOperationId):
             self._complete_native_save(req_id, succeeded=True)
 
     def connector_completion(self, completion: ConnectorCompletion) -> bool | None:
+        if completion.channel == NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL:
+            operation = completion.operation_id
+            if not isinstance(operation, SaveOperationId):
+                return False
+            lease = self._native_saves.get(operation)
+            if lease is not None and not lease.source_safe:
+                self._checkpoints.release_offload_store_source(lease.source)
+                lease.source_safe = True
+            return None
         if completion.channel != NATIVE_STATE_MP_STORE_CHANNEL:
             return super().connector_completion(completion)
         if not isinstance(completion.operation_id, SaveOperationId):
@@ -261,8 +289,6 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
     def _decide_load_after_alloc(self, seq: Any, load_spec):
         decision = super()._decide_load_after_alloc(seq, load_spec)
         should_load, _reason, hbm, lmc, need, chunk = decision
-        if hbm != 0:
-            return False, "native_load_requires_empty_hbm", hbm, lmc, need, chunk
         if not should_load:
             return decision
         if not getattr(seq, "has_per_req_cache", False) or seq.state_slot < 0:
@@ -285,6 +311,7 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         if units is None:
             self._pinned_state_bytes -= self._image_reservation_bytes
             return False, "native_state_units", hbm, lmc, need, chunk
+        local_restore = self._checkpoints.suspend_queued_restore(int(seq.state_slot))
         self._native_loads[operation] = _NativeLoad(
             seq,
             NativeStateTransfer(
@@ -293,6 +320,8 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                 self._boundary_hash(seq, lmc),
                 destination_slot=int(seq.state_slot),
             ),
+            hbm,
+            local_restore,
         )
         self._native_load_operations[sid] = operation
         self._active_load_operations[sid] = (seq, operation)
@@ -304,7 +333,7 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         self._native_loads[operation].dispatched = True
         # The scheduler publishes the loaded PAGE prefix only after terminal
         # success. Its hash chain must exist before suffix prefill checkpoints.
-        seq.offload_load_start_tokens = 0
+        seq.offload_load_start_tokens = self._native_loads[operation].hbm_cached_tokens
         return operation
 
     def build_connector_meta(self):
@@ -316,10 +345,13 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                 ].transfer
         return metadata
 
-    def _release_native_load(self, operation: LoadOperationId) -> _NativeLoad | None:
+    def _release_native_load(
+        self, operation: LoadOperationId, *, release_units: bool = True
+    ) -> _NativeLoad | None:
         lease = self._native_loads.pop(operation, None)
         if lease is not None:
-            self._checkpoints.release_transfer_units(operation)
+            if release_units:
+                self._checkpoints.release_transfer_units(operation)
             self._pinned_state_bytes -= self._image_reservation_bytes
             sid = str(operation.req_id)
             if self._native_load_operations.get(sid) == operation:
@@ -330,6 +362,9 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         operation = self._native_load_operations.get(sid)
         lease = self._native_loads.get(operation)
         if lease is not None and not lease.dispatched:
+            if lease.local_restore is not None:
+                self._checkpoints.resume_suspended_restore(lease.local_restore)
+                lease.local_restore = None
             self._release_native_load(operation)
             if self._active_load_operations.get(sid) == (lease.seq, operation):
                 self._active_load_operations.pop(sid, None)
@@ -343,7 +378,20 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             or operation not in self._native_loads
         ):
             return False
-        lease = self._release_native_load(operation)
+        lease = self._native_loads[operation]
+        if succeeded:
+            self._checkpoints.adopt_transfer_units(
+                operation, lease.transfer.prefix_hash
+            )
+            if lease.local_restore is not None:
+                self._checkpoints.release_suspended_restore(lease.local_restore)
+                lease.local_restore = None
+            self._release_native_load(operation, release_units=False)
+        else:
+            if lease.local_restore is not None:
+                self._checkpoints.resume_suspended_restore(lease.local_restore)
+                lease.local_restore = None
+            self._release_native_load(operation)
         finished = (
             super().load_finished(operation)
             if succeeded

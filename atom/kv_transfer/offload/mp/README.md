@@ -32,6 +32,8 @@ the native-state contract:
 ```bash
 export LMCACHE_CHUNK_SIZE=256
 export OFFLOAD_MAX_PENDING_SAVES=2
+export OFFLOAD_MIN_LOAD_TOKENS=8192
+export OFFLOAD_MIN_SAVE_TOKENS=8192
 
 python -m atom.entrypoints.openai_server \
   --model deepseek-ai/DeepSeek-V4-Pro --kv_cache_dtype fp8 -tp 8 \
@@ -42,7 +44,7 @@ python -m atom.entrypoints.openai_server \
     "kv_connector_extra_config": {
       "lmcache.mp.host": "tcp://127.0.0.1",
       "lmcache.mp.port": 5555,
-      "lmcache.mp.tp_rank_collapse": false
+      "lmcache.mp.tp_rank_collapse": true
     }
   }'
 ```
@@ -57,8 +59,12 @@ complete STATE checkpoint both exist on all TP ranks.
 and temporary restore images together. Its default is
 `OFFLOAD_MAX_PENDING_SAVES * units_per_checkpoint * page_unit_bytes`, per TP
 worker's geometry. PAGE KV sources continue to use normal request ownership.
-Candidates consume no image pin until admission. The shared save limit defaults
-to `max(2, 2 * OFFLOAD_COPY_WORKERS)` when not configured.
+Candidates consume no PAGE or image pin until admission. If a request finishes
+while waiting, admission resolves the original token/hash chain back through
+the live prefix index and stores only its still-resident contiguous prefix.
+`OFFLOAD_MIN_SAVE_TOKENS` (default 8192) suppresses a late save whose remaining
+prefix is too small. The shared save limit defaults to
+`max(2, 2 * OFFLOAD_COPY_WORKERS)` when not configured.
 
 The namespace includes model/PAGE geometry, TP size, speculation configuration,
 native layout and image sizes, Hugging Face commit identity when available,
@@ -80,33 +86,42 @@ physical PAGE stride.
 The scheduler dispatches one combined PAGE/STATE save generation at a time per
 request, with round-robin admission and count/byte bounds. It acquires the exact
 READY image only after admission. An IPC producer event orders MP reads after
-native checkpoint creation. A terminal completion from every TP rank releases
-the native source and settles the logical operation. Failed saves roll back the
-watermark for at most three attempts at that boundary.
+native checkpoint creation. Source-safe events release PAGE leases chunk by
+chunk and release the READY STATE image once its endpoint is safe; terminal
+completion then settles the logical operation. Decode-only PAGEs and the live
+SLOT are not save sources and can be returned as soon as the request ends.
+Failed saves roll back the watermark for at most three attempts at that
+boundary. Native saves never reclaim an uncertain DMA lease by elapsed time.
 
-Restore reserves fresh PAGE units plus the request's already allocated fixed
-SLOT. After MP H2D finishes, the worker invokes the native image-to-SLOT codec.
-The request wakes and the temporary units release only after local restore is
-complete. An aborted request keeps its allocations until the same exact
-completion arrives. Transport exceptions without proof of device completion
-retain the lease; elapsed time and server heartbeat failure do not free DMA
-sources or destinations.
+Restore loads PAGE KV only for `[hbm, lmcache)` and restores the endpoint's full
+native image into the request's already allocated fixed SLOT. If the local HBM
+hit is not chunk-aligned, ATOM first prefills to the next chunk boundary and
+then parks the request for the aligned remainder, provided that remainder meets
+`OFFLOAD_MIN_LOAD_TOKENS`. The native codec runs on a dedicated stream with a
+separate descriptor slot; completion is polled by event and never synchronizes
+the compute stream. After successful H2D and SLOT restore, the temporary STATE
+PAGE units are atomically adopted as an unpinned `READY` checkpoint, so a later
+request can hit it locally until normal LRU eviction. An aborted request keeps
+its allocations until the same exact completion arrives. Transport exceptions
+without proof of device completion retain the lease; elapsed time and server
+heartbeat failure do not free DMA sources or destinations.
 
-## Initial scope
+## Current scope and constraints
 
 - Native ATOM, one MP server, TP only. DP/PP/PCP/DCP and engine-driven transfers
-  are rejected. TP rank collapse is disabled whenever native STATE is present,
-  because that state is rank-specific.
-- External restore is used when the actual post-allocation HBM hit is zero.
-  Requests with a local HBM prefix follow normal local prefill. Lookups truncate
-  the token list to `floor((prompt_tokens - 1) / chunk_size) * chunk_size` before
-  querying, so the restored state agrees with the resumed token boundary.
-- The native restore callback currently shares its descriptor buffer with
-  forward. Local stream synchronization before and after restore prevents host
-  descriptor reuse races; network transfer remains asynchronous.
-- Finished requests currently retain their normal PAGE/SLOT allocations while
-  a PAGE save is pending. Releasing their SLOT earlier needs a separate native
-  PAGE lease path. Running requests never give their SLOT to the MP connector.
+  are rejected.
+- DSv4 declares both PAGE and native STATE byte-identical across TP ranks.
+  `lmcache.mp.tp_rank_collapse=auto` therefore collapses TP automatically;
+  explicit `true` is also accepted after the worker validates both declarations.
+  One rank stores each object and every rank retrieves it (`num_kv_readers=TP`).
+- External restore supports both zero-HBM and incremental local-prefix cases.
+  Lookups truncate the token list to
+  `floor((prompt_tokens - 1) / chunk_size) * chunk_size`, and PAGE/STATE must
+  reach the same real endpoint.
+- Pending saves do not pin source PAGEs. Once admitted, only the verified,
+  continuous hash-matching prefix is acquired, and only source-unsafe chunks
+  remain leased after request teardown. Running requests never give their SLOT
+  to the MP connector.
 - The transport aliases native buffers directly, but LMCache may use its own
   GPU transfer buffers internally. This removes an additional ATOM SLOT image,
   rather than promising a completely copy-free transport.
@@ -125,7 +140,8 @@ LMCache checkout:
 python -m pytest -xvs tests/v1/multiprocess/test_native_state_alias_gpu.py
 ```
 
-It uses synthetic cache contents and validates the shared transport contract,
-not model accuracy or serving performance. Model validation still requires a
-run with forced HBM misses, prefix reuse, TP quorum, cancellation, and
-comparison to fresh prefill.
+It uses synthetic cache contents and validates the shared transport contract.
+The repository-level DSv4-Pro TP8 test additionally covers a forced full remote
+restore, READY reuse, incremental restore, second local reuse, exact next-token
+comparison with fresh prefill, per-rank retrieve counts, one-writer storage,
+and exact promoted ranges.

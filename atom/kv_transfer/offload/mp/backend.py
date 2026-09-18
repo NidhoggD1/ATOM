@@ -25,14 +25,21 @@ import torch
 
 from atom.kv_transfer.disaggregation.base import KVConnectorBase
 from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
     KVConnectorOutput,
     LoadCompletionId,
     LoadOperationId,
     SaveCompletionId,
+    SaveOperationId,
+    SaveSourceGroupId,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import validated_kv_role
-from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+from atom.kv_transfer.offload.chunked_scheduler import (
+    DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+    DENSE_PAGE_STORE_CHANNEL,
+    ChunkedOffloadSchedulerBase,
+)
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
 
 logger = logging.getLogger("atom")
@@ -157,16 +164,6 @@ def _tp_replication_factor(config: Any, *, native_state: bool = False) -> int:
 
     tp_size, _ = _validate_mp_config(config)
     configured = _extra_config(config).get("lmcache.mp.tp_rank_collapse", "auto")
-    if native_state:
-        if configured is True:
-            raise ValueError(
-                "native STATE requires every TP rank; disable rank collapse"
-            )
-        if configured is not False and configured != "auto":
-            raise TypeError(
-                "lmcache.mp.tp_rank_collapse must be true, false, or 'auto'"
-            )
-        return 1
     if isinstance(configured, str) and configured.strip().lower() == "auto":
         collapse = _config_has_fully_replicated_tp_pages(config)
     elif type(configured) is bool:
@@ -180,22 +177,29 @@ def _published_tp_replication_factor(
     transfer_tensors: Any,
     *,
     tp_size: int,
+    native_state: bool = False,
 ) -> int:
-    """Validate the attention backend's whole-PAGE replication declaration."""
+    """Validate a backend's whole-object TP replication declaration."""
 
+    attribute = (
+        "native_state_tp_replication_factor"
+        if native_state
+        else "tp_replication_factor"
+    )
+    label = "native STATE" if native_state else "KV PAGE"
     factor = offcfg._strict_integer(
-        "KV PAGE TP replication factor",
-        getattr(transfer_tensors, "tp_replication_factor", 1),
+        f"{label} TP replication factor",
+        getattr(transfer_tensors, attribute, 1),
         minimum=1,
     )
     if tp_size % factor:
         raise ValueError(
-            f"KV PAGE TP replication factor {factor} must divide TP size {tp_size}"
+            f"{label} TP replication factor {factor} must divide TP size {tp_size}"
         )
     if factor not in (1, tp_size):
         raise NotImplementedError(
             "lmcache_mp currently supports only sharded or fully TP-replicated "
-            f"PAGE layouts, got replication factor {factor} for TP size {tp_size}"
+            f"{label} layouts, got replication factor {factor} for TP size {tp_size}"
         )
     return factor
 
@@ -445,6 +449,8 @@ class _PendingLoad:
 class _PendingSave:
     completion: SaveCompletionId
     future: Any | None
+    start: int
+    end: int
 
 
 def _terminal_future_result(future: Any | None) -> tuple[bool, Any]:
@@ -652,6 +658,7 @@ class LMCacheMPConnector(KVConnectorBase):
         self._completed_save_operation_order: deque[str] = deque()
         self._completed_load_operation_order: deque[str] = deque()
         self._immediate_saves: set[SaveCompletionId] = set()
+        self._immediate_save_failures: set[SaveCompletionId] = set()
         self._immediate_load_failures: set[LoadCompletionId] = set()
         self._lock = threading.Lock()
 
@@ -897,7 +904,12 @@ class LMCacheMPConnector(KVConnectorBase):
                 start=start,
                 end=end,
             )
-            transfer = self._adapter.submit_store_request(
+            submit = getattr(
+                self._adapter,
+                "submit_store_request_with_source_events",
+                self._adapter.submit_store_request,
+            )
+            transfer = submit(
                 request_id,
                 op,
                 event,
@@ -914,13 +926,15 @@ class LMCacheMPConnector(KVConnectorBase):
                     self._completed_save_operations,
                     self._completed_save_operation_order,
                 )
-                self._immediate_saves.add(completion)
+                self._immediate_save_failures.add(completion)
             return
         with self._lock:
             self._submitting_saves.discard(operation_id)
             self._pending_saves[operation_id] = _PendingSave(
                 completion=completion,
                 future=transfer,
+                start=start,
+                end=end,
             )
 
     def get_finished(self) -> KVConnectorOutput:
@@ -929,6 +943,7 @@ class LMCacheMPConnector(KVConnectorBase):
         done_load: set[LoadCompletionId] = set()
         failed_load: set[LoadCompletionId] = set()
         done_save: set[SaveCompletionId] = set()
+        connector_completions: set[ConnectorCompletion] = set()
         with self._lock:
             # Heartbeat health is a control-plane signal, not proof that GPU
             # work submitted before the failure has quiesced. Keep every real
@@ -936,7 +951,27 @@ class LMCacheMPConnector(KVConnectorBase):
             # represented by None, while LMCache's missing-registration path
             # returns an event-free terminal False future.
             for operation_id, pending in list(self._pending_saves.items()):
-                terminal, _result = _terminal_future_result(pending.future)
+                take_ranges = getattr(pending.future, "take_source_safe_ranges", None)
+                if callable(take_ranges) and isinstance(
+                    pending.completion, SaveOperationId
+                ):
+                    try:
+                        for token_range in take_ranges():
+                            connector_completions.add(
+                                ConnectorCompletion(
+                                    DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+                                    SaveSourceGroupId(
+                                        pending.completion, (tuple(token_range),)
+                                    ),
+                                    True,
+                                )
+                            )
+                    except Exception:
+                        logger.warning(
+                            "LMCache MP source-safe event polling failed",
+                            exc_info=True,
+                        )
+                terminal, result = _terminal_future_result(pending.future)
                 if terminal:
                     self._pending_saves.pop(operation_id, None)
                     _remember_operation_tombstone(
@@ -945,6 +980,34 @@ class LMCacheMPConnector(KVConnectorBase):
                         self._completed_save_operation_order,
                     )
                     done_save.add(pending.completion)
+                    if isinstance(pending.completion, SaveOperationId):
+                        for start in range(
+                            pending.start, pending.end, int(self.chunk_size)
+                        ):
+                            connector_completions.add(
+                                ConnectorCompletion(
+                                    DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+                                    SaveSourceGroupId(
+                                        pending.completion,
+                                        (
+                                            (
+                                                start,
+                                                min(
+                                                    start + self.chunk_size, pending.end
+                                                ),
+                                            ),
+                                        ),
+                                    ),
+                                    True,
+                                )
+                            )
+                        connector_completions.add(
+                            ConnectorCompletion(
+                                DENSE_PAGE_STORE_CHANNEL,
+                                pending.completion,
+                                result is True,
+                            )
+                        )
 
             for operation_id, pending in list(self._pending_loads.items()):
                 terminal, result = _terminal_future_result(pending.future)
@@ -961,18 +1024,33 @@ class LMCacheMPConnector(KVConnectorBase):
                 else:
                     done_load.add(pending.completion)
             done_save.update(self._immediate_saves)
+            for completion in self._immediate_saves:
+                if isinstance(completion, SaveOperationId):
+                    connector_completions.add(
+                        ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, completion, True)
+                    )
+            for completion in self._immediate_save_failures:
+                done_save.add(completion)
+                if isinstance(completion, SaveOperationId):
+                    connector_completions.add(
+                        ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, completion, False)
+                    )
             failed_load.update(self._immediate_load_failures)
             self._immediate_saves.clear()
+            self._immediate_save_failures.clear()
             self._immediate_load_failures.clear()
         return KVConnectorOutput(
             finished_loading=done_load,
             failed_loading=failed_load,
             finished_saving=done_save,
+            connector_completions=connector_completions,
         )
 
 
 class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     """Scheduler-side LMCache MP connector for generic PAGE offload."""
+
+    _supports_early_block_release = True
 
     def __init__(self, config: Any, *, checkpoint_spec: Any = None) -> None:
         _validate_mp_config(config)

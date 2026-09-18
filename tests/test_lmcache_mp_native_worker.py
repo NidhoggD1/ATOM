@@ -10,11 +10,14 @@ import pytest
 import torch
 
 from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
     KVTransferRegion,
     KVTransferTensors,
     LoadOperationId,
     SaveOperationId,
+    SaveSourceGroupId,
 )
+from atom.kv_transfer.offload.chunked_scheduler import DENSE_PAGE_SOURCE_SAFE_CHANNEL
 from atom.kv_transfer.offload.metadata import (
     LMCacheReqMeta,
     LoadSpec,
@@ -26,6 +29,8 @@ from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
 )
 from atom.kv_transfer.offload.mp.native_state_worker import (
+    NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL,
+    NATIVE_STATE_MP_STORE_CHANNEL,
     NativeStateLMCacheMPConnector,
     require_native_state_server,
 )
@@ -33,14 +38,19 @@ from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 
 
 class Future:
-    def __init__(self, value=True, ready=False):
+    def __init__(self, value=True, ready=False, source_ranges=()):
         self.value, self.ready = value, ready
+        self.source_ranges = list(source_ranges)
 
     def query(self):
         return self.ready
 
     def result(self, timeout=0):
         return self.value
+
+    def take_source_safe_ranges(self):
+        ranges, self.source_ranges = self.source_ranges, []
+        return tuple(ranges)
 
 
 def config(**extra):
@@ -90,12 +100,12 @@ def worker():
     return instance
 
 
-def request(*, loading=False, units=(0, 25, 31), generation=1):
+def request(*, loading=False, units=(0, 25, 31), generation=1, hbm=0):
     return LMCacheReqMeta(
         req_id=7,
         token_ids=list(range(16)),
         block_ids=[1, 2, 3, 4],
-        load_spec=LoadSpec(0, 16) if loading else None,
+        load_spec=LoadSpec(hbm, 16) if loading else None,
         save_spec=None if loading else SaveSpec(0),
         save_operation=None if loading else SaveOperationId(7, generation),
         load_operation=LoadOperationId(7, generation) if loading else None,
@@ -110,9 +120,25 @@ def test_store_transmits_page_zero_as_real_native_unit(worker):
     assert not worker.get_finished().connector_completions
     worker.future.ready = True
     finished = worker.get_finished()
-    (completion,) = finished.connector_completions
-    assert completion.operation_id == req.save_operation
-    assert completion.succeeded
+    assert {completion.channel for completion in finished.connector_completions} == {
+        DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+        NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL,
+        NATIVE_STATE_MP_STORE_CHANNEL,
+    }
+    terminals = [
+        completion
+        for completion in finished.connector_completions
+        if completion.channel == NATIVE_STATE_MP_STORE_CHANNEL
+    ]
+    assert terminals == [
+        ConnectorCompletion(NATIVE_STATE_MP_STORE_CHANNEL, req.save_operation, True)
+    ]
+    page_ranges = {
+        completion.operation_id.ranges
+        for completion in finished.connector_completions
+        if completion.channel == DENSE_PAGE_SOURCE_SAFE_CHANNEL
+    }
+    assert page_ranges == {((0, 8),), ((8, 16),)}
     assert not finished.finished_saving  # one quorum channel for the entire pair
 
 
@@ -122,8 +148,13 @@ def test_store_transmits_page_zero_as_real_native_unit(worker):
 def test_invalid_native_source_fails_before_transport(worker, units):
     worker._submit_save(request(units=units), object())
     assert not worker.submitted
-    (completion,) = worker.get_finished().connector_completions
-    assert not completion.succeeded
+    completions = worker.get_finished().connector_completions
+    [terminal] = [
+        completion
+        for completion in completions
+        if completion.channel == NATIVE_STATE_MP_STORE_CHANNEL
+    ]
+    assert not terminal.succeeded
 
 
 def test_uncertain_remote_submission_retains_lease(worker):
@@ -185,9 +216,14 @@ def test_worker_admission_bound_rejects_before_dma(worker):
     worker._submit_save(request(), object())
     worker._submit_save(request(generation=2), object())
     assert len(worker.submitted) == 1
-    (completion,) = worker.get_finished().connector_completions
-    assert completion.operation_id == SaveOperationId(7, 2)
-    assert not completion.succeeded
+    completions = worker.get_finished().connector_completions
+    [terminal] = [
+        completion
+        for completion in completions
+        if completion.channel == NATIVE_STATE_MP_STORE_CHANNEL
+    ]
+    assert terminal.operation_id == SaveOperationId(7, 2)
+    assert not terminal.succeeded
 
 
 def test_exact_completed_generation_cannot_replay(worker):
@@ -198,13 +234,127 @@ def test_exact_completed_generation_cannot_replay(worker):
         worker._submit_save(request(), object())
 
 
-def test_native_state_cannot_collapse_tp_ranks():
+def test_native_state_uses_same_tp_rank_collapse_as_page():
     assert _tp_replication_factor(config()) == 2
-    assert _tp_replication_factor(config(), native_state=True) == 1
-    with pytest.raises(ValueError, match="every TP rank"):
+    assert _tp_replication_factor(config(), native_state=True) == 2
+    assert (
         _tp_replication_factor(
             config(**{"lmcache.mp.tp_rank_collapse": True}), native_state=True
         )
+        == 2
+    )
+
+
+def test_incremental_load_transfers_only_page_suffix_but_full_native_image(worker):
+    req = request(loading=True, hbm=8)
+    worker._submit_load(req, object())
+    [submitted] = worker.submitted
+    assert submitted.start == 8
+    assert submitted.end == 16
+    assert submitted.block_ids == [[3, 4], [0], [25], [31]]
+
+
+def test_source_safe_ranges_are_reported_before_terminal(worker):
+    req = request()
+    worker.future.source_ranges = [(0, 8)]
+    worker._submit_save(req, object())
+
+    first = worker.get_finished()
+    assert first.connector_completions == {
+        ConnectorCompletion(
+            DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+            SaveSourceGroupId(req.save_operation, ((0, 8),)),
+            True,
+        )
+    }
+    assert worker._native_saves
+
+    worker.future.source_ranges = [(8, 16)]
+    second = worker.get_finished()
+    assert (
+        ConnectorCompletion(
+            DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+            SaveSourceGroupId(req.save_operation, ((8, 16),)),
+            True,
+        )
+        in second.connector_completions
+    )
+    assert (
+        ConnectorCompletion(
+            NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL, req.save_operation, True
+        )
+        in second.connector_completions
+    )
+    assert all(
+        completion.channel != NATIVE_STATE_MP_STORE_CHANNEL
+        for completion in second.connector_completions
+    )
+
+
+def test_collapsed_tp_non_writer_skips_transport_and_reports_safe_success(worker):
+    worker._is_kv_writer = False
+    req = request()
+    worker._submit_save(req, object())
+    assert worker.submitted == []
+
+    completions = worker.get_finished().connector_completions
+    assert (
+        ConnectorCompletion(
+            NATIVE_STATE_MP_SOURCE_SAFE_CHANNEL, req.save_operation, True
+        )
+        in completions
+    )
+    assert (
+        ConnectorCompletion(NATIVE_STATE_MP_STORE_CHANNEL, req.save_operation, True)
+        in completions
+    )
+    assert {
+        completion.operation_id.ranges
+        for completion in completions
+        if completion.channel == DENSE_PAGE_SOURCE_SAFE_CHANNEL
+    } == {((0, 8),), ((8, 16),)}
+
+
+def test_restore_uses_independent_descriptor_slot_without_stream_sync(
+    worker, monkeypatch
+):
+    from atom.kv_transfer.offload.mp import native_state_worker
+
+    class Event:
+        def __init__(self):
+            self.recorded_on = None
+
+        def record(self, stream):
+            self.recorded_on = stream
+
+    class StreamContext:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    restore_stream = object()
+    event = Event()
+    copied = []
+    worker._restore_stream = restore_stream
+    worker._restore_descriptor_slots = [3]
+    worker._native_copy = lambda stores, restores, descriptor_slot=0: copied.append(
+        (stores, restores, descriptor_slot)
+    )
+    monkeypatch.setattr(native_state_worker.torch.cuda, "Event", lambda: event)
+    monkeypatch.setattr(
+        native_state_worker.torch.cuda, "stream", lambda stream: StreamContext()
+    )
+
+    req = request(loading=True)
+    worker._submit_load(req, object())
+    pending = next(iter(worker._native_loads.values()))
+    assert worker._begin_restore(pending)
+    assert pending.descriptor_slot == 3
+    assert worker._restore_descriptor_slots == []
+    assert copied[0][2] == 3
+    assert event.recorded_on is restore_stream
 
 
 def test_native_server_chunk_mismatch_fails_before_registration(monkeypatch):
