@@ -128,6 +128,7 @@ on:
           - auto
           - amd-frameworks
           - amd-tw
+          - amd-atom
       atomesh_slurm_partition:
         description: 'TW Slurm partition: amd-frameworks[42/44/47], amd-tw[36/43]; Crusoe v2 uses the default partition'
         required: false
@@ -137,6 +138,7 @@ on:
           - auto
           - amd-frameworks
           - amd-tw
+          - atom-spur
       atomesh_single_node:
         description: 'ATOMesh single-node P/D placement; auto uses the existing runner/node configuration'
         required: false
@@ -1534,7 +1536,22 @@ jobs:
               cell = remap_model_paths(cell)
               cell["runner"]["log_root"] = "/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG"
               cell["runner"]["slurm_partition"] = "amd-spur"
-              cell["runner"]["slurm_qos"] = "amd-frameworks-qos"
+              cell["runner"]["slurm_qos"] = f"{cell['runner']['slurm_account']}-qos"
+              rail_routed_nodes = [
+                  "pit2-p03-g01", "pit2-p03-g03", "pit2-p03-g07", "pit2-p03-g08",
+                  "pit2-p03-g09", "pit2-p03-g10", "pit2-p03-g12", "pit2-p03-g13",
+                  "pit2-p03-g15", "pit2-p03-g17", "pit2-p03-g19", "pit2-p03-g20",
+                  "pit2-p03-g23", "pit2-p03-g24", "pit2-p03-g25", "pit2-p03-g27",
+                  "pit2-p03-g42",
+              ]
+              if len(rail_routed_nodes) < cell["num_nodes"]:
+                  raise SystemExit(
+                      f"{cell['id']} needs {cell['num_nodes']} node(s) but only "
+                      f"{len(rail_routed_nodes)} are rail-routed"
+                  )
+              # Slurm takes num_nodes out of the list, so handing it the whole
+              # pool starts the job on whatever happens to be free.
+              cell["nodes"] = rail_routed_nodes
 
           with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
               output.write(f"cell_json={json.dumps(cell, separators=(',', ':'))}\n")
