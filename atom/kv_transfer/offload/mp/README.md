@@ -13,6 +13,13 @@ path pins existing READY checkpoint PAGE units; it does not take another
 snapshot of the request's Active SLOT. Every request keeps its normal fixed
 SLOT while running.
 
+The PAGE-only path covers both sparse MLA and MHA/GQA layouts. GLM-5.2's MLA
+KV and index cache are byte-identical across TP, so automatic rank collapse
+stores one copy while every rank retrieves it. MiniMax-M3 publishes its GQA
+KV, scale, and NSA index-cache planes as zero-copy PAGE views and deliberately
+keeps one stored shard per TP rank. Both layouts use chunk completion events to
+release save-source PAGE blocks before the remote store becomes terminal.
+
 ## Run
 
 Install the matching ATOM and LMCache changes. The LMCache build must include
@@ -114,6 +121,12 @@ heartbeat failure do not free DMA sources or destinations.
   `lmcache.mp.tp_rank_collapse=auto` therefore collapses TP automatically;
   explicit `true` is also accepted after the worker validates both declarations.
   One rank stores each object and every rank retrieves it (`num_kv_readers=TP`).
+- GLM-5.2 (`glm_moe_dsa`) uses the same fully replicated sparse-MLA PAGE rule:
+  one TP rank stores, all TP ranks retrieve, and non-writers report immediate
+  source-safety so early release waits only for the real writer DMA.
+- MiniMax-M3 uses GQA PAGE shards plus its NSA index cache. It publishes the
+  complete layout to LMCache MP but leaves TP replication at `1`, so every TP
+  rank stores and retrieves its own shard while retaining chunk-wise early free.
 - External restore supports both zero-HBM and incremental local-prefix cases.
   Lookups truncate the token list to
   `floor((prompt_tokens - 1) / chunk_size) * chunk_size`, and PAGE/STATE must

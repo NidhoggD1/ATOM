@@ -149,6 +149,11 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     """
 
     hf_config = getattr(config, "hf_config", None)
+    # MiniMax-M3 is GQA. Some TP ranks can happen to own the same KV head when
+    # TP exceeds the global KV-head count, but the complete PAGE object is not
+    # replicated across the whole TP group and must remain one shard per rank.
+    if offcfg._is_minimax_m3(hf_config):
+        return False
     hf_config = getattr(hf_config, "text_config", hf_config)
     return getattr(hf_config, "kv_lora_rank", None) is not None
 
@@ -657,7 +662,11 @@ class LMCacheMPConnector(KVConnectorBase):
         self._completed_load_operations: set[str] = set()
         self._completed_save_operation_order: deque[str] = deque()
         self._completed_load_operation_order: deque[str] = deque()
-        self._immediate_saves: set[SaveCompletionId] = set()
+        # Immediate successes include collapsed-TP non-writers. Keep their
+        # logical token range so they can report PAGE source-safety too: the TP
+        # aggregator must receive the same chunk completion from every rank
+        # before releasing the writer's source blocks early.
+        self._immediate_saves: dict[SaveCompletionId, tuple[int, int] | None] = {}
         self._immediate_save_failures: set[SaveCompletionId] = set()
         self._immediate_load_failures: set[LoadCompletionId] = set()
         self._lock = threading.Lock()
@@ -872,6 +881,10 @@ class LMCacheMPConnector(KVConnectorBase):
                     f"duplicate LMCache MP save operation {operation_id!r}"
                 )
             self._submitting_saves.add(operation_id)
+        end = (len(req.token_ids) // self.chunk_size) * self.chunk_size
+        start = (
+            int(req.save_spec.skip_leading_tokens) // self.chunk_size
+        ) * self.chunk_size
         if not self._is_kv_writer:
             with self._lock:
                 self._submitting_saves.discard(operation_id)
@@ -880,12 +893,10 @@ class LMCacheMPConnector(KVConnectorBase):
                     self._completed_save_operations,
                     self._completed_save_operation_order,
                 )
-                self._immediate_saves.add(completion)
+                self._immediate_saves[completion] = (
+                    (start, end) if start < end else None
+                )
             return
-        end = (len(req.token_ids) // self.chunk_size) * self.chunk_size
-        start = (
-            int(req.save_spec.skip_leading_tokens) // self.chunk_size
-        ) * self.chunk_size
         if start >= end:
             with self._lock:
                 self._submitting_saves.discard(operation_id)
@@ -894,7 +905,7 @@ class LMCacheMPConnector(KVConnectorBase):
                     self._completed_save_operations,
                     self._completed_save_operation_order,
                 )
-                self._immediate_saves.add(completion)
+                self._immediate_saves[completion] = None
             return
         try:
             block_ids = self._block_slice(req, start, end)
@@ -1024,8 +1035,28 @@ class LMCacheMPConnector(KVConnectorBase):
                 else:
                     done_load.add(pending.completion)
             done_save.update(self._immediate_saves)
-            for completion in self._immediate_saves:
+            for completion, token_range in self._immediate_saves.items():
                 if isinstance(completion, SaveOperationId):
+                    if token_range is not None:
+                        start, end = token_range
+                        for chunk_start in range(start, end, int(self.chunk_size)):
+                            connector_completions.add(
+                                ConnectorCompletion(
+                                    DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+                                    SaveSourceGroupId(
+                                        completion,
+                                        (
+                                            (
+                                                chunk_start,
+                                                min(
+                                                    chunk_start + self.chunk_size, end
+                                                ),
+                                            ),
+                                        ),
+                                    ),
+                                    True,
+                                )
+                            )
                     connector_completions.add(
                         ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, completion, True)
                     )

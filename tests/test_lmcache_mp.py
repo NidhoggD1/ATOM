@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import (
     KVTransferRegion,
@@ -201,6 +202,21 @@ def test_parallel_strategy_collapses_fully_replicated_mla(monkeypatch):
     assert {strategy.world_size for strategy in strategies} == {1}
     assert {strategy.worker_id for strategy in strategies} == {0}
     assert {strategy.tp_size for strategy in strategies} == {8}
+
+
+def test_auto_rank_collapse_distinguishes_glm52_mla_from_minimax_m3_gqa():
+    glm52 = _config(model_type="glm_moe_dsa", tp=8, kv_lora_rank=512)
+    minimax = _config(model_type="minimax_m3_vl", tp=8)
+    minimax.hf_config.architectures = ["MiniMaxM3SparseForConditionalGeneration"]
+    minimax.hf_config.text_config = SimpleNamespace(
+        num_key_value_heads=4,
+        # Stay fail-closed for this model family even if a wrapper grows an
+        # unrelated field with the same name in the future.
+        kv_lora_rank=512,
+    )
+
+    assert mp_connector._tp_replication_factor(glm52) == 8
+    assert mp_connector._tp_replication_factor(minimax) == 1
 
 
 def test_tp_rank_collapse_can_be_disabled_and_rejects_bad_values():
@@ -679,6 +695,7 @@ class _WorkerFuture:
         self.ready = False
         self.value = result
         self.query_error = None
+        self.completed_ranges = []
 
     def query(self):
         if self.query_error is not None:
@@ -689,6 +706,11 @@ class _WorkerFuture:
         if not self.ready:
             raise TimeoutError("future is not ready")
         return self.value
+
+    def take_completed_ranges(self):
+        ranges = self.completed_ranges
+        self.completed_ranges = []
+        return ranges
 
 
 @pytest.fixture
@@ -742,6 +764,9 @@ class _WorkerAdapter:
         future = _WorkerFuture()
         self.saves.append((request_id, op, event, future))
         return future
+
+    def submit_store_request_with_chunk_events(self, request_id, op, event):
+        return self.submit_store_request(request_id, op, event)
 
     def shutdown(self):
         self.shutdown_called = True
@@ -993,6 +1018,33 @@ def test_worker_save_slices_chunk_blocks_and_preserves_operation(
     assert worker.get_finished().finished_saving == {operation}
 
 
+def test_worker_reports_chunk_source_safe_before_store_terminal(fake_lmcache_modules):
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    operation = SaveOperationId(req_id=81, generation=2)
+    request = LMCacheReqMeta(
+        req_id=81,
+        token_ids=list(range(16)),
+        block_ids=[30, 31, 32, 33],
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        save_operation=operation,
+    )
+
+    worker._submit_save(request, object())
+    future = worker._pending_saves["save:81:2"].future
+    future.completed_ranges = [(8, 16)]
+    output = worker.get_finished()
+
+    assert output.finished_saving == set()
+    assert output.connector_completions == {
+        mp_connector.ConnectorCompletion(
+            mp_connector.DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+            mp_connector.SaveSourceGroupId(operation, ((8, 16),)),
+            True,
+        )
+    }
+
+
 def test_non_writer_completes_save_without_submitting(fake_lmcache_modules):
     adapter = _WorkerAdapter()
     worker = _worker(adapter)
@@ -1009,9 +1061,51 @@ def test_non_writer_completes_save_without_submitting(fake_lmcache_modules):
     worker._submit_save(request, object())
 
     assert adapter.saves == []
-    assert worker.get_finished().finished_saving == {operation}
+    output = worker.get_finished()
+    assert output.finished_saving == {operation}
+    assert {
+        completion.operation_id.ranges
+        for completion in output.connector_completions
+        if completion.channel == mp_connector.DENSE_PAGE_SOURCE_SAFE_CHANNEL
+    } == {((0, 8),)}
     with pytest.raises(RuntimeError, match="duplicate LMCache MP save"):
         worker._submit_save(request, object())
+
+
+def test_collapsed_tp_early_release_waits_only_for_the_single_writer_dma(
+    fake_lmcache_modules,
+):
+    operation = SaveOperationId(req_id=91, generation=1)
+    request = LMCacheReqMeta(
+        req_id=91,
+        token_ids=list(range(16)),
+        block_ids=[40, 41, 42, 43],
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        save_operation=operation,
+    )
+    writer = _worker(_WorkerAdapter())
+    non_writer = _worker(_WorkerAdapter())
+    non_writer._is_kv_writer = False
+    writer._submit_save(request, object())
+    non_writer._submit_save(request, object())
+    writer_future = writer._pending_saves["save:91:1"].future
+    writer_future.completed_ranges = [(0, 8)]
+
+    aggregator = KVOutputAggregator(world_size=2)
+    first = aggregator.aggregate([writer.get_finished(), non_writer.get_finished()])
+    assert {
+        completion.operation_id.ranges
+        for completion in first.connector_completions
+        if completion.channel == mp_connector.DENSE_PAGE_SOURCE_SAFE_CHANNEL
+    } == {((0, 8),)}
+
+    writer_future.completed_ranges = [(8, 16)]
+    second = aggregator.aggregate([writer.get_finished(), non_writer.get_finished()])
+    assert {
+        completion.operation_id.ranges
+        for completion in second.connector_completions
+        if completion.channel == mp_connector.DENSE_PAGE_SOURCE_SAFE_CHANNEL
+    } == {((8, 16),)}
 
 
 def test_worker_tracks_two_load_generations_for_one_raw_request(
