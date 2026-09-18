@@ -33,19 +33,16 @@ CONC=1    # then 2, 4, 5, 8, 10, 12, 15, 20, 24, 28, 32
 
 ```bash
 env \
-  NCCL_IB_DISABLE=1 \
-  RCCL_IB_DISABLE=1 \
   AITER_QUICK_REDUCE_QUANTIZATION=INT4 \
-  AITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0 \
   ATOM_FORCE_ATTN_TRITON=1 \
   AITER_LOG_LEVEL=WARNING \
-  ATOM_GC_THRESHOLD=20000,50,50 \
   python3 -u -m atom.entrypoints.openai_server \
     --model "$FP4_TARGET" --served-model-name "$FP4_TARGET" \
     --host 0.0.0.0 --port 8896 --server-port 8890 \
     --tensor-parallel-size 4 \
     --trust-remote-code \
     --kv_cache_dtype fp8 \
+    --index-cache-dtype fp8 \
     --gpu-memory-utilization 0.9 \
     --block-size 128 \
     --max-num-batched-tokens 32768 \
@@ -57,7 +54,7 @@ env \
     --method eagle3 \
     --draft-model "$DRAFT" \
     --num-speculative-tokens 3 \
-    --spec-decode-acceptance-rate 0.5933 \
+    --spec-decode-acceptance-length 2.78 \
   > server_c${CONC}.log 2>&1 &
 ```
 
@@ -101,15 +98,7 @@ mkdir -p "$ART"
 export AIPERF_HTTP_TCP_USER_TIMEOUT=900000
 export AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800
 export AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=1800
-export AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT=300
-export AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES=0
 export AIPERF_UI_REALTIME_METRICS_ENABLED=true
-export AIPERF_FAILED_REQUEST_THRESHOLD=0.10
-export AIPERF_LIVE_FAILED_REQUEST_THRESHOLD=0.10
-export AIPERF_WARMUP_REQUESTS_PER_LANE=10
-export AIPERF_BENCHMARK_GRACE_PERIOD=30
-export AIPERF_SERVER_METRICS_URLS="http://localhost:8890/metrics"
-export AIPERF_REQUIRED_SERVER_METRIC_PREFIX="atom:"
 
 aiperf profile --scenario inferencex-agentx-mvp \
   --url http://localhost:8890 --endpoint /v1/chat/completions \
@@ -161,13 +150,9 @@ prefix hit finally breaks below 97% (91.8%) — the knee of this configuration.
 - `ATOM_FORCE_ATTN_TRITON=1` is not optional. Without it decode routes to the ASM paged-attention
   kernel, whose `qlen × gqa ≤ 16` constraint M3 violates (gqa=16, qlen=4 → 64), and the server
   dies at startup.
-- `NCCL_IB_DISABLE=1` / `RCCL_IB_DISABLE=1` are for single-node TP4. The container bind-mounts the
-  host ionic RDMA provider over its own rdma-core and RCCL GP-faults inside `libibverbs`→`libionic`
-  when it probes IB devices at worker init — every ModelRunner dies with `exitcode=-11` right after
-  the Gloo handshake, before any weight load. TP4 is intra-node XGMI only, so nothing is lost.
 - `--enable-prefix-caching` is on, a deliberate deviation from CI's `--no-enable_prefix_caching`.
   CI's random ISL/OSL workloads do not reuse prefixes; agentic replay is built on prefix reuse.
-- `--spec-decode-acceptance-rate` is performance-only: the draft and the verify still run, but
-  which draft tokens commit is fixed to the target rate instead of the draft head's real
+- `--spec-decode-acceptance-length` is performance-only: the draft and the verify still run, but
+  which draft tokens commit is fixed to the target length instead of the draft head's real
   agreement. It invalidates accuracy, and the acceptance figure in the server log becomes a
   restatement of the constant rather than a measurement.
