@@ -9,8 +9,9 @@ as it measures the serving system.
 `--spec-decode-acceptance-length` takes that variable out. The rejection sampler
 stops comparing draft tokens against the target and instead accepts them with a
 fixed per-position probability, chosen so the run converges on the mean
-acceptance length you asked for. What stays under measurement is the system:
-attention, scheduling, graph capture, and the drafter's own cost.
+acceptance length you asked for. Generated tokens use one fixed fake token ID
+throughout target decoding and draft feedback. Attention, scheduling, graph
+capture, and the drafter still execute with that synthetic token stream.
 
 Two situations call for it:
 
@@ -102,8 +103,24 @@ else. This is what vLLM resolves `synthetic_acceptance_length` to and what
 SGLang's `match-expected` draws, so the accepted-length *distribution* matches
 across engines and not merely its mean.
 
-Accepted positions emit the draft's own token IDs, so the drafter still runs and
-is still paid for on every step. Only the accept/reject decision is synthetic.
+All emitted positions use the same fake token ID: accepted drafts, rejection
+corrections, bonus tokens, and the first token sampled after prefill. The engine
+chooses the lowest ID shared by the target and draft vocabularies that is not a
+configured BOS, EOS, padding, or stop token, and logs it at startup. No new flag
+is needed; both acceptance flags enable this behavior, including rate `0`.
+
+The fake ID is fed into the next target forward and every subsequent MTP/EAGLE
+draft iteration. DSpark exports the same ID for every proposed position. Target
+decode graph padding also uses that ID. Original prompt tokens, including
+successor tokens used to build draft KV across prefill chunks, retain their
+actual IDs. The target and draft models and their output heads still execute.
+
+Repeated fake tokens can reduce the number of distinct experts loaded by MoE
+operators. Token-ID-based routing, such as DeepSeek-V4's hash layers, selects
+the same experts for those tokens. Hidden-state-based routers also depend on
+context and position, so identical IDs do not guarantee identical routing in
+every layer. Throughput from this mode measures a synthetic, repetitive-token
+workload; it is not representative of the expert load from ordinary text.
 
 ## Confirming the run hit the target
 
@@ -157,8 +174,8 @@ ATOM replays them; it does not collect them.
 
 ## Restrictions
 
-**No accuracy evaluation.** Accepted tokens come from the draft without ever
-being compared against the target, so anything measuring quality — `lm_eval`,
+**No accuracy evaluation.** Generated tokens are fixed fake IDs without being
+compared against the target, so anything measuring quality — `lm_eval`,
 gsm8k, a golden-output diff — is measuring noise.
 
 **Not with the DSpark confidence scheduler.** The confidence scheduler
@@ -185,13 +202,23 @@ whichever knob was set, converts a rate into a length, and calls
 the per-position unconditional rates. Everything downstream reads only the
 resolved `synthetic_acceptance_rates`, so neither spelling survives past config.
 
-`rejection_sample` then dispatches `rejection_synthetic_sample_kernel` in place
+`resolve_synthetic_token_id` (`atom/spec_decode/synthetic.py`) selects the shared
+fake ID once during runner and drafter initialization. Before target metadata
+is constructed, `ModelRunner.prepare_model` fills the decode input buffer with
+that ID, including padded graph rows. This covers deferred feedback, newly
+admitted requests, and eager and graph execution. Prefill sampling seeds the
+first draft with the same ID. Serial draft heads replace their sampled IDs
+before feeding the next iteration; captured draft heads record the replacement
+inside their graph. DSpark replaces the block head's exported IDs.
+
+`rejection_sample` dispatches `rejection_synthetic_sample_kernel` in place
 of the greedy kernel. The kernel walks positions in order and stops at the first
 rejection, so it needs `P(accept i | accepted through i-1)` rather than the
 unconditional rates the config carries; the conversion happens once and is
-cached per device. On rejection it emits the target's argmax as the correction
-token, keeping the output layout and `num_bonus_tokens` semantics identical to
-the real path.
+cached per device. It emits the shared fake ID at each valid output position,
+including the correction or bonus, and retains `-1` in rejected/padded positions.
+The output layout and `num_bonus_tokens` semantics are identical to the real
+path. Acceptance probabilities and the per-step RNG schedule are unchanged.
 
 The accept/reject draw has to be bit-identical on every TP rank. `sampled_tokens`
 is broadcast from rank 0 while `num_bonus_tokens` stays local, so a per-rank
