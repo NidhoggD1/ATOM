@@ -307,7 +307,7 @@ def test_scheduler_reserves_locks_for_every_collapsed_tp_reader(
             self.__dict__.update(kwargs)
 
         def _create_key(self, *_args, **_kwargs):
-            return Key()
+            return Key(self.num_kv_readers)
 
     adapter_module = types.ModuleType("lmcache.integration.atom")
     adapter_module.AtomMPParallelConfig = AtomMPParallelConfig

@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 from contextlib import ExitStack
+from typing import Any
 
 import torch
 import zmq
@@ -224,7 +225,7 @@ class EngineCore:
     def _send_ready_signal(self):
         self.output_queue.put_nowait(("READY", self._ready_payload()))
 
-    def _ready_payload(self) -> dict[str, int] | None:
+    def _ready_payload(self) -> dict[str, Any] | None:
         """Startup facts the frontend cannot read off its own Config.
 
         `num_kvcache_blocks` is measured in this subprocess, so the API server's
@@ -235,7 +236,16 @@ class EngineCore:
         """
         if self.scheduler is None:
             return None
-        return {"max_pool_tokens": self.scheduler.block_manager.max_pool_tokens}
+        payload: dict[str, Any] = {
+            "max_pool_tokens": self.scheduler.block_manager.max_pool_tokens
+        }
+        connector = getattr(self.scheduler, "kv_connector", None)
+        descriptor_getter = getattr(connector, "get_route_lookup_descriptor", None)
+        if callable(descriptor_getter):
+            descriptor = descriptor_getter()
+            if descriptor is not None:
+                payload["lmcache_mp_route_lookup"] = descriptor
+        return payload
 
     def _post_model_load_hook(self):
         """Called after ModelRunner is initialized (model loaded) but before
@@ -742,9 +752,9 @@ class DPEngineCoreProc(EngineCore):
         # only by coincidence on one node: the second node of a 2x4 run has
         # local ranks 0..3 against global ranks 4..7.
         assert 0 <= dp_rank < dp_size, f"dp_rank={dp_rank} outside [0,{dp_size})"
-        assert (
-            0 <= local_dp_rank < local_dp_size
-        ), f"local_dp_rank={local_dp_rank} outside [0,{local_dp_size})"
+        assert 0 <= local_dp_rank < local_dp_size, (
+            f"local_dp_rank={local_dp_rank} outside [0,{local_dp_size})"
+        )
 
         self.dp_rank = dp_rank
         self.dp_group = config.parallel_config.stateless_init_dp_group()

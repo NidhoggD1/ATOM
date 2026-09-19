@@ -58,6 +58,61 @@ class InternodeDPSocketPlan:
     control_port: int
 
 
+@dataclass(frozen=True)
+class _LMCacheDPRouteConfig:
+    """Validated knobs for existing-session spill through LMCache L1."""
+
+    enabled: bool = False
+    min_gain_tokens: int = 8192
+    lookup_timeout: float = 0.25
+
+
+_MISSING_DP_SESSION_STATE = object()
+
+
+@dataclass(frozen=True)
+class _DPDispatchRollback:
+    """State to undo when one selected request was not handed to an engine."""
+
+    dp_rank: int
+    session_id: str | None
+    previous_owner: object
+    previous_prompt_tokens: object
+    route_counter_deltas: tuple[tuple[str, int], ...]
+    prefix_credit: int
+
+
+def _lmcache_dp_route_config(config: Config) -> _LMCacheDPRouteConfig:
+    """Read LMCache DP-routing options without importing connector internals."""
+    kvc = getattr(config, "kv_transfer_config", {}) or {}
+    extra = kvc.get("kv_connector_extra_config", {}) or {}
+    if not isinstance(extra, dict):
+        raise TypeError("kv_connector_extra_config must be a dictionary")
+
+    enabled = extra.get("lmcache.mp.dp_route_enabled", False)
+    if type(enabled) is not bool:
+        raise TypeError("lmcache.mp.dp_route_enabled must be a boolean")
+
+    min_gain = extra.get("lmcache.mp.dp_route_min_gain_tokens", 8192)
+    if type(min_gain) is not int or min_gain < 0:
+        raise ValueError(
+            "lmcache.mp.dp_route_min_gain_tokens must be a non-negative integer"
+        )
+
+    lookup_timeout = extra.get("lmcache.mp.dp_route_lookup_timeout", 0.25)
+    if isinstance(lookup_timeout, bool):
+        raise TypeError("lmcache.mp.dp_route_lookup_timeout must be a number")
+    lookup_timeout = float(lookup_timeout)
+    if lookup_timeout <= 0:
+        raise ValueError("lmcache.mp.dp_route_lookup_timeout must be positive")
+
+    return _LMCacheDPRouteConfig(
+        enabled=enabled,
+        min_gain_tokens=min_gain,
+        lookup_timeout=lookup_timeout,
+    )
+
+
 def build_internode_dp_socket_plan(
     *, engine_count: int, master_port: int
 ) -> list[InternodeDPSocketPlan]:
@@ -221,6 +276,17 @@ class CoreManager:
         # is built after env/args are finalized), not a runtime-tunable knob.
         self._dp_lb_req_equiv = envs.ATOM_DP_LB_REQ_EQUIV
         self._dp_session_affinity_enabled = envs.ATOM_DP_SESSION_AFFINITY
+        lmcache_route = _lmcache_dp_route_config(config)
+        if lmcache_route.enabled and not self._dp_session_affinity_enabled:
+            raise ValueError(
+                "lmcache.mp.dp_route_enabled requires ATOM DP session affinity"
+            )
+        self._dp_lmcache_route_enabled = lmcache_route.enabled
+        self._dp_lmcache_route_min_gain_tokens = lmcache_route.min_gain_tokens
+        self._dp_lmcache_route_lookup_timeout = lmcache_route.lookup_timeout
+        self._dp_lmcache_route_probe = None
+        self._dp_lmcache_route_probe_lock = Lock()
+        self._dp_lmcache_route_descriptors: list[dict[str, object] | None] = []
         self._dp_prefix_hints = None
         if envs.ATOM_DP_PREFIX_ROUTING:
             if not self._dp_session_affinity_enabled:
@@ -244,9 +310,8 @@ class CoreManager:
         self._dp_prefix_routed_total = 0
         self._dp_prefix_estimated_tokens = 0
         # Session id -> rank whose local prefix cache owns the session. Owners
-        # are immutable for the lifetime of the process: moving one turn to a
-        # light rank discards the dominant optimization in agentic workloads,
-        # namely reuse of the accumulated conversation prefix.
+        # normally remain fixed. Native LMCache routing may move one only after
+        # proving a reusable PAGE+STATE prefix and enough queueing benefit.
         self._dp_session_owners: dict[str, int] = {}
         # Last prompt length observed for each sticky session.  A later turn on
         # the same owner normally reuses the old prompt, so only its positive
@@ -260,6 +325,10 @@ class CoreManager:
             # this at zero. It makes an accidental reintroduction of spill
             # visible in benchmark artifacts.
             "affinity_spill_total": 0,
+            "lmcache_probe_hit_total": 0,
+            "lmcache_probe_miss_total": 0,
+            "lmcache_probe_failure_total": 0,
+            "lmcache_probe_hit_tokens": 0,
             "affinity_parent_ignored_total": 0,
             "explicit_total": 0,
             "load_balanced_total": 0,
@@ -319,9 +388,9 @@ class CoreManager:
             config.tensor_parallel_size = 1
         else:
             dp_size = config.parallel_config.data_parallel_size
-            assert not (
-                pp_size > 1 and dp_size > 1
-            ), "Pipeline parallel combined with data parallel is not supported yet."
+            assert not (pp_size > 1 and dp_size > 1), (
+                "Pipeline parallel combined with data parallel is not supported yet."
+            )
             local_engine_count = len(rank_assignments) * pp_size
 
         global_engine_count = (
@@ -492,6 +561,7 @@ class CoreManager:
                     self.shutdown_paths.append(get_open_zmq_inproc_path())
 
                 self._wait_for_all_ready_signals()
+                self._initialize_dp_lmcache_route_probe()
                 logger.info(
                     f"{self.label}: All EngineCores are fully initialized and ready"
                 )
@@ -534,6 +604,15 @@ class CoreManager:
 
     def _record_ready_payload(self, data) -> None:
         """Fold one rank's READY facts into the manager's view of capacity."""
+        if data is not None and not isinstance(data, dict):
+            raise TypeError("EngineCore READY payload must be a dictionary or None")
+        if self._dp_lmcache_route_enabled:
+            descriptor = data.get("lmcache_mp_route_lookup") if data else None
+            if descriptor is not None and not isinstance(descriptor, dict):
+                raise TypeError(
+                    "LMCache route lookup descriptor in READY must be a dictionary"
+                )
+            self._dp_lmcache_route_descriptors.append(descriptor)
         if not data:
             return
         reported = data.get("max_pool_tokens")
@@ -543,6 +622,40 @@ class CoreManager:
             self.max_pool_tokens = reported
         else:
             self.max_pool_tokens = min(self.max_pool_tokens, reported)
+
+    def _initialize_dp_lmcache_route_probe(self) -> None:
+        """Create one frontend L1 probe after every rank agrees on its namespace."""
+        if not self._dp_lmcache_route_enabled:
+            return
+        if len(self._dp_lmcache_route_descriptors) != len(self.output_sockets):
+            raise RuntimeError(
+                "LMCache DP routing did not receive one route descriptor per rank"
+            )
+        if any(value is None for value in self._dp_lmcache_route_descriptors):
+            raise RuntimeError(
+                "lmcache.mp.dp_route_enabled requires native PAGE+STATE LMCache MP "
+                "on every DP rank"
+            )
+        descriptor = self._dp_lmcache_route_descriptors[0]
+        assert descriptor is not None
+        if any(value != descriptor for value in self._dp_lmcache_route_descriptors[1:]):
+            raise RuntimeError(
+                "LMCache DP ranks advertised different route lookup descriptors"
+            )
+
+        from lmcache.integration.atom import AtomMPSchedulerAdapter
+
+        self._dp_lmcache_route_probe = (
+            AtomMPSchedulerAdapter.from_route_lookup_descriptor(descriptor, self.ctx)
+        )
+        logger.info(
+            "%s: LMCache CPU-aware DP routing enabled: min_gain_tokens=%d "
+            "lookup_timeout_s=%s chunk_tokens=%d",
+            self.label,
+            self._dp_lmcache_route_min_gain_tokens,
+            self._dp_lmcache_route_lookup_timeout,
+            descriptor["lmcache_tokens_per_chunk"],
+        )
 
     def _wait_for_all_ready_signals(self):
         """Wait for READY signals from all DP ranks in parallel (no timeout)."""
@@ -767,6 +880,18 @@ class CoreManager:
             return
         self._closed = True
 
+        route_probe = getattr(self, "_dp_lmcache_route_probe", None)
+        self._dp_lmcache_route_probe = None
+        if route_probe is not None:
+            try:
+                route_probe.shutdown()
+            except Exception:
+                logger.warning(
+                    "%s: failed to close LMCache DP route probe",
+                    self.label,
+                    exc_info=True,
+                )
+
         logger.info(
             f"{self.label}: Shutting down {len(self.input_sockets)} EngineCores"
         )
@@ -935,6 +1060,7 @@ class CoreManager:
         # load. The resolved hints are reused in the loop below to avoid a second
         # getattr/int pass per seq.
         hints = self._resolve_and_validate_hints(seqs)
+        lmcache_hits, lmcache_probe_outcomes = self._probe_dp_lmcache_hits(seqs, hints)
 
         prefix_hints = self._dp_prefix_hints
         prefix_keys = None
@@ -953,8 +1079,17 @@ class CoreManager:
         )
         engine_count = self._routable_engine_count
         dp_seqs = [[] for _ in range(engine_count)]
+        route_rollbacks: list[_DPDispatchRollback] = []
         reqs_snapshot = tokens_snapshot = None
         with self._lb_lock:
+            for outcome, hit_tokens in zip(lmcache_probe_outcomes, lmcache_hits):
+                if outcome is None:
+                    continue
+                self._dp_route_counters[f"lmcache_probe_{outcome}_total"] += 1
+                if outcome == "hit":
+                    self._dp_route_counters["lmcache_probe_hit_tokens"] += int(
+                        hit_tokens or 0
+                    )
             for index, (seq, hint) in enumerate(zip(seqs, hints)):
                 cached_tokens = None
                 if prefix_keys is not None and hint is None:
@@ -964,10 +1099,35 @@ class CoreManager:
                         cached_tokens = prefix_hints.match(
                             prefix_keys[index], time.monotonic()
                         )
-                dp_rank = self._select_dp_rank_for_seq_locked(seq, hint, cached_tokens)
+                session_id = getattr(seq, "dp_session_id", None)
+                previous_session_owner = self._dp_session_owners.get(
+                    session_id, _MISSING_DP_SESSION_STATE
+                )
+                previous_session_prompt = self._dp_session_prompt_tokens.get(
+                    session_id, _MISSING_DP_SESSION_STATE
+                )
+                previous_owner = self._dp_session_owners.get(session_id)
+                counters_before = dict(self._dp_route_counters)
+                dp_rank = self._select_dp_rank_for_seq_locked(
+                    seq,
+                    hint,
+                    cached_tokens,
+                    lmcache_hit_tokens=lmcache_hits[index],
+                )
                 prefix_credit = cached_tokens[dp_rank] if cached_tokens else 0
+                lmcache_credit = 0
+                if (
+                    lmcache_hits[index]
+                    and previous_owner is not None
+                    and dp_rank != previous_owner
+                ):
+                    lmcache_credit = int(lmcache_hits[index])
                 if track_load:
-                    self._charge_seq_load_locked(seq, dp_rank, prefix_credit)
+                    self._charge_seq_load_locked(
+                        seq,
+                        dp_rank,
+                        max(prefix_credit, lmcache_credit),
+                    )
                 if prefix_keys is not None and prefix_keys[index]:
                     self._pending_dp_prefix_hints[seq.id] = (
                         dp_rank,
@@ -989,6 +1149,20 @@ class CoreManager:
                             self._dp_prefix_estimated_tokens,
                         )
                 dp_seqs[dp_rank].append(seq)
+                route_rollbacks.append(
+                    _DPDispatchRollback(
+                        dp_rank=dp_rank,
+                        session_id=session_id,
+                        previous_owner=previous_session_owner,
+                        previous_prompt_tokens=previous_session_prompt,
+                        route_counter_deltas=tuple(
+                            (name, value - counters_before[name])
+                            for name, value in self._dp_route_counters.items()
+                            if value != counters_before[name]
+                        ),
+                        prefix_credit=prefix_credit,
+                    )
+                )
             # Copy the counters under the lock so the snapshot log below is a
             # consistent instant, not a torn read racing _release_seq_load.
             if track_load:
@@ -1028,6 +1202,30 @@ class CoreManager:
                     if rank_seqs and not dispatched[dp_rank]:
                         for seq in rank_seqs:
                             self._release_seq_load(seq.id)
+            with self._lb_lock:
+                for rollback in reversed(route_rollbacks):
+                    if dispatched[rollback.dp_rank]:
+                        continue
+                    session_id = rollback.session_id
+                    if session_id:
+                        if rollback.previous_owner is _MISSING_DP_SESSION_STATE:
+                            self._dp_session_owners.pop(session_id, None)
+                        else:
+                            self._dp_session_owners[session_id] = int(
+                                rollback.previous_owner
+                            )
+                        if rollback.previous_prompt_tokens is _MISSING_DP_SESSION_STATE:
+                            self._dp_session_prompt_tokens.pop(session_id, None)
+                        else:
+                            self._dp_session_prompt_tokens[session_id] = int(
+                                rollback.previous_prompt_tokens
+                            )
+                    for name, delta in rollback.route_counter_deltas:
+                        self._dp_route_counters[name] -= delta
+                    self._rank_routed_total[rollback.dp_rank] -= 1
+                    if rollback.prefix_credit:
+                        self._dp_prefix_routed_total -= 1
+                        self._dp_prefix_estimated_tokens -= rollback.prefix_credit
             raise
 
         # One line per add: the per-rank delta this add placed, plus (for the
@@ -1043,6 +1241,60 @@ class CoreManager:
             )
         else:
             logger.info("%s: add %s", self.label, ", ".join(added))
+
+    def _probe_dp_lmcache_hits(
+        self,
+        seqs: list[Sequence],
+        hints: list[int | None],
+    ) -> tuple[list[int | None], list[str | None]]:
+        """Probe existing sticky sessions outside ``_lb_lock``.
+
+        Returns one optional hit length and one outcome label per sequence.
+        Only requests that already have a valid owner are probed. The separate
+        probe lock serializes the single ZMQ client without blocking decode-side
+        load release on the router lock.
+        """
+        hits: list[int | None] = [None] * len(seqs)
+        outcomes: list[str | None] = [None] * len(seqs)
+        probe = self._dp_lmcache_route_probe
+        if not self._dp_lmcache_route_enabled or probe is None:
+            return hits, outcomes
+
+        with self._lb_lock:
+            candidates = [
+                index
+                for index, (seq, hint) in enumerate(zip(seqs, hints))
+                if hint is None
+                and (session_id := getattr(seq, "dp_session_id", None))
+                and 0
+                <= self._dp_session_owners.get(session_id, -1)
+                < self._routable_engine_count
+            ]
+
+        for index in candidates:
+            seq = seqs[index]
+            prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
+            try:
+                token_ids = list(seq.token_ids[:prompt_tokens])
+                with self._dp_lmcache_route_probe_lock:
+                    hit_tokens = int(
+                        probe.probe_l1_hit_tokens(
+                            token_ids,
+                            timeout=self._dp_lmcache_route_lookup_timeout,
+                        )
+                    )
+                hit_tokens = max(0, min(prompt_tokens, hit_tokens))
+                hits[index] = hit_tokens
+                outcomes[index] = "hit" if hit_tokens else "miss"
+            except Exception:
+                outcomes[index] = "failure"
+                logger.warning(
+                    "%s: LMCache DP route probe failed for seq=%s; keeping owner",
+                    self.label,
+                    seq.id,
+                    exc_info=True,
+                )
+        return hits, outcomes
 
     def _select_dp_rank_locked(self) -> int:
         """Pick a DP engine rank for a new request. Caller must hold _lb_lock.
@@ -1159,18 +1411,60 @@ class CoreManager:
         self._rank_routed_total[rank] += 1
         return rank
 
+    def _select_lmcache_spill_rank_locked(
+        self,
+        session_id: str,
+        owner: int,
+        prompt_tokens: int,
+        hit_tokens: int,
+    ) -> tuple[int, int, int]:
+        """Return the cheapest alternate rank and both token-equivalent scores."""
+        previous_prompt = self._dp_session_prompt_tokens.get(session_id, 0)
+        owner_score = (
+            self._rank_tokens[owner]
+            + self._dp_lb_req_equiv * self._rank_reqs[owner]
+            + max(0, prompt_tokens - previous_prompt)
+        )
+        alternate_debt = max(0, prompt_tokens - hit_tokens)
+        best_rank = owner
+        best_score = owner_score
+        best_hash = -1
+        session_key = str(session_id).encode("utf-8")
+        for rank in range(self._routable_engine_count):
+            if rank == owner:
+                continue
+            score = (
+                self._rank_tokens[rank]
+                + self._dp_lb_req_equiv * self._rank_reqs[rank]
+                + alternate_debt
+            )
+            tie_hash = int.from_bytes(
+                hashlib.blake2b(
+                    session_key + rank.to_bytes(4, "little"), digest_size=8
+                ).digest(),
+                "little",
+            )
+            if score < best_score or (
+                score == best_score and best_rank != owner and tie_hash > best_hash
+            ):
+                best_rank = rank
+                best_score = score
+                best_hash = tie_hash
+        return best_rank, owner_score, best_score
+
     def _select_dp_rank_for_seq_locked(
         self,
         seq: Sequence,
         explicit_rank: int | None,
         cached_tokens: list[int] | None = None,
+        *,
+        lmcache_hit_tokens: int | None = None,
     ) -> int:
-        """Route one sequence using explicit hint, strict owner, then load.
+        """Route one sequence using explicit hint, cache-safe owner, then load.
 
-        This intentionally matches SGLang Model Gateway's agentic routing
-        semantics: a stable correlation/session id selects one DP rank, and
-        every later turn stays there. Load cannot move an existing session;
-        doing so turns a cheap cache hit into a potentially huge prefill.
+        A stable correlation/session id selects one DP rank. Existing turns stay
+        there unless an L1-only LMCache probe proves a complete PAGE+STATE
+        prefix and another rank wins by the configured minimum gain.
 
         Parent lineage alone does not affect placement. Optional prefix hints
         require actual token-prefix equality and compete with queued work in
@@ -1216,6 +1510,37 @@ class CoreManager:
             )
             return self._record_dp_route_locked("affinity_new_total", owner)
 
+        if self._dp_lmcache_route_enabled and lmcache_hit_tokens:
+            prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
+            hit_tokens = min(prompt_tokens, int(lmcache_hit_tokens))
+            alternate, owner_score, alternate_score = (
+                self._select_lmcache_spill_rank_locked(
+                    session_id,
+                    owner,
+                    prompt_tokens,
+                    hit_tokens,
+                )
+            )
+            if (
+                alternate != owner
+                and alternate_score + self._dp_lmcache_route_min_gain_tokens
+                < owner_score
+            ):
+                self._dp_session_owners[session_id] = alternate
+                logger.info(
+                    "%s: LMCache affinity spill session=%s rank%d->rank%d "
+                    "hit_tokens=%d owner_score=%d alternate_score=%d min_gain=%d",
+                    self.label,
+                    session_id,
+                    owner,
+                    alternate,
+                    hit_tokens,
+                    owner_score,
+                    alternate_score,
+                    self._dp_lmcache_route_min_gain_tokens,
+                )
+                return self._record_dp_route_locked("affinity_spill_total", alternate)
+
         return self._record_dp_route_locked("affinity_owner_hit_total", owner)
 
     def get_dp_router_statistics(self) -> dict:
@@ -1244,7 +1569,7 @@ class CoreManager:
         session_id = getattr(seq, "dp_session_id", None)
         if self._dp_session_affinity_enabled and session_id:
             previous_prompt_tokens = self._dp_session_prompt_tokens.get(session_id)
-            if previous_prompt_tokens is not None:
+            if previous_prompt_tokens is not None and cached_prefix_tokens == 0:
                 # Agentic turns normally extend their previous prompt.  Charge
                 # only that extension; request-equivalent load still accounts
                 # for lookup/decode pressure when the delta is zero.

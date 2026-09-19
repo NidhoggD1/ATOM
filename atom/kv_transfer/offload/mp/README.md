@@ -51,7 +51,10 @@ python -m atom.entrypoints.openai_server \
     "kv_connector_extra_config": {
       "lmcache.mp.host": "tcp://127.0.0.1",
       "lmcache.mp.port": 5555,
-      "lmcache.mp.tp_rank_collapse": true
+      "lmcache.mp.tp_rank_collapse": true,
+      "lmcache.mp.dp_route_enabled": true,
+      "lmcache.mp.dp_route_min_gain_tokens": 8192,
+      "lmcache.mp.dp_route_lookup_timeout": 0.25
     }
   }'
 ```
@@ -61,6 +64,18 @@ align to ATOM's PAGE/hash block size. Native checkpoints are produced by the
 attention backend's existing checkpoint policy, so their cadence must provide
 the desired reusable boundaries. A prefix is loadable only where PAGE KV and a
 complete STATE checkpoint both exist on all TP ranks.
+
+With `ATOM_DP_SESSION_AFFINITY=1`, the optional
+`lmcache.mp.dp_route_enabled` setting lets an existing session move away from
+its owner only after the MP server confirms a complete L1 PAGE+STATE prefix.
+The frontend compares the owner's queued token-equivalent load plus prompt
+growth against the lightest alternate rank plus the uncached prompt suffix. It
+spills only when the alternate wins by more than
+`lmcache.mp.dp_route_min_gain_tokens` (default 8192). The L1 probe is bounded by
+`lmcache.mp.dp_route_lookup_timeout` seconds (default 0.25), creates no LMCache
+request session, releases its temporary read locks before returning, and fails
+closed to the current owner on a miss, timeout, or error. Explicit
+`data_parallel_rank` placement remains authoritative.
 
 `lmcache.mp.max_pinned_state_bytes` optionally limits native checkpoint sources
 and temporary restore images together. Its default is

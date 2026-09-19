@@ -69,6 +69,9 @@ class Adapter:
     def end_session(self, request_id):
         self.ended.append(request_id)
 
+    def get_route_lookup_descriptor(self):
+        return {"version": 1, "model_name": "native-test"}
+
     def shutdown(self):
         self.closed = True
 
@@ -110,6 +113,14 @@ def make_scheduler(monkeypatch, *, capacity=2, budget=60, units=30, role="offloa
     assert connections == [checkpoints.store.spec]
     scheduler._min_load_tokens = 0
     return scheduler, checkpoints, adapter
+
+
+def test_native_scheduler_exports_route_lookup_descriptor(monkeypatch):
+    scheduler, _checkpoints, adapter = make_scheduler(monkeypatch)
+
+    assert scheduler.get_route_lookup_descriptor() == (
+        adapter.get_route_lookup_descriptor()
+    )
 
 
 def sequence(request_id=1, *, count=24, computed=16, token_offset=0):

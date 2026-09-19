@@ -152,6 +152,13 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
     def request_finished(self, seq: Any) -> None:
         self._require_impl().request_finished(seq)
 
+    def get_route_lookup_descriptor(self) -> dict[str, Any] | None:
+        """Return the bound native LMCache namespace used by route probes."""
+        getter = getattr(self._require_impl(), "get_route_lookup_descriptor", None)
+        if not callable(getter):
+            return None
+        return getter()
+
     def __getattr__(self, name: str) -> Any:
         impl = self.__dict__.get("_impl")
         if impl is None:

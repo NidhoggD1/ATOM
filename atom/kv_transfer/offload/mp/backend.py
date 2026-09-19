@@ -18,7 +18,7 @@ import os
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -307,15 +307,8 @@ def _make_scheduler_adapter(config: Any, *, checkpoint_spec: Any = None) -> Any:
     native_state = checkpoint_spec is not None
     num_kv_readers = _tp_replication_factor(config, native_state=native_state)
 
-    class _ReaderAwareSchedulerAdapter(AtomMPSchedulerAdapter):
-        """Reserve one LMCache read lock for every collapsed TP consumer."""
-
-        def _create_key(self, *args: Any, **kwargs: Any) -> Any:
-            key = super()._create_key(*args, **kwargs)
-            return replace(key, num_kv_readers=num_kv_readers)
-
     extra = _extra_config(config)
-    return _ReaderAwareSchedulerAdapter(
+    return AtomMPSchedulerAdapter(
         server_url=_server_urls(config)[0],
         context=zmq.Context.instance(),
         model_name=(
@@ -326,6 +319,7 @@ def _make_scheduler_adapter(config: Any, *, checkpoint_spec: Any = None) -> Any:
         block_size=int(config.kv_cache_block_size),
         parallel_config=_parallel_strategy(config, 0, native_state=native_state),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
+        num_kv_readers=num_kv_readers,
     )
 
 
@@ -1082,9 +1076,7 @@ class LMCacheMPConnector(KVConnectorBase):
                                         (
                                             (
                                                 chunk_start,
-                                                min(
-                                                    chunk_start + self.chunk_size, end
-                                                ),
+                                                min(chunk_start + self.chunk_size, end),
                                             ),
                                         ),
                                     ),
@@ -1142,6 +1134,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 poll_interval=poll_interval,
             )
             self._mp_adapter = adapter
+            self._checkpoint_spec = checkpoint_spec
             super().__init__(
                 config,
                 chunk_size=int(adapter.lmcache_tokens_per_chunk),
@@ -1152,6 +1145,17 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             if callable(shutdown):
                 shutdown()
             raise
+
+    def get_route_lookup_descriptor(self) -> dict[str, Any] | None:
+        """Describe the exact native PAGE+STATE namespace for DP routing.
+
+        Returns ``None`` for generic PAGE-only offload. Existing-session spill
+        is enabled only when the route probe can prove a complete native
+        checkpoint boundary, not merely PAGE presence.
+        """
+        if self._checkpoint_spec is None:
+            return None
+        return self._mp_adapter.get_route_lookup_descriptor()
 
     def save_abandon_timeout_s(self) -> float:
         """A timeout cannot prove that a remote MP DMA stopped reading HBM."""
