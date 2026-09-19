@@ -14,8 +14,9 @@ from __future__ import annotations
 import gc
 
 from prometheus_client import CollectorRegistry, generate_latest
+from prometheus_client.parser import text_string_to_metric_families
 
-from atom.entrypoints.openai.metrics import _gc_metrics
+from atom.entrypoints.openai.metrics import AtomMetricsExporter, _gc_metrics
 
 
 def _render() -> str:
@@ -82,3 +83,31 @@ def test_every_generation_is_labelled_rather_than_summed():
 
     for generation in ("0", "1", "2"):
         assert f'atom:gc_collections_total{{generation="{generation}"}}' in exposition
+
+
+def test_lmcache_dp_route_probe_counters_are_exported():
+    exporter = AtomMetricsExporter()
+    exporter.update(
+        {
+            "enabled": True,
+            "dp_router": {
+                "lmcache_probe_hit_total": 3,
+                "lmcache_probe_miss_total": 4,
+                "lmcache_probe_failure_total": 5,
+                "lmcache_probe_hit_tokens": 8192,
+            },
+        }
+    )
+
+    samples = {
+        sample.name: sample.value
+        for family in text_string_to_metric_families(exporter.render().decode())
+        for sample in family.samples
+        if sample.name.startswith("atom:dp_lmcache_probe_")
+    }
+    assert samples == {
+        "atom:dp_lmcache_probe_hit_total": 3,
+        "atom:dp_lmcache_probe_miss_total": 4,
+        "atom:dp_lmcache_probe_failure_total": 5,
+        "atom:dp_lmcache_probe_hit_tokens_total": 8192,
+    }

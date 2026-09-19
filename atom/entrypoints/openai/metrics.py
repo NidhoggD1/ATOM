@@ -229,6 +229,26 @@ class _AtomMetricsCollector:
                 ),
                 dp_router.get("load_balanced_total", 0),
             ),
+            (
+                "atom:dp_lmcache_probe_hit",
+                "Number of sticky-session route probes with an L1 cache hit.",
+                dp_router.get("lmcache_probe_hit_total", 0),
+            ),
+            (
+                "atom:dp_lmcache_probe_miss",
+                "Number of sticky-session route probes with no L1 cache hit.",
+                dp_router.get("lmcache_probe_miss_total", 0),
+            ),
+            (
+                "atom:dp_lmcache_probe_failure",
+                "Number of sticky-session route probes that failed or timed out.",
+                dp_router.get("lmcache_probe_failure_total", 0),
+            ),
+            (
+                "atom:dp_lmcache_probe_hit_tokens",
+                "Cumulative L1 hit tokens returned by sticky-session route probes.",
+                dp_router.get("lmcache_probe_hit_tokens", 0),
+            ),
         ):
             metric = CounterMetricFamily(name, documentation)
             metric.add_metric([], float(value))
