@@ -34,7 +34,10 @@ from atom.kv_transfer.disaggregation.types import (
     SaveSourceGroupId,
 )
 from atom.kv_transfer.offload import config as offcfg
-from atom.kv_transfer.offload._offload_common import validated_kv_role
+from atom.kv_transfer.offload._offload_common import (
+    max_pending_saves,
+    validated_kv_role,
+)
 from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_SOURCE_SAFE_CHANNEL,
     DENSE_PAGE_STORE_CHANNEL,
@@ -1140,6 +1143,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 chunk_size=int(adapter.lmcache_tokens_per_chunk),
                 lookup_client=lookup_client,
             )
+            self._max_pending_saves = max_pending_saves(
+                int(os.environ.get("OFFLOAD_COPY_WORKERS", "1") or 1)
+            )
         except Exception:
             shutdown = getattr(adapter, "shutdown", None)
             if callable(shutdown):
@@ -1156,6 +1162,14 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         if self._checkpoint_spec is None:
             return None
         return self._mp_adapter.get_route_lookup_descriptor()
+
+    def _may_emit_save(self) -> bool:
+        """Bound scheduler reservations to the MP worker queue capacity."""
+
+        return (
+            len(self._save_inflight) + len(self._save_committed)
+            < self._max_pending_saves
+        )
 
     def save_abandon_timeout_s(self) -> float:
         """A timeout cannot prove that a remote MP DMA stopped reading HBM."""

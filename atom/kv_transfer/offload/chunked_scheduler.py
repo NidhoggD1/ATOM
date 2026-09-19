@@ -8,6 +8,8 @@ from __future__ import annotations
 import logging
 import os
 import time
+from dataclasses import dataclass
+from math import ceil
 
 from atom.kv_transfer.disaggregation.base import KVConnectorSchedulerBase
 from atom.kv_transfer.disaggregation.types import (
@@ -28,11 +30,34 @@ from atom.kv_transfer.offload.metadata import (
     LoadSpec,
     SaveSpec,
 )
+from atom.kv_transfer.offload.save_admission import (
+    PrefixDemandKey,
+    PrefixDemandTracker,
+    load_save_admission_config,
+)
 
 logger = logging.getLogger("atom")
 
 DENSE_PAGE_SOURCE_SAFE_CHANNEL = "dense.page.source_safe"
 DENSE_PAGE_STORE_CHANNEL = "dense.page.store"
+
+
+@dataclass(frozen=True)
+class _ChunkedSaveCandidate:
+    sid: str
+    seq: object
+    generation: int
+    saved: int
+    aligned: int
+    observed_count: int
+    reusable_tokens: int
+    enqueued_at: float
+    finished: bool
+    held_blocks: int
+
+    @property
+    def dirty_tokens(self) -> int:
+        return max(0, self.aligned - self.saved)
 
 
 class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBase):
@@ -102,6 +127,34 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         # save. Subclasses may bound the number of outstanding saves through
         # `_may_emit_save`; resuming after this sid prevents starvation.
         self._save_rr_last: str | None = None
+        save_admission = load_save_admission_config()
+        self._save_policy = save_admission.policy
+        self._save_min_observed_count = save_admission.min_observed_count
+        self._save_aging_weight = save_admission.aging_weight
+        self._save_release_weight = save_admission.release_weight
+        self._prefix_demand = PrefixDemandTracker(
+            block_tokens=save_admission.demand_block_tokens,
+            max_entries=save_admission.demand_max_entries,
+            ttl_seconds=save_admission.demand_ttl_seconds,
+        )
+        self._save_demand_keys: dict[
+            str, tuple[object, tuple[PrefixDemandKey, ...]]
+        ] = {}
+        self._save_candidate_since: dict[str, tuple[object, float]] = {}
+        self._save_candidate_generation: dict[str, tuple[object, int]] = {}
+        self._save_candidate_nonce = 0
+        self._save_committed: dict[str, object] = {}
+        self._finished_save_requests: dict[str, object] = {}
+        self._finished_save_failed: set[str] = set()
+        self._save_inflight_since: dict[SaveOperationId, float] = {}
+        self.total_save_admitted = 0
+        self._save_drop_totals = {
+            "capacity": 0,
+            "low_value": 0,
+            "terminal_failure": 0,
+            "stale": 0,
+        }
+        self._save_drop_token_totals = dict.fromkeys(self._save_drop_totals, 0)
         # sid -> exact save generation.  Exact matching prevents a delayed TP
         # notification for an older request lifecycle from releasing the
         # current request's deferred blocks.
@@ -270,6 +323,25 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             entry = self._save_tracker.get(sid)
             if entry is None or entry[0] is not seq:
                 self._save_tracker[sid] = [seq, initial_saved]
+                now = time.monotonic()
+                demand_keys = (
+                    self._prefix_demand.observe(
+                        seq.token_ids,
+                        int(seq.num_prompt_tokens),
+                        now,
+                    )
+                    if self._save_policy == "priority"
+                    else ()
+                )
+                self._save_demand_keys[sid] = (seq, demand_keys)
+                self._save_candidate_generation[sid] = (
+                    seq,
+                    self._save_candidate_nonce,
+                )
+                self._save_candidate_nonce += 1
+                self._save_committed.pop(sid, None)
+                self._finished_save_requests.pop(sid, None)
+                self._finished_save_failed.discard(sid)
             else:
                 entry[1] = max(int(entry[1]), initial_saved)
 
@@ -326,6 +398,213 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """Return whether another save may be emitted this scheduler step."""
         return True
 
+    def _ensure_save_admission_state(self) -> None:
+        """Supply compatibility defaults for lightweight/manual schedulers."""
+
+        if not hasattr(self, "_save_policy"):
+            self._save_policy = "round_robin"
+        if not hasattr(self, "_save_min_observed_count"):
+            self._save_min_observed_count = 2
+        if not hasattr(self, "_save_aging_weight"):
+            self._save_aging_weight = 0.01
+        if not hasattr(self, "_save_release_weight"):
+            self._save_release_weight = 1.0
+        if not hasattr(self, "_prefix_demand"):
+            self._prefix_demand = PrefixDemandTracker()
+        for name in (
+            "_save_demand_keys",
+            "_save_candidate_since",
+            "_save_candidate_generation",
+            "_save_committed",
+            "_finished_save_requests",
+            "_save_inflight_since",
+        ):
+            if not hasattr(self, name):
+                setattr(self, name, {})
+        if not hasattr(self, "_save_candidate_nonce"):
+            self._save_candidate_nonce = 0
+        if not hasattr(self, "_finished_save_failed"):
+            self._finished_save_failed = set()
+        if not hasattr(self, "total_save_admitted"):
+            self.total_save_admitted = 0
+        if not hasattr(self, "_save_drop_totals"):
+            self._save_drop_totals = {
+                "capacity": 0,
+                "low_value": 0,
+                "terminal_failure": 0,
+                "stale": 0,
+            }
+        if not hasattr(self, "_save_drop_token_totals"):
+            self._save_drop_token_totals = dict.fromkeys(self._save_drop_totals, 0)
+
+    def _candidate_generation_for(self, sid: str, seq) -> int:
+        record = self._save_candidate_generation.get(sid)
+        if record is not None and record[0] is seq:
+            return record[1]
+        generation = self._save_candidate_nonce
+        self._save_candidate_nonce += 1
+        self._save_candidate_generation[sid] = (seq, generation)
+        return generation
+
+    def _candidate_since_for(self, sid: str, seq, now: float) -> float:
+        record = self._save_candidate_since.get(sid)
+        if record is not None and record[0] is seq:
+            return record[1]
+        self._save_candidate_since[sid] = (seq, now)
+        return now
+
+    def _build_save_candidate(
+        self, sid: str, *, now: float | None = None
+    ) -> _ChunkedSaveCandidate | None:
+        self._ensure_save_admission_state()
+        entry = self._save_tracker.get(sid)
+        if entry is None:
+            return None
+        seq, saved = entry
+        aligned = self._save_frontier(seq)
+        if aligned <= int(saved):
+            return None
+        candidate_now = time.monotonic() if now is None else float(now)
+        demand = self._save_demand_keys.get(sid)
+        observed_count, reusable_tokens = (0, 0)
+        if demand is not None and demand[0] is seq:
+            observed_count, reusable_tokens = self._prefix_demand.heat(
+                demand[1],
+                max_tokens=aligned,
+                now=candidate_now,
+            )
+        finished = self._finished_save_requests.get(sid) is seq
+        return _ChunkedSaveCandidate(
+            sid=sid,
+            seq=seq,
+            generation=self._candidate_generation_for(sid, seq),
+            saved=int(saved),
+            aligned=aligned,
+            observed_count=observed_count,
+            reusable_tokens=reusable_tokens,
+            enqueued_at=self._candidate_since_for(sid, seq, candidate_now),
+            finished=finished,
+            held_blocks=(
+                len(
+                    getattr(
+                        seq,
+                        "_offload_finished_block_ids",
+                        getattr(seq, "block_table", ()),
+                    )
+                )
+                if finished
+                else 0
+            ),
+        )
+
+    def _candidate_priority(
+        self, candidate: _ChunkedSaveCandidate, now: float
+    ) -> float:
+        chunk = max(1, int(self.chunk_size or 256))
+        cost_units = max(1, ceil(candidate.dirty_tokens / chunk))
+        reusable = max(candidate.reusable_tokens, chunk)
+        benefit = candidate.observed_count * reusable
+        release_bonus = (
+            self._save_release_weight
+            * candidate.held_blocks
+            * max(1, int(self.virtual_block_size))
+        )
+        age = max(0.0, now - candidate.enqueued_at)
+        return (benefit + release_bonus) / cost_units + self._save_aging_weight * age
+
+    def _candidate_sort_key(
+        self, candidate: _ChunkedSaveCandidate, now: float
+    ) -> tuple[float, int, float, str, int]:
+        return (
+            -self._candidate_priority(candidate, now),
+            candidate.dirty_tokens,
+            candidate.enqueued_at,
+            candidate.sid,
+            candidate.generation,
+        )
+
+    def _meets_save_value_threshold(self, candidate: _ChunkedSaveCandidate) -> bool:
+        return candidate.observed_count >= self._save_min_observed_count
+
+    def _commit_finished_save(self, candidate: _ChunkedSaveCandidate) -> bool:
+        if not candidate.finished or not self._meets_save_value_threshold(candidate):
+            return False
+        if not self._may_emit_save():
+            return False
+        entry = self._save_tracker.get(candidate.sid)
+        if entry is None or entry[0] is not candidate.seq:
+            return False
+        self._save_committed[candidate.sid] = candidate.seq
+        self.total_save_admitted += 1
+        return True
+
+    def _forget_save_candidate(self, sid: str, seq) -> None:
+        for mapping in (
+            self._save_demand_keys,
+            self._save_candidate_since,
+            self._save_candidate_generation,
+        ):
+            record = mapping.get(sid)
+            if record is not None and record[0] is seq:
+                mapping.pop(sid, None)
+
+    def drop_unadmitted_save(self, seq, *, reason: str) -> bool:
+        """Atomically remove a candidate that no worker can be reading."""
+
+        sid = str(seq.id)
+        if sid in self._save_inflight:
+            return False
+        entry = self._save_tracker.get(sid)
+        if entry is None or entry[0] is not seq:
+            return False
+        candidate = self._build_save_candidate(sid)
+        dropped_tokens = 0 if candidate is None else candidate.dirty_tokens
+        self._save_tracker.pop(sid, None)
+        if self._save_committed.get(sid) is seq:
+            self._save_committed.pop(sid, None)
+        if self._finished_save_requests.get(sid) is seq:
+            self._finished_save_requests.pop(sid, None)
+        self._finished_save_failed.discard(sid)
+        self._forget_save_candidate(sid, seq)
+        if reason not in self._save_drop_totals:
+            reason = "stale"
+        self._save_drop_totals[reason] += 1
+        self._save_drop_token_totals[reason] += dropped_tokens
+        logger.info(
+            "LMCache offload: dropped unadmitted save req=%s reason=%s tokens=%d",
+            sid,
+            reason,
+            dropped_tokens,
+        )
+        return True
+
+    def _settle_finished_save(self, sid: str, *, failed: bool = False) -> None:
+        seq = self._finished_save_requests.get(sid)
+        if seq is None or sid in self._save_inflight or sid in self._save_committed:
+            return
+        if failed:
+            self._finished_save_failed.add(sid)
+        if sid in self._finished_save_failed:
+            self.drop_unadmitted_save(seq, reason="terminal_failure")
+            return
+        candidate = self._build_save_candidate(sid)
+        if candidate is None:
+            entry = self._save_tracker.get(sid)
+            if entry is not None and entry[0] is seq:
+                self._save_tracker.pop(sid, None)
+            self._finished_save_requests.pop(sid, None)
+            self._finished_save_failed.discard(sid)
+            self._forget_save_candidate(sid, seq)
+            return
+        if self._commit_finished_save(candidate):
+            return
+        reason = (
+            "low_value"
+            if not self._meets_save_value_threshold(candidate)
+            else "capacity"
+        )
+        self.drop_unadmitted_save(seq, reason=reason)
+
     def _new_load_operation(self, seq) -> LoadOperationId:
         operation = LoadOperationId(seq.id, self._load_nonce)
         self._load_nonce += 1
@@ -377,7 +656,98 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return None
         return target, block_ids, keep
 
+    def _emit_save_candidate(
+        self,
+        meta: LMCacheOffloadMetadata,
+        candidate: _ChunkedSaveCandidate,
+    ) -> bool:
+        sid = candidate.sid
+        seq = candidate.seq
+        entry = self._save_tracker.get(sid)
+        if entry is None or entry[0] is not seq:
+            return False
+        computed = min(
+            int(
+                getattr(
+                    seq,
+                    "_offload_finished_cached_tokens",
+                    getattr(seq, "num_cached_tokens", 0),
+                )
+            ),
+            int(seq.num_prompt_tokens),
+        )
+        is_last_prefill = computed >= int(seq.num_prompt_tokens)
+        aligned = candidate.aligned
+        save_operation = SaveOperationId(seq.id, self._save_nonce)
+        self._save_nonce += 1
+        late_acquired = frozenset()
+        if hasattr(seq, "_offload_finished_block_ids") and not seq.block_table:
+            late_source = self._late_save_source(seq, candidate.saved, aligned)
+            if late_source is None:
+                if self._save_policy == "priority" and candidate.finished:
+                    self.drop_unadmitted_save(seq, reason="stale")
+                else:
+                    self._save_tracker.pop(sid, None)
+                    self._forget_save_candidate(sid, seq)
+                return False
+            aligned, block_ids, late_acquired = late_source
+        else:
+            block_ids = list(seq.block_table)
+        try:
+            request = self._build_save_request(
+                seq,
+                candidate.saved,
+                aligned,
+                save_operation,
+                block_ids,
+                is_last_prefill,
+            )
+        except Exception:
+            if late_acquired:
+                self._block_manager.free_leased_blocks(late_acquired)
+            raise
+        if request is None:
+            if late_acquired:
+                self._block_manager.free_leased_blocks(late_acquired)
+            if candidate.finished:
+                self.drop_unadmitted_save(seq, reason="capacity")
+            return False
+
+        logger.debug(
+            "[OFFLOAD-SAVE-EMIT] seq=%s computed=%d num_prompt=%d "
+            "aligned=%d saved=%d policy=%s observed=%d",
+            seq.id,
+            computed,
+            int(seq.num_prompt_tokens),
+            aligned,
+            candidate.saved,
+            self._save_policy,
+            candidate.observed_count,
+        )
+        self._track_save_statistics(save_operation, aligned - candidate.saved)
+        self._save_inflight_since[save_operation] = time.monotonic()
+        meta.add_request(request)
+        entry[1] = aligned
+        self._save_inflight[sid] = save_operation
+        if getattr(self, "_early_release", False):
+            # Freeze the exact token-index -> block-id mapping before a
+            # finished request clears its block table. The lease itself is
+            # activated only by `activate_block_leases` at teardown.
+            source_block_size = getattr(self, "virtual_block_size", self.block_size)
+            start_block = candidate.saved // source_block_size
+            end_block = -(-aligned // source_block_size)  # ceil div
+            self._save_operation_blocks[save_operation] = {
+                index: block_ids[index]
+                for index in range(start_block, min(end_block, len(block_ids)))
+            }
+            self._save_operation_safe[save_operation] = set()
+            self._save_operation_owner[save_operation] = seq
+            if late_acquired:
+                self.activate_block_leases(seq, late_acquired)
+        return True
+
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
+        self._ensure_save_admission_state()
         meta = LMCacheOffloadMetadata()
 
         # Loads
@@ -447,89 +817,72 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             for sid in self._lookup_in_step
             if sid in loading_sids or sid not in self._load_specs
         ]
-        # Saves: store fully computed prompt chunks. Under scheduler-side
-        # chunked prefill, seq.num_cached_tokens advances after each prefill
-        # chunk's forward has completed; use it as the D2H-safe frontier.
-        tracker_sids = list(self._save_tracker.keys())
-        if tracker_sids and self._save_rr_last in self._save_tracker:
-            start = (tracker_sids.index(self._save_rr_last) + 1) % len(tracker_sids)
-            tracker_sids = tracker_sids[start:] + tracker_sids[:start]
-        for sid in tracker_sids:
-            entry = self._save_tracker[sid]
-            if not self._do_save:
-                continue
-            if not self._may_emit_save():
-                break
-            seq, saved = entry
-            if sid in self._reqs_need_recv or sid in loading_sids:
-                continue  # loading this step; defer its save
-            if sid in self._save_inflight:
-                continue  # keep at most one save per request in flight
-            computed = min(
-                int(
-                    getattr(
-                        seq,
-                        "_offload_finished_cached_tokens",
-                        getattr(seq, "num_cached_tokens", 0),
-                    )
-                ),
-                int(seq.num_prompt_tokens),
-            )
-            is_last_prefill = computed >= int(seq.num_prompt_tokens)
-            aligned = self._save_frontier(seq)
-            if aligned <= saved:
-                continue
-            logger.debug(
-                "[OFFLOAD-SAVE-EMIT] seq=%s computed=%d num_prompt=%d aligned=%d saved=%d",
-                seq.id,
-                computed,
-                int(seq.num_prompt_tokens),
-                aligned,
-                saved,
-            )
-            save_operation = SaveOperationId(seq.id, self._save_nonce)
-            self._save_nonce += 1
-            late_acquired = frozenset()
-            if hasattr(seq, "_offload_finished_block_ids") and not seq.block_table:
-                late_source = self._late_save_source(seq, saved, aligned)
-                if late_source is None:
-                    self._save_tracker.pop(sid, None)
+        # Saves: dispatch finished reservations before selecting new work.
+        if self._do_save:
+            now = time.monotonic()
+            committed = []
+            for sid, seq in list(self._save_committed.items()):
+                entry = self._save_tracker.get(sid)
+                if entry is None or entry[0] is not seq:
+                    self._save_committed.pop(sid, None)
                     continue
-                aligned, block_ids, late_acquired = late_source
+                candidate = self._build_save_candidate(sid, now=now)
+                if candidate is None:
+                    self._save_committed.pop(sid, None)
+                    self._settle_finished_save(sid)
+                    continue
+                committed.append(candidate)
+            committed.sort(
+                key=lambda candidate: self._candidate_sort_key(candidate, now)
+            )
+            for candidate in committed:
+                sid = candidate.sid
+                if sid in self._reqs_need_recv or sid in loading_sids:
+                    continue
+                if sid in self._save_inflight:
+                    continue
+                self._save_committed.pop(sid, None)
+                self._emit_save_candidate(meta, candidate)
+
+            tracker_sids = list(self._save_tracker.keys())
+            if self._save_policy == "round_robin":
+                if tracker_sids and self._save_rr_last in self._save_tracker:
+                    start = (tracker_sids.index(self._save_rr_last) + 1) % len(
+                        tracker_sids
+                    )
+                    tracker_sids = tracker_sids[start:] + tracker_sids[:start]
+                candidates = [
+                    candidate
+                    for sid in tracker_sids
+                    if (candidate := self._build_save_candidate(sid, now=now))
+                    is not None
+                ]
             else:
-                block_ids = list(seq.block_table)
-            try:
-                request = self._build_save_request(
-                    seq, saved, aligned, save_operation, block_ids, is_last_prefill
+                candidates = [
+                    candidate
+                    for sid in tracker_sids
+                    if (candidate := self._build_save_candidate(sid, now=now))
+                    is not None
+                    and self._meets_save_value_threshold(candidate)
+                ]
+                candidates.sort(
+                    key=lambda candidate: self._candidate_sort_key(candidate, now)
                 )
-            except Exception:
-                if late_acquired:
-                    self._block_manager.free_leased_blocks(late_acquired)
-                raise
-            if request is None:
-                if late_acquired:
-                    self._block_manager.free_leased_blocks(late_acquired)
-                continue
-            self._track_save_statistics(save_operation, aligned - saved)
-            meta.add_request(request)
-            entry[1] = aligned
-            self._save_inflight[sid] = save_operation
-            self._save_rr_last = sid
-            if getattr(self, "_early_release", False):
-                # Freeze the exact token-index -> block-id mapping before a
-                # finished request clears its block table. The lease itself is
-                # activated only by `activate_block_leases` at teardown.
-                source_block_size = getattr(self, "virtual_block_size", self.block_size)
-                start_block = saved // source_block_size
-                end_block = -(-aligned // source_block_size)  # ceil div
-                self._save_operation_blocks[save_operation] = {
-                    index: block_ids[index]
-                    for index in range(start_block, min(end_block, len(block_ids)))
-                }
-                self._save_operation_safe[save_operation] = set()
-                self._save_operation_owner[save_operation] = seq
-                if late_acquired:
-                    self.activate_block_leases(seq, late_acquired)
+
+            for candidate in candidates:
+                sid = candidate.sid
+                if not self._may_emit_save():
+                    break
+                if sid in self._save_committed:
+                    continue
+                if sid in self._reqs_need_recv or sid in loading_sids:
+                    continue
+                if sid in self._save_inflight:
+                    continue
+                if self._emit_save_candidate(meta, candidate):
+                    self.total_save_admitted += 1
+                    if self._save_policy == "round_robin":
+                        self._save_rr_last = sid
         dispatched = set(meta.lookup_requests_in_step)
         for sid in dispatched:
             self._lookup_results.pop(sid, None)
@@ -540,6 +893,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         return meta
 
     def should_defer_free(self, seq) -> bool:
+        self._ensure_save_admission_state()
         if self._has_active_load(seq):
             return True
         if not self._do_save:
@@ -548,6 +902,16 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         operation_blocks = getattr(self, "_save_operation_blocks", {})
         operation_safe = getattr(self, "_save_operation_safe", {})
         operation_owner = getattr(self, "_save_operation_owner", {})
+        active_operation = self._save_inflight.get(sid)
+        active_owner = operation_owner.get(active_operation)
+        active_entry = self._save_tracker.get(sid)
+        active_save = active_operation is not None and (
+            active_owner is seq
+            or (
+                active_owner is None
+                and (active_entry is None or active_entry[0] is seq)
+            )
+        )
         unsafe_retired_operation = any(
             owner is seq
             and not set(operation_blocks.get(operation, {}).values()).issubset(
@@ -556,7 +920,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             for operation, owner in operation_owner.items()
         )
         return (
-            sid in self._save_inflight
+            active_save
+            or self._save_committed.get(sid) is seq
             or self._has_pending_save(seq)
             or unsafe_retired_operation
         )
@@ -637,6 +1002,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             operation = self._save_inflight.get(sid) if sid is not None else None
             if operation in owned_operations:
                 self._save_inflight.pop(sid, None)
+                self._save_inflight_since.pop(operation, None)
                 self._cancel_save_statistics(operation)
             for candidate in [
                 op for op in self._save_operation_blocks if op in owned_operations
@@ -649,6 +1015,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 entry = self._save_tracker.get(sid)
                 if entry is not None and entry[0] is owner:
                     self._save_tracker.pop(sid, None)
+                if self._save_committed.get(sid) is owner:
+                    self._save_committed.pop(sid, None)
+                if self._finished_save_requests.get(sid) is owner:
+                    self._finished_save_requests.pop(sid, None)
+                self._finished_save_failed.discard(sid)
+                if owner is not None:
+                    self._forget_save_candidate(sid, owner)
             if blocks:
                 released.append(frozenset(blocks))
                 self.total_abnormal_lease_reclaims += len(blocks)
@@ -679,6 +1052,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         )
         return (
             bool(self._reqs_need_recv)
+            or bool(self._save_committed)
             or bool(self._save_inflight)
             or bool(getattr(self, "_save_lease_blocks", {}))
             or pending_finished_save
@@ -809,6 +1183,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     def _store_finished(self, operation: SaveOperationId, *, succeeded: bool) -> None:
         sid = str(operation.req_id)
         active = self._save_inflight.get(sid)
+        owner = self._save_operation_owner.get(operation)
         if (
             active != operation
             and operation not in self._save_operation_blocks
@@ -825,6 +1200,21 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         else:
             self._cancel_save_statistics(operation)
             # Failed stores keep unsafe ranges leased until abandon timeout.
+            block_map = self._save_operation_blocks.get(operation, {})
+            safe = self._save_operation_safe.get(operation, set())
+            if set(block_map.values()).issubset(safe):
+                # A terminal failure can arrive after every source range became
+                # safe. Retire that exact operation now; otherwise native MP,
+                # whose terminal is also its final source fence, leaks owner and
+                # block-map bookkeeping forever.
+                self._release_operation_lease(operation)
+        self._save_inflight_since.pop(operation, None)
+        if (
+            self._save_policy == "priority"
+            and owner is not None
+            and self._finished_save_requests.get(sid) is owner
+        ):
+            self._settle_finished_save(sid, failed=not succeeded)
         self._finish_retired_request(sid)
 
     def _release_operation_lease(self, operation) -> None:
@@ -854,6 +1244,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             seq
         ):
             self._save_tracker.pop(sid, None)
+            if self._finished_save_requests.get(sid) is seq:
+                self._finished_save_requests.pop(sid, None)
+            self._finished_save_failed.discard(sid)
+            self._forget_save_candidate(sid, seq)
 
     def blocks_waiting_for_store(self) -> int:
         return sum(
@@ -865,8 +1259,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)
         operation = self._save_inflight.pop(sid, None)
         if operation is not None:
+            self._save_inflight_since.pop(operation, None)
             self._cancel_save_statistics(operation)
-        self._save_tracker.pop(sid, None)
+        tracker = self._save_tracker.pop(sid, None)
         owner = self._save_operation_owner.pop(operation, None)
         lease_key = id(owner) if owner is not None else None
         self._save_lease_at.pop(lease_key, None)
@@ -876,9 +1271,71 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._save_operation_blocks.pop(operation, None)
             self._save_operation_safe.pop(operation, None)
             self._source_safe_waiting_for_store.pop(operation, None)
+        committed = self._save_committed.pop(sid, None)
+        finished = self._finished_save_requests.pop(sid, None)
+        seq = finished if finished is not None else committed
+        if seq is None and tracker is not None:
+            seq = tracker[0]
+        self._finished_save_failed.discard(sid)
+        if seq is not None:
+            self._forget_save_candidate(sid, seq)
         if blocks:
             self._pending_source_safe_releases.append(frozenset(blocks))
             self.total_abnormal_lease_reclaims += len(blocks)
+
+    def get_statistics(self) -> dict[str, int | float]:
+        """Return save-admission gauges in addition to transfer counters."""
+
+        self._ensure_save_admission_state()
+        statistics = super().get_statistics()
+        now = time.monotonic()
+        candidates = []
+        for sid, entry in self._save_tracker.items():
+            seq = entry[0]
+            operation = self._save_inflight.get(sid)
+            if (
+                self._save_operation_owner.get(operation) is seq
+                or self._save_committed.get(sid) is seq
+            ):
+                continue
+            candidate = self._build_save_candidate(sid, now=now)
+            if candidate is not None:
+                candidates.append(candidate)
+
+        finished = [candidate for candidate in candidates if candidate.finished]
+        candidate_scores = [
+            self._candidate_priority(candidate, now) for candidate in candidates
+        ]
+        pinned_blocks = sum(len(blocks) for blocks in self._save_lease_blocks.values())
+        statistics.update(
+            save_candidates=len(candidates),
+            save_candidates_finished=len(finished),
+            save_committed=len(self._save_committed),
+            save_admitted=self.total_save_admitted,
+            save_candidate_wait_seconds=max(
+                (max(0.0, now - candidate.enqueued_at) for candidate in candidates),
+                default=0.0,
+            ),
+            save_priority_score=max(candidate_scores, default=0.0),
+            save_inflight_wait_seconds=max(
+                (
+                    max(0.0, now - started)
+                    for started in self._save_inflight_since.values()
+                ),
+                default=0.0,
+            ),
+            save_pinned_blocks=pinned_blocks,
+            save_pinned_tokens=pinned_blocks * int(self.virtual_block_size),
+            deferred_free_requests=sum(
+                bool(blocks) for blocks in self._save_lease_blocks.values()
+            ),
+        )
+        for reason, total in self._save_drop_totals.items():
+            statistics[f"save_dropped_{reason}"] = total
+            statistics[f"save_dropped_tokens_{reason}"] = self._save_drop_token_totals[
+                reason
+            ]
+        return statistics
 
     def load_failed(self, req_id) -> bool:
         sid = str(req_id.req_id if isinstance(req_id, LoadOperationId) else req_id)
@@ -939,7 +1396,27 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._load_lifecycles.pop(sid, None)
         entry = self._save_tracker.get(sid)
         if entry is not None and entry[0] is seq:
-            if self._early_release:
+            if self._save_policy == "priority":
+                self._finished_save_requests[sid] = seq
+                # Freeze the final source identity before request teardown.
+                # Priority reservations dispatch on a later metadata build and
+                # reacquire only the still-canonical prefix blocks.
+                if self._early_release:
+                    seq._offload_finished_cached_tokens = min(
+                        int(getattr(seq, "num_cached_tokens", 0)),
+                        int(seq.num_prompt_tokens),
+                    )
+                if sid in self._save_inflight or self._save_committed.get(sid) is seq:
+                    pass
+                else:
+                    candidate = self._build_save_candidate(sid)
+                    if candidate is None:
+                        self._settle_finished_save(sid)
+                    elif not self._meets_save_value_threshold(candidate):
+                        self.drop_unadmitted_save(seq, reason="low_value")
+                    elif not self._commit_finished_save(candidate):
+                        self.drop_unadmitted_save(seq, reason="capacity")
+            elif self._early_release:
                 # Freeze the final computed frontier before BlockManager
                 # clears it during partial deallocation. Keep the tracker when
                 # a final chunk still needs emission; a later metadata build
@@ -953,6 +1430,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                     self._save_tracker.pop(sid, None)
             elif not self.should_defer_free(seq):
                 self._save_tracker.pop(sid, None)
+                self._forget_save_candidate(sid, seq)
         if hasattr(seq, "_load_operation"):
             delattr(seq, "_load_operation")
 

@@ -79,6 +79,7 @@ def _make_mgr(
         "lmcache_probe_hit_total": 0,
         "lmcache_probe_miss_total": 0,
         "lmcache_probe_failure_total": 0,
+        "lmcache_probe_skipped_total": 0,
         "lmcache_probe_hit_tokens": 0,
         "affinity_parent_ignored_total": 0,
         "explicit_total": 0,
@@ -663,16 +664,34 @@ def test_lmcache_cpu_hit_below_minimum_gain_keeps_owner():
     mgr = _make_mgr(2, req_equiv=0, session_affinity=True)
     mgr._dp_session_owners["s"] = 0
     mgr._dp_session_prompt_tokens["s"] = 1000
-    mgr._rank_tokens = [8000, 0]
-    _probe, sent = _enable_lmcache_route(mgr, result=1024, min_gain=8192)
+    mgr._rank_tokens = [7900, 0]
+    probe, sent = _enable_lmcache_route(mgr, result=0, min_gain=8192)
     seq = _prefix_seq("turn", list(range(1200)), "s")
 
     mgr._dispatch_to_dp_ranks([seq])
 
     assert sent == [("turn", 0)]
     assert mgr._dp_session_owners["s"] == 0
-    assert mgr._dp_route_counters["lmcache_probe_hit_total"] == 1
+    assert probe.calls == []
+    assert mgr._dp_route_counters["lmcache_probe_skipped_total"] == 1
+    assert mgr._dp_route_counters["lmcache_probe_hit_total"] == 0
     assert mgr._dp_route_counters["affinity_spill_total"] == 0
+
+
+def test_lmcache_probe_runs_when_a_full_hit_can_clear_minimum_gain():
+    mgr = _make_mgr(2, req_equiv=0, session_affinity=True)
+    mgr._dp_session_owners["s"] = 0
+    mgr._dp_session_prompt_tokens["s"] = 1000
+    mgr._rank_tokens = [8400, 0]
+    probe, sent = _enable_lmcache_route(mgr, result=0, min_gain=8192)
+    seq = _prefix_seq("turn", list(range(1200)), "s")
+
+    mgr._dispatch_to_dp_ranks([seq])
+
+    assert len(probe.calls) == 1
+    assert sent == [("turn", 0)]
+    assert mgr._dp_route_counters["lmcache_probe_miss_total"] == 1
+    assert mgr._dp_route_counters["lmcache_probe_skipped_total"] == 0
 
 
 def test_lmcache_cpu_hit_spills_from_backlogged_owner_and_updates_cost():

@@ -94,6 +94,7 @@ def test_lmcache_dp_route_probe_counters_are_exported():
                 "lmcache_probe_hit_total": 3,
                 "lmcache_probe_miss_total": 4,
                 "lmcache_probe_failure_total": 5,
+                "lmcache_probe_skipped_total": 6,
                 "lmcache_probe_hit_tokens": 8192,
             },
         }
@@ -109,5 +110,58 @@ def test_lmcache_dp_route_probe_counters_are_exported():
         "atom:dp_lmcache_probe_hit_total": 3,
         "atom:dp_lmcache_probe_miss_total": 4,
         "atom:dp_lmcache_probe_failure_total": 5,
+        "atom:dp_lmcache_probe_skipped_total": 6,
         "atom:dp_lmcache_probe_hit_tokens_total": 8192,
     }
+
+
+def test_lmcache_save_admission_metrics_are_exported():
+    exporter = AtomMetricsExporter()
+    exporter.update(
+        {
+            "enabled": True,
+            "offload": {
+                "save_admitted": 7,
+                "save_candidates": 3,
+                "save_candidates_finished": 1,
+                "save_committed": 2,
+                "save_dropped_capacity": 4,
+                "save_dropped_tokens_capacity": 4096,
+                "save_pinned_blocks": 12,
+                "save_pinned_tokens": 3072,
+                "deferred_free_requests": 2,
+            },
+        }
+    )
+
+    samples = [
+        sample
+        for family in text_string_to_metric_families(exporter.render().decode())
+        for sample in family.samples
+        if sample.name.startswith("atom:lmcache_save_")
+        or sample.name == "atom:lmcache_deferred_free_requests"
+    ]
+    by_name_and_labels = {
+        (sample.name, tuple(sorted(sample.labels.items()))): sample.value
+        for sample in samples
+    }
+    assert by_name_and_labels[("atom:lmcache_save_admitted_total", ())] == 7
+    assert by_name_and_labels[("atom:lmcache_save_candidates", ())] == 3
+    assert by_name_and_labels[("atom:lmcache_save_committed", ())] == 2
+    assert (
+        by_name_and_labels[
+            ("atom:lmcache_save_dropped_total", (("reason", "capacity"),))
+        ]
+        == 4
+    )
+    assert (
+        by_name_and_labels[
+            (
+                "atom:lmcache_save_dropped_tokens_total",
+                (("reason", "capacity"),),
+            )
+        ]
+        == 4096
+    )
+    assert by_name_and_labels[("atom:lmcache_save_pinned_blocks", ())] == 12
+    assert by_name_and_labels[("atom:lmcache_deferred_free_requests", ())] == 2

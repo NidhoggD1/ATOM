@@ -328,6 +328,7 @@ class CoreManager:
             "lmcache_probe_hit_total": 0,
             "lmcache_probe_miss_total": 0,
             "lmcache_probe_failure_total": 0,
+            "lmcache_probe_skipped_total": 0,
             "lmcache_probe_hit_tokens": 0,
             "affinity_parent_ignored_total": 0,
             "explicit_total": 0,
@@ -1250,9 +1251,11 @@ class CoreManager:
         """Probe existing sticky sessions outside ``_lb_lock``.
 
         Returns one optional hit length and one outcome label per sequence.
-        Only requests that already have a valid owner are probed. The separate
-        probe lock serializes the single ZMQ client without blocking decode-side
-        load release on the router lock.
+        Only requests that already have a valid owner are considered. Before
+        touching LMCache, the router assumes a perfect full-prompt hit and skips
+        the RPC when even that best case cannot beat the owner by the configured
+        minimum gain. The separate probe lock serializes the single ZMQ client
+        without blocking decode-side load release on the router lock.
         """
         hits: list[int | None] = [None] * len(seqs)
         outcomes: list[str | None] = [None] * len(seqs)
@@ -1260,16 +1263,36 @@ class CoreManager:
         if not self._dp_lmcache_route_enabled or probe is None:
             return hits, outcomes
 
+        candidates = []
         with self._lb_lock:
-            candidates = [
-                index
-                for index, (seq, hint) in enumerate(zip(seqs, hints))
-                if hint is None
-                and (session_id := getattr(seq, "dp_session_id", None))
-                and 0
-                <= self._dp_session_owners.get(session_id, -1)
-                < self._routable_engine_count
-            ]
+            for index, (seq, hint) in enumerate(zip(seqs, hints)):
+                if hint is not None:
+                    continue
+                session_id = getattr(seq, "dp_session_id", None)
+                if not session_id:
+                    continue
+                owner = self._dp_session_owners.get(session_id, -1)
+                if not 0 <= owner < self._routable_engine_count:
+                    continue
+
+                prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
+                alternate, owner_score, best_case_alternate_score = (
+                    self._select_lmcache_spill_rank_locked(
+                        session_id,
+                        owner,
+                        prompt_tokens,
+                        prompt_tokens,
+                    )
+                )
+                if (
+                    alternate == owner
+                    or best_case_alternate_score
+                    + self._dp_lmcache_route_min_gain_tokens
+                    >= owner_score
+                ):
+                    outcomes[index] = "skipped"
+                    continue
+                candidates.append(index)
 
         for index in candidates:
             seq = seqs[index]

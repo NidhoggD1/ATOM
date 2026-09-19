@@ -39,6 +39,8 @@ the native-state contract:
 ```bash
 export LMCACHE_CHUNK_SIZE=256
 export OFFLOAD_MAX_PENDING_SAVES=2
+export OFFLOAD_SAVE_POLICY=priority
+export OFFLOAD_SAVE_MIN_OBSERVED_COUNT=2
 export OFFLOAD_MIN_LOAD_TOKENS=8192
 export OFFLOAD_MIN_SAVE_TOKENS=8192
 
@@ -74,7 +76,9 @@ spills only when the alternate wins by more than
 `lmcache.mp.dp_route_min_gain_tokens` (default 8192). The L1 probe is bounded by
 `lmcache.mp.dp_route_lookup_timeout` seconds (default 0.25), creates no LMCache
 request session, releases its temporary read locks before returning, and fails
-closed to the current owner on a miss, timeout, or error. Explicit
+closed to the current owner on a miss, timeout, or error. The router skips the
+probe entirely when even a hypothetical full-prompt L1 hit cannot clear the
+minimum-gain threshold. Explicit
 `data_parallel_rank` placement remains authoritative.
 
 `lmcache.mp.max_pinned_state_bytes` optionally limits native checkpoint sources
@@ -106,14 +110,20 @@ The final image region is trimmed at `image_bytes`, preserving the original
 physical PAGE stride.
 
 The scheduler dispatches one combined PAGE/STATE save generation at a time per
-request, with round-robin admission and count/byte bounds. It acquires the exact
+request, with count/byte bounds. `OFFLOAD_SAVE_POLICY=round_robin` preserves the
+compatibility order. `priority` ranks candidates by rank-local prefix demand,
+dirty-token cost, age, and finished-request release value. A finished candidate
+must reserve capacity immediately or its PAGE+STATE save is dropped atomically;
+the request never waits in an unbounded save backlog. It acquires the exact
 READY image only after admission. An IPC producer event orders MP reads after
 native checkpoint creation. Source-safe events release PAGE leases chunk by
 chunk and release the READY STATE image once its endpoint is safe; terminal
 completion then settles the logical operation. Decode-only PAGEs and the live
 SLOT are not save sources and can be returned as soon as the request ends.
-Failed saves roll back the watermark for at most three attempts at that
-boundary. Native saves never reclaim an uncertain DMA lease by elapsed time.
+Failed saves from active requests roll back the watermark for at most three
+attempts at that boundary. A failed save whose request has already finished is
+dropped immediately, including any residual tail. Native saves never reclaim
+an uncertain DMA lease by elapsed time.
 
 Restore loads PAGE KV only for `[hbm, lmcache)` and restores the endpoint's full
 native image into the request's already allocated fixed SLOT. If the local HBM

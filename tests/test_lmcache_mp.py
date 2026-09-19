@@ -414,6 +414,19 @@ def test_scheduler_closes_adapter_if_local_initialization_fails(monkeypatch):
     assert adapter.closed is True
 
 
+def test_page_only_mp_counts_committed_reservations_against_save_capacity():
+    scheduler = mp_connector.LMCacheMPConnectorScheduler.__new__(
+        mp_connector.LMCacheMPConnectorScheduler
+    )
+    scheduler._max_pending_saves = 2
+    scheduler._save_inflight = {"running": SaveOperationId("running", 0)}
+    scheduler._save_committed = {}
+    assert scheduler._may_emit_save()
+
+    scheduler._save_committed = {"reserved": object()}
+    assert not scheduler._may_emit_save()
+
+
 def _transfer_tensors(*, tp_replication_factor: int = 1) -> KVTransferTensors:
     tensors = [
         torch.zeros(2, 4, 32, dtype=torch.float16),

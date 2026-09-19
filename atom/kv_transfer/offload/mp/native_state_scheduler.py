@@ -171,8 +171,11 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         return super().get_num_new_matched_tokens(seq)
 
     def _has_state_budget(self) -> bool:
+        committed_bytes = (
+            len(getattr(self, "_save_committed", {})) * self._image_reservation_bytes
+        )
         return (
-            self._pinned_state_bytes + self._image_reservation_bytes
+            self._pinned_state_bytes + committed_bytes + self._image_reservation_bytes
             <= self._max_pinned_state_bytes
         )
 
@@ -202,7 +205,8 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
 
     def _may_emit_save(self) -> bool:
         return (
-            len(self._save_inflight) < self._max_pending_saves
+            len(self._save_inflight) + len(self._save_committed)
+            < self._max_pending_saves
             and self._has_state_budget()
         )
 

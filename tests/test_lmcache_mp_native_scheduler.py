@@ -76,8 +76,19 @@ class Adapter:
         self.closed = True
 
 
-def make_scheduler(monkeypatch, *, capacity=2, budget=60, units=30, role="offload"):
+def make_scheduler(
+    monkeypatch,
+    *,
+    capacity=2,
+    budget=60,
+    units=30,
+    role="offload",
+    policy="round_robin",
+    min_observed=2,
+):
     monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", str(capacity))
+    monkeypatch.setenv("OFFLOAD_SAVE_POLICY", policy)
+    monkeypatch.setenv("OFFLOAD_SAVE_MIN_OBSERVED_COUNT", str(min_observed))
     adapter = Adapter()
     connections = []
 
@@ -212,6 +223,252 @@ def test_save_credit_and_bytes_are_reserved_before_native_pin(
     [second] = scheduler.build_connector_meta().requests
     assert second.req_id == 2
     assert second.native_state.unit_ids != first.native_state.unit_ids
+
+
+def test_priority_save_prefers_hotter_prefix(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(
+        monkeypatch, capacity=1, policy="priority", min_observed=1
+    )
+    cold = sequence("cold", token_offset=100)
+    hot = sequence("hot")
+    scheduler._prefix_demand.observe(hot.token_ids, hot.num_prompt_tokens)
+    scheduler._prefix_demand.observe(hot.token_ids, hot.num_prompt_tokens)
+    for seq in (cold, hot):
+        checkpoint(scheduler, checkpoints, seq, 16)
+        scheduler.update_state_after_alloc(seq)
+
+    [request] = scheduler.build_connector_meta().requests
+    assert request.req_id == "hot"
+
+
+def test_priority_save_prefers_lower_dirty_cost(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(
+        monkeypatch, capacity=1, policy="priority", min_observed=1
+    )
+    expensive = sequence("expensive", token_offset=100)
+    cheap = sequence("cheap")
+    for seq in (expensive, cheap):
+        checkpoint(scheduler, checkpoints, seq, 16)
+        scheduler.update_state_after_alloc(seq)
+    scheduler._save_tracker["cheap"][1] = 8
+
+    [request] = scheduler.build_connector_meta().requests
+    assert request.req_id == "cheap"
+    assert request.save_spec.skip_leading_tokens == 8
+
+
+def test_priority_save_has_stable_request_id_tie_break(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_SAVE_AGING_WEIGHT", "0")
+    scheduler, checkpoints, _ = make_scheduler(
+        monkeypatch, capacity=1, policy="priority", min_observed=1
+    )
+    later_id = sequence("b", token_offset=100)
+    earlier_id = sequence("a")
+    for seq in (later_id, earlier_id):
+        checkpoint(scheduler, checkpoints, seq, 16)
+        scheduler.update_state_after_alloc(seq)
+
+    [request] = scheduler.build_connector_meta().requests
+    assert request.req_id == "a"
+
+
+def test_priority_aging_can_reorder_eligible_candidates_but_not_bypass_threshold(
+    monkeypatch,
+):
+    scheduler, checkpoints, _ = make_scheduler(
+        monkeypatch, capacity=1, policy="priority", min_observed=1
+    )
+    old = sequence("old", token_offset=100)
+    hot = sequence("hot")
+    scheduler._prefix_demand.observe(hot.token_ids, hot.num_prompt_tokens)
+    for seq in (old, hot):
+        checkpoint(scheduler, checkpoints, seq, 16)
+        scheduler.update_state_after_alloc(seq)
+        scheduler._build_save_candidate(str(seq.id))
+    owner, since = scheduler._save_candidate_since["old"]
+    scheduler._save_candidate_since["old"] = (owner, since - 10_000)
+
+    [request] = scheduler.build_connector_meta().requests
+    assert request.req_id == "old"
+
+    scheduler, checkpoints, _ = make_scheduler(
+        monkeypatch, capacity=1, policy="priority", min_observed=2
+    )
+    cold = sequence("cold")
+    checkpoint(scheduler, checkpoints, cold, 16)
+    scheduler.update_state_after_alloc(cold)
+    scheduler._save_candidate_since["cold"] = (cold, 0.0)
+    assert scheduler.build_connector_meta().requests == []
+
+
+def test_finished_priority_save_commits_then_dispatches(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(
+        monkeypatch, capacity=1, policy="priority", min_observed=1
+    )
+    seq = sequence()
+    checkpoint(scheduler, checkpoints, seq, 16)
+    scheduler.update_state_after_alloc(seq)
+
+    scheduler.request_finished(seq)
+    assert scheduler._save_committed == {"1": seq}
+    assert scheduler.should_defer_free(seq)
+    [request] = scheduler.build_connector_meta().requests
+    assert request.req_id == seq.id
+    assert scheduler._save_committed == {}
+    assert scheduler._save_inflight == {"1": request.save_operation}
+
+
+def test_finished_priority_save_drops_immediately_when_capacity_is_full(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(
+        monkeypatch, capacity=1, policy="priority", min_observed=1
+    )
+    running = sequence("running")
+    finished = sequence("finished", token_offset=100)
+    for seq in (running, finished):
+        checkpoint(scheduler, checkpoints, seq, 16)
+        scheduler.update_state_after_alloc(seq)
+    [request] = scheduler.build_connector_meta().requests
+    assert request.req_id == "finished" or request.req_id == "running"
+    inflight_seq = running if request.req_id == "running" else finished
+    dropped_seq = finished if inflight_seq is running else running
+
+    scheduler.request_finished(dropped_seq)
+    assert str(dropped_seq.id) not in scheduler._save_tracker
+    assert not scheduler.should_defer_free(dropped_seq)
+    assert scheduler.get_statistics()["save_dropped_capacity"] == 1
+
+
+def test_committed_and_inflight_saves_share_one_capacity_bound(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(
+        monkeypatch, capacity=2, policy="priority", min_observed=1
+    )
+    first = sequence("first")
+    second = sequence("second", token_offset=100)
+    third = sequence("third", token_offset=200)
+    checkpoint(scheduler, checkpoints, first, 16)
+    scheduler.update_state_after_alloc(first)
+    [first_request] = scheduler.build_connector_meta().requests
+    for seq in (second, third):
+        checkpoint(scheduler, checkpoints, seq, 16)
+        scheduler.update_state_after_alloc(seq)
+    scheduler.request_finished(second)
+    assert scheduler._save_committed == {"second": second}
+
+    [second_request] = scheduler.build_connector_meta().requests
+    assert second_request.req_id == "second"
+    assert set(scheduler._save_inflight) == {"first", "second"}
+    assert scheduler.build_connector_meta().requests == []
+    terminal(scheduler, first_request.save_operation)
+    [third_request] = scheduler.build_connector_meta().requests
+    assert third_request.req_id == "third"
+
+
+def test_finished_inflight_save_commits_one_residual_tail(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(
+        monkeypatch, capacity=1, policy="priority", min_observed=1
+    )
+    seq = sequence(computed=8)
+    checkpoint(scheduler, checkpoints, seq, 8)
+    checkpoint(scheduler, checkpoints, seq, 16)
+    scheduler.update_state_after_alloc(seq)
+    [first] = scheduler.build_connector_meta().requests
+    assert first.native_state.boundary_tokens == 8
+
+    seq.num_cached_tokens = 16
+    scheduler.request_finished(seq)
+    terminal(scheduler, first.save_operation)
+    assert scheduler._save_committed == {"1": seq}
+    [residual] = scheduler.build_connector_meta().requests
+    assert residual.native_state.boundary_tokens == 16
+    assert residual.save_spec.skip_leading_tokens == 8
+    terminal(scheduler, residual.save_operation)
+    assert scheduler.build_connector_meta().requests == []
+    assert scheduler._save_tracker == {}
+
+
+def test_finished_priority_failure_drops_tail_without_retry_or_leaks(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(
+        monkeypatch, capacity=1, policy="priority", min_observed=1
+    )
+    seq = sequence()
+    checkpoint(scheduler, checkpoints, seq, 16)
+    scheduler.update_state_after_alloc(seq)
+    [request] = scheduler.build_connector_meta().requests
+    scheduler.request_finished(seq)
+
+    terminal(scheduler, request.save_operation, succeeded=False)
+    assert scheduler.build_connector_meta().requests == []
+    assert scheduler._save_tracker == {}
+    assert scheduler._save_failures == {}
+    assert scheduler._save_operation_blocks == {}
+    assert scheduler._save_operation_owner == {}
+    stats = scheduler.get_statistics()
+    assert stats["save_dropped_terminal_failure"] == 1
+    assert stats["save_dropped_tokens_terminal_failure"] == 16
+
+
+def test_active_priority_failure_retains_bounded_retry(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(
+        monkeypatch, capacity=1, policy="priority", min_observed=1
+    )
+    seq = sequence()
+    checkpoint(scheduler, checkpoints, seq, 16)
+    scheduler.update_state_after_alloc(seq)
+    [first] = scheduler.build_connector_meta().requests
+    terminal(scheduler, first.save_operation, succeeded=False)
+    [second] = scheduler.build_connector_meta().requests
+    assert second.save_operation != first.save_operation
+
+
+def test_late_failure_from_reused_request_id_does_not_drop_new_lifecycle(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(
+        monkeypatch, capacity=1, policy="priority", min_observed=1
+    )
+    old = sequence("same")
+    checkpoint(scheduler, checkpoints, old, 16)
+    scheduler.update_state_after_alloc(old)
+    [old_request] = scheduler.build_connector_meta().requests
+    scheduler.request_finished(old)
+
+    new = sequence("same", token_offset=100)
+    checkpoint(scheduler, checkpoints, new, 16)
+    scheduler.update_state_after_alloc(new)
+    terminal(scheduler, old_request.save_operation, succeeded=False)
+    assert scheduler._save_tracker["same"][0] is new
+    assert scheduler._retired_requests == {}
+
+    [new_request] = scheduler.build_connector_meta().requests
+    assert new_request.req_id == new.id
+    assert new_request.save_operation != old_request.save_operation
+
+
+def test_priority_statistics_report_candidates_reservations_drops_and_real_leases(
+    monkeypatch,
+):
+    scheduler, checkpoints, _ = make_scheduler(
+        monkeypatch, capacity=1, policy="priority", min_observed=2
+    )
+    cold = sequence("cold")
+    checkpoint(scheduler, checkpoints, cold, 16)
+    scheduler.update_state_after_alloc(cold)
+    stats = scheduler.get_statistics()
+    assert stats["save_candidates"] == 1
+    assert stats["save_candidates_finished"] == 0
+    assert stats["save_admitted"] == 0
+    assert stats["save_priority_score"] > 0
+
+    scheduler.request_finished(cold)
+    stats = scheduler.get_statistics()
+    assert stats["save_dropped_low_value"] == 1
+    assert stats["save_dropped_tokens_low_value"] == 16
+    assert stats["save_candidates"] == 0
+
+    leased = sequence("leased", token_offset=100)
+    scheduler.activate_block_leases(leased, frozenset({7, 8}))
+    stats = scheduler.get_statistics()
+    assert stats["save_pinned_blocks"] == 2
+    assert stats["save_pinned_tokens"] == 8
+    assert stats["deferred_free_requests"] == 1
 
 
 def test_save_frontier_selects_existing_checkpoint_below_computed_tokens(monkeypatch):
