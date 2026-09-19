@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789665360414,
+  "lastUpdate": 1789838094538,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -3047,6 +3047,57 @@ window.BENCHMARK_DATA = {
             "value": 0.8923,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35245887981 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609171455 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1691 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lin Sun",
+            "username": "linsun12",
+            "email": "linsun12@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "d07089373a6d6020e6455dc3baed884416062b19",
+          "message": "fix the cudagraph crash by not assignning state slots for warmup batches (#2273)",
+          "timestamp": "2026-09-19T14:05:48Z",
+          "url": "https://github.com/ROCm/ATOM/commit/d07089373a6d6020e6455dc3baed884416062b19"
+        },
+        "date": 1789838094027,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9424,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35454416832 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202609191458 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9356 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9424,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35454416832 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609191458 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9439 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 66.14,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35454416832 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609191458 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9439 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8976,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35454416832 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609191458 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1766 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
