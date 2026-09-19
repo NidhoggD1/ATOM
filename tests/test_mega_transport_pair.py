@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
-"""Prefill and decode must not share one MegaMoE recv layout.
+"""Prefill and decode use separately sized MegaMoE transports.
 
 Compaction is fixed when a transport is constructed and its row capacity comes
-from that capacity rather than the step's tokens, so the two phases get two
-transports: prefill keeps token-major rows, decode gets a small compact one.
+from that capacity rather than the step's tokens, so decode gets a small compact
+transport. Prefill is either the mori token-major baseline or a full-capacity
+TDM compact transport, selected by ATOM_MEGA_DISPATCH_TDM.
 These tests drive the real host selection and cache with stubs for the AITER
 constructor, the cco communicator and the per-forward context; they do not
 claim to validate collectives, arena bytes or graph replay.
@@ -154,14 +155,14 @@ def test_pair_splits_capacity_layout_and_dispatch_kernel(runtime):
 def test_prefill_dispatch_kernel_is_switchable_without_moving_decode(
     runtime, monkeypatch
 ):
-    # Compaction only exists on TDM, so the decode half stays there whatever
-    # prefill runs on.
+    # The prefill switch selects the complete TDM compact path. Decode keeps its
+    # own smaller TDM compact transport independently.
     monkeypatch.setenv("ATOM_MEGA_DISPATCH_TDM", "1")
 
     prefill, decode = runtime.build()
 
     assert prefill._config.dispatch_backend == "tdm"
-    assert prefill._config.compact_plan is False
+    assert prefill._config.compact_plan is True
     assert decode._config.dispatch_backend == "tdm"
     assert decode._config.compact_plan is True
 

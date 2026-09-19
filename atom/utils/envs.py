@@ -164,16 +164,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # own MEGA_DISPATCH=flydsl|mori), 0 binds mori's v2 op-layer running plain
     # gather, i.e. the untouched upstream baseline.
     "ATOM_MORI_V2_FUSED": lambda: os.getenv("ATOM_MORI_V2_FUSED", "0") == "1",
-    # Run the PREFILL transport's dispatch on aiter's FlyDSL TDM kernel instead
-    # of mori's. Both carry the quantized wire's e8m0 row, so this is a straight
-    # swap of the kernel that moves the payload. Off by default because a full
-    # prefill batch is payload-bound and mori is the faster mover there: at 16k
-    # tokens/rank on EP4 fp4, dispatch measured 220us against TDM's 249us, with
-    # the whole layer within noise of each other. Only read on a quantizing wire
-    # under ATOM_MORI_V2_FUSED -- a bf16 wire keeps whatever $MEGA_DISPATCH
-    # names -- and it does not reach the decode transport, which is always on
-    # TDM (see ATOM_MEGA_DECODE_COMPACT).
-    "ATOM_MEGA_DISPATCH_TDM": lambda: os.getenv("ATOM_MEGA_DISPATCH_TDM", "0") == "1",
+    # Run PREFILL on aiter's FlyDSL TDM dispatch with compact recv rows. Both the
+    # backend and compaction are selected together because compact layout is a
+    # TDM-only contract between dispatch and the grouped expert kernels. Enabled
+    # by default for E2E validation; set to 0 for the mori token-major baseline.
+    # Only read on a quantizing wire under ATOM_MORI_V2_FUSED -- a bf16 wire
+    # keeps whatever $MEGA_DISPATCH names. Decode has its own smaller compact
+    # transport and remains controlled by ATOM_MEGA_DECODE_COMPACT.
+    "ATOM_MEGA_DISPATCH_TDM": lambda: os.getenv("ATOM_MEGA_DISPATCH_TDM", "1") == "1",
     # Give decode its own small-capacity TDM transport with compact recv rows,
     # alongside the prefill-capacity one that keeps them token-major. Compaction
     # trades payload traffic (one copy per route, where token-major dedups to one

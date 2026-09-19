@@ -459,11 +459,10 @@ def build_mega_transports(
     rows any decode step can fill and hands the expert GEMM a contiguous_m and a
     CSV token bucket sized for prefill.
 
-    So the phases get different transports AND different dispatch kernels.
-    Prefill keeps token-major rows, where the payload is the cost and the
-    dispatch dedups it per destination rank rather than per route; that is
-    mori's dispatch by default ($ATOM_MEGA_DISPATCH_TDM picks TDM's instead).
-    Decode gets a small compact transport, always on TDM because compaction is
+    So the phases get different-capacity transports. With
+    $ATOM_MEGA_DISPATCH_TDM=1, prefill also uses TDM compact rows for E2E
+    validation; setting it to 0 restores the mori token-major baseline. Decode
+    gets a separate small compact transport, always on TDM because compaction is
     a TDM-only recv layout, and there the fused stage1 (no route-ksplit
     preshuffle, no moe_route_g2l_lds) is worth the per-route copies.
 
@@ -474,7 +473,10 @@ def build_mega_transports(
     prefill = init_mega_transport(
         max_num_inp_token_per_rank=max_num_inp_token_per_rank,
         triton_experts=triton_experts,
-        want_compact=False,
+        # Compact is a TDM-only layout; _dispatch_backend() selects TDM under
+        # the same switch. Keeping these together makes one env var a complete
+        # prefill A/B between TDM compact and the mori token-major baseline.
+        want_compact=envs.ATOM_MEGA_DISPATCH_TDM,
         **recipe,
     )
     if triton_experts or not envs.ATOM_MEGA_DECODE_COMPACT or not _wire_is_quantized():
