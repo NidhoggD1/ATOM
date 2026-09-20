@@ -136,7 +136,8 @@ def _sparse_attn_indexer_kpool(
     attn_metadata = fwd.attn_metadata
     context = fwd.context
     result = weights.to(dtype=torch.float32, copy=True)
-    if context.is_dummy_run:
+    # context is None during vLLM's profile (_dummy_run) pass — treat as dummy.
+    if context is None or context.is_dummy_run:
         return result
 
     if get_dcp_world_size() > 1 or pcp_is_enabled():

@@ -27,6 +27,12 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "DeepseekV32ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Glm4MoeForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "GlmMoeDsaForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    # GLM-5.3-Flash (glm5_next). Native ATOM already has this class; without
+    # this entry `vllm serve` never sees Glm5NextForConditionalGeneration on
+    # vLLM 0.28.x and the plugin never wraps ATOM kernels.
+    "Glm5NextForConditionalGeneration": (
+        "atom.plugin.vllm.models.glm5_next:Glm5NextForConditionalGenerationVllm"
+    ),
     "DeepSeekMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepSeekV4MTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Glm4MoeMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
@@ -294,6 +300,15 @@ def register_model() -> None:
         return
 
     _set_plugin_mode()
+
+    # Install the GLM-5.3-Flash MLA/mamba KV page-alignment fix. register_model
+    # runs in each worker before its KV-cache setup calls
+    # `_align_hybrid_block_size`, and (unlike register_platform) reliably runs in
+    # the worker process, so patch the base Platform method from here.
+    from atom.plugin.vllm.platform import _install_glm5_align_patch
+
+    _install_glm5_align_patch()
+
     # The general-plugin hook runs in the EngineCore process that owns the
     # scheduler/KVCacheManager; install this here as well as in the platform hook.
     from atom.plugin.vllm.deepseek_v4_prefix_patch import (

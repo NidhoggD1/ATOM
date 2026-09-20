@@ -35,6 +35,14 @@ _MLA_FAST_MODE = True
 _MLA_MAX_SPLIT_PER_BATCH = 16
 
 
+def hf_text_config(model_config):
+    """The text sub-config when the checkpoint nests one (e.g. GLM-5.3-Flash).
+
+    `index_topk` and `num_hidden_layers` live there, not on the outer config.
+    """
+    return getattr(model_config, "hf_text_config", None) or model_config.hf_config
+
+
 def get_aiter_kv_cache_dtype(config) -> torch.dtype:
     kv_cache_dtype = config.cache_config.cache_dtype
     if kv_cache_dtype == "auto" or kv_cache_dtype == "bfloat16":
@@ -1932,7 +1940,7 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.padded_num_heads = max(self.num_heads, _MLA_MIN_HEADS)
         self.mla_dims = get_mla_dims(self.model_config)
-        self.topk_tokens = config.model_config.hf_config.index_topk
+        self.topk_tokens = hf_text_config(config.model_config).index_topk
         self.max_model_len_tensor = torch.tensor(
             [self.model_config.max_model_len], device=device, dtype=torch.int32
         )
@@ -2336,7 +2344,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         # num_speculative_tokens should be 0 for its builders.
         is_draft_layer = False
         if layer_names:
-            num_hidden_layers = config.model_config.hf_config.num_hidden_layers
+            num_hidden_layers = hf_text_config(config.model_config).num_hidden_layers
             layer_indices = [
                 extract_layer_index(layer_name) for layer_name in layer_names
             ]
