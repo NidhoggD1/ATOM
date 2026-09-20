@@ -671,11 +671,7 @@ class TestForbiddingToolCallsDoesNotDeleteTheAnswer:
                     continue
                 fn = node.func
                 name = getattr(fn, "id", None) or getattr(fn, "attr", None)
-                if name not in (
-                    "ToolCallStreamParser",
-                    "ForcedJsonToolCallParser",
-                    "parse_tool_calls",
-                ):
+                if name not in ("ToolCallStreamParser", "parse_tool_calls"):
                     continue
                 built += 1
                 parser_arg = next(
