@@ -633,6 +633,157 @@ def test_hbm_catches_up_after_a_pending_cpu_lookup(monkeypatch):
     assert metadata.requests == []
 
 
+def _counting_lookup(calls, hit):
+    def lookup(_tokens, lookup_id):
+        calls.append(lookup_id)
+        return hit
+
+    return SimpleNamespace(lookup=lookup, clear_lookup_status=lambda _sid: None)
+
+
+def test_native_retry_on_a_full_kv_cache_reuses_the_lookup(
+    monkeypatch, scheduler, seq_factory
+):
+    """One lookup per frontier, not one per scheduler step.
+
+    ATOM's own scheduler runs the external-tier lookup at the top of its waiting
+    loop, ahead of `can_allocate`, and every failure path puts the sequence back
+    at the head of `waiting` with its frontier untouched -- so the next step
+    asks the identical question. A complete miss pins nothing, so
+    `build_connector_meta` dispatches the lookup's cleanup and the step after
+    that hashes the whole prompt again. With the KV cache full that is every
+    step, on the scheduler thread, which is how the engine livelocks.
+    """
+
+    connector = _scheduler(monkeypatch, "kv_consumer")
+    calls = []
+    connector._lookup_client = _counting_lookup(calls, 0)
+    scheduler.kv_connector = connector
+    seq = seq_factory(list(range(24)))
+    scheduler.add(seq)
+    monkeypatch.setattr(scheduler.block_manager, "can_allocate", lambda _seq: -1)
+
+    for _ in range(8):
+        scheduler.schedule()
+
+    assert list(scheduler.waiting) == [seq]
+    assert calls == [str(seq.id)]
+    assert connector.total_lookups_skipped_by_memo == 7
+
+
+def test_native_admission_spends_the_memo(monkeypatch, scheduler, seq_factory):
+    """The memo is keyed on a frontier, so admission has to end it.
+
+    Once the request is scheduled its frontier moves and the answer no longer
+    describes anything. Holding the entry past that point would also hold the
+    sequence itself, one per request id, for as long as the process runs.
+    """
+
+    connector = _scheduler(monkeypatch, "kv_consumer")
+    calls = []
+    connector._lookup_client = _counting_lookup(calls, 0)
+    scheduler.kv_connector = connector
+    seq = seq_factory(list(range(24)))
+    scheduler.add(seq)
+    kv_full = {"yes": True}
+    can_allocate = scheduler.block_manager.can_allocate
+    monkeypatch.setattr(
+        scheduler.block_manager,
+        "can_allocate",
+        lambda value: -1 if kv_full["yes"] else can_allocate(value),
+    )
+
+    scheduler.schedule()
+    assert calls == [str(seq.id)]
+    assert str(seq.id) in connector._match_memo
+
+    kv_full["yes"] = False
+    scheduler.schedule()
+
+    assert list(scheduler.waiting) == []
+    assert connector._match_memo == {}
+
+
+def test_a_declined_load_is_not_looked_up_again_every_step(monkeypatch):
+    """The plugin's shape: the decline is what releases the lookup.
+
+    vLLM hands ATOM the real HBM frontier, so `should_park_for_load_after_alloc`
+    routinely declines a hit -- already covered by HBM, unaligned, or below the
+    transfer floor. Declining clears the pending load, which makes the lookup
+    dispatchable, which drops the memo it was cached in. The request is still at
+    the head of the waiting queue at the same frontier, so without a memo keyed
+    on that frontier the next step pays for the tier again.
+    """
+
+    sched = _scheduler(monkeypatch, "kv_consumer")
+    sched._min_load_tokens = 8192  # every hit here is "too small" to transfer
+    calls = []
+    sched._lookup_client = _counting_lookup(calls, 16)
+    seq = _load_seq(60, num_prompt_tokens=24)
+
+    for _ in range(8):
+        need, _park = sched.get_num_new_matched_tokens(seq)
+        assert not (need > 0 and sched.should_park_for_load_after_alloc(seq))
+        sched.build_connector_meta()
+
+    assert calls == ["60"]
+    assert sched.total_lookups_skipped_by_memo == 7
+    assert "60" not in sched._load_specs
+
+
+def test_a_moved_frontier_is_a_new_question(monkeypatch):
+    sched = _scheduler(monkeypatch, "kv_consumer")
+    sched._min_load_tokens = 8192
+    calls = []
+    sched._lookup_client = _counting_lookup(calls, 16)
+    seq = _load_seq(61, num_prompt_tokens=24)
+
+    sched.get_num_new_matched_tokens(seq)
+    sched.should_park_for_load_after_alloc(seq)
+    sched.build_connector_meta()
+    seq.num_cached_tokens = 8
+    sched.get_num_new_matched_tokens(seq)
+
+    assert calls == ["61", "61"]
+
+
+def test_a_failed_lookup_is_not_memoized(monkeypatch):
+    """A timeout is not an answer. Caching it would turn one dropped reply
+    into a permanent miss for the rest of the request's life."""
+
+    sched = _scheduler(monkeypatch, "kv_consumer")
+    sched._min_load_tokens = 0
+    replies = [None, 16]
+    calls = []
+
+    def lookup(_tokens, lookup_id):
+        calls.append(lookup_id)
+        return replies.pop(0)
+
+    sched._lookup_client = SimpleNamespace(
+        lookup=lookup, clear_lookup_status=lambda _sid: None
+    )
+    seq = _load_seq(62, num_prompt_tokens=24)
+
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    sched.build_connector_meta()
+
+    assert sched.get_num_new_matched_tokens(seq) == (16, True)
+    assert calls == ["62", "62"]
+
+
+def test_a_finished_request_leaves_no_memo_behind(monkeypatch):
+    sched = _scheduler(monkeypatch, "kv_consumer")
+    calls = []
+    sched._lookup_client = _counting_lookup(calls, 0)
+    seq = _load_seq(63, num_prompt_tokens=24)
+
+    sched.get_num_new_matched_tokens(seq)
+    sched.request_finished(seq)
+
+    assert sched._match_memo == {}
+
+
 def test_cpu_pin_is_retained_until_retrieve_finishes(monkeypatch):
     scheduler = _scheduler(monkeypatch, "kv_consumer")
     scheduler._min_load_tokens = 0

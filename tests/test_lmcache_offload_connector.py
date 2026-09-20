@@ -177,6 +177,8 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._save_inflight_tokens = {}
     sched._load_failed_seqs = {}
     sched.total_suppressed_load_retries = 0
+    sched.total_lookups_skipped_by_memo = 0
+    sched._match_memo = {}
     sched.total_load_requests = 0
     sched.total_loaded_tokens = 0
     sched.total_load_failures = 0
@@ -5122,6 +5124,7 @@ def test_scheduler_offload_statistics_are_cumulative():
         "loads_pending": 0,
         "saves_pending": 0,
         "suppressed_load_retries": 0,
+        "lookups_skipped_by_memo": 0,
     }
 
 

@@ -417,15 +417,27 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         So the decision is taken here, before the promise. When ATOM declines it
         has already cleared its pending-load state, and reporting no external
         tokens leaves the request to prefill normally.
+
+        vLLM asks this question far more often than it has news: in
+        `schedule()` it is gated only on `num_computed_tokens == 0` and runs
+        BEFORE `allocate_slots`, so a request that fails allocation comes back
+        with its frontier still 0 and is asked again on the very next step.
+        Under a full KV cache that repeats forever and the engine livelocks.
+        The memo that stops it lives in ATOM's scheduler, keyed by this
+        frontier, because the native scheduler has the same retry shape; see
+        `ChunkedOffloadSchedulerBase.get_num_new_matched_tokens`. Everything
+        below a repeated answer is then dictionary lookups: a declined load has
+        already cleared its pending state, so `should_park_for_load_after_alloc`
+        returns False without deciding anything a second time.
         """
         seq = self._seqs.get_or_create(request)
         seq.set_num_cached_tokens(num_computed_tokens)
         need, _ = self._scheduler.get_num_new_matched_tokens(seq)
-        if need <= 0:
+        if need <= 0 or not self._scheduler.should_park_for_load_after_alloc(seq):
             return 0, False
-        if not self._scheduler.should_park_for_load_after_alloc(seq):
-            return 0, False
-        self._promised_loads[request.request_id] = 0
+        # setdefault, not assignment: the watchdog counts steps since the
+        # promise, and re-answering the same question is not news.
+        self._promised_loads.setdefault(request.request_id, 0)
         return need, True
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):

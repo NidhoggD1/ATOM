@@ -483,6 +483,9 @@ class OffloadSchedulerMixin(ABC):
         # external-tier attempt per request; see `_repeat_load_suppressed`.
         self._load_failed_seqs: dict[str, object] = {}
         self.total_suppressed_load_retries = 0
+        # Repeats of `get_num_new_matched_tokens` answered from the frontier
+        # memo instead of a fresh external-tier lookup.
+        self.total_lookups_skipped_by_memo = 0
         # Early block-release observability. Populated by layouts that support
         # exact source-block leases; unsupported layouts leave these at 0.
         self.total_early_released_blocks = 0  # freed at request-finish, not save-gated
@@ -590,6 +593,7 @@ class OffloadSchedulerMixin(ABC):
             "loads_pending": len(self._load_inflight_tokens),
             "saves_pending": len(self._save_inflight_tokens),
             "suppressed_load_retries": self.total_suppressed_load_retries,
+            "lookups_skipped_by_memo": self.total_lookups_skipped_by_memo,
         }
         if hasattr(self, "total_early_released_blocks"):
             statistics.update(

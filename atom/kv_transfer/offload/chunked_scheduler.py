@@ -126,6 +126,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._active_load_operations: dict[str, tuple[object, LoadOperationId]] = {}
         self._lookup_in_step: list[str] = []
         self._lookup_results: dict[str, tuple[object, int]] = {}
+        # sid -> (seq, HBM frontier the answer was computed against, answer).
+        # Both schedulers re-ask `get_num_new_matched_tokens` every step for as
+        # long as a request stays unadmitted; see that method for why answering
+        # from here is what keeps a full KV cache from livelocking.
+        self._match_memo: dict[str, tuple[object, int, tuple[int, bool]]] = {}
         self._handoff_loads: set[str] = set()
         # Unaligned handoff is always on: when the HBM prefix-cache hit is not
         # chunk-aligned, recompute the misaligned head up to the next chunk
@@ -151,22 +156,58 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._clear_pending_load(sid)
             self._active_load_operations.pop(sid, None)
             self._load_failed_seqs.pop(sid, None)
+            self._match_memo.pop(sid, None)
         self._load_lifecycles[sid] = seq
 
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
+        """How many extra prompt tokens the external tier can supply.
+
+        The answer is memoized against the request's HBM frontier, because both
+        schedulers ask this question once per step for as long as the request
+        stays unadmitted. The call site is upstream of allocation -- vLLM gates
+        it on `num_computed_tokens == 0`, ATOM's own scheduler runs it before
+        `block_manager.can_allocate` -- and every allocation failure returns the
+        request to the head of the waiting queue with its frontier untouched. So
+        a full KV cache turns one question into one question per step, and this
+        question is not cheap: it copies the prompt, hashes it a chunk at a time
+        on the scheduler thread (~5k hashes for a 645k-token prompt) and blocks
+        on the tier's reply. The step rate collapses, the running requests
+        cannot finish, the KV cache never drains, and the engine livelocks with
+        the GPUs idle. Measured on GLM-5.3 TP4 through the vLLM plugin; the
+        native path is exposed on a complete tier miss, whose lookup is likewise
+        dispatched and dropped every step.
+
+        Answering from the memo is sound because the question is a function of
+        the prompt (fixed), the frontier (the key) and the tier's contents. Only
+        the last can move underneath us, and only by gaining a prefix that
+        another request stored while this one waited; missing it costs a
+        recompute, which is what a miss would have cost anyway. The side effects
+        a fresh answer leaves behind -- the load spec, the save floor,
+        `offload_loaded_tokens` -- are functions of the same key, so the step
+        that filled the memo already applied them and repeating them would be a
+        no-op. The entry is dropped when the request is admitted, when the ID is
+        handed to a new sequence, and when the request finishes.
+        """
+
         if not self._do_load or self._lookup_client is None:
             return 0, False
         self._begin_load_lifecycle(seq)
         sid = str(seq.id)
         if self._repeat_load_suppressed(seq, sid):
             return 0, False
-        num_prompt = seq.num_prompt_tokens
-        token_ids = list(seq.token_ids[:num_prompt])
         pending = self._lookup_results.get(sid)
         if pending is not None and pending[0] is not seq:
             # An older lifecycle still owns this worker-side pin. Its cleanup
-            # must be dispatched before the ID can acquire a new lease.
+            # must be dispatched before the ID can acquire a new lease. Not
+            # memoized: what clears it is a metadata dispatch, not a frontier.
             return 0, False
+        frontier = int(seq.num_cached_tokens)
+        memo = self._match_memo.get(sid)
+        if memo is not None and memo[0] is seq and memo[1] == frontier:
+            self.total_lookups_skipped_by_memo += 1
+            return memo[2]
+        num_prompt = seq.num_prompt_tokens
+        token_ids = list(seq.token_ids[:num_prompt])
         try:
             if pending is None:
                 if sid not in self._lookup_in_step:
@@ -203,25 +244,41 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 hit,
                 _lh,
             )
-        if not hit:
+        if hit is None:
+            # Timed out or refused: not an answer. Ask again next step rather
+            # than freezing a transport failure into the memo.
             return 0, False
+        if not hit:
+            return self._memoize_match(sid, seq, frontier, (0, False))
         hit = self._loadable_hit(hit, num_prompt)
         self._hit_save_floors[sid] = hit
-        need = hit - int(seq.num_cached_tokens)
+        need = hit - frontier
         if need <= 0:
             self._clear_pending_load(sid)
             self._hit_save_floors[sid] = self._chunk_floor(hit)
-            return 0, False
+            return self._memoize_match(sid, seq, frontier, (0, False))
         self._load_specs[sid] = LoadSpec(
-            hbm_cached_tokens=int(seq.num_cached_tokens),
+            hbm_cached_tokens=frontier,
             lmcache_cached_tokens=hit,
             can_load=False,
         )
-        return need, True  # True => park in WAITING_FOR_REMOTE_KVS
+        # True => park in WAITING_FOR_REMOTE_KVS
+        return self._memoize_match(sid, seq, frontier, (need, True))
+
+    def _memoize_match(
+        self, sid: str, seq, frontier: int, answer: tuple[int, bool]
+    ) -> tuple[int, bool]:
+        """Record an answer against the sequence and frontier it was asked for."""
+
+        self._match_memo[sid] = (seq, frontier, answer)
+        return answer
 
     def update_state_after_alloc(self, seq) -> None:
         self._begin_load_lifecycle(seq)
         sid = str(seq.id)
+        # Admitted: the frontier is about to move and the load spec is about to
+        # be dispatched, so the answer keyed against the old frontier is spent.
+        self._match_memo.pop(sid, None)
         ls = self._load_specs.get(sid) if self._do_load else None
         logger.debug(
             "[OFFLOAD-ALLOC] seq=%s ls_found=%s num_cached_now=%s",
@@ -850,6 +907,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if self._load_lifecycles.get(sid) is not seq:
             return
         self._clear_pending_load(sid)
+        self._match_memo.pop(sid, None)
         active = self._active_load_operations.get(sid)
         if active is not None and active[0] is seq:
             self._active_load_operations.pop(sid, None)
@@ -868,6 +926,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._cancel_load_statistics(active[1])
             self._load_lifecycles.pop(sid, None)
         self._release_failed_load_attempt(sid, seq)
+        memo = self._match_memo.get(sid)
+        if memo is not None and memo[0] is seq:
+            self._match_memo.pop(sid, None)
         entry = self._save_tracker.get(sid)
         if entry is not None and entry[0] is seq:
             if self._early_release:

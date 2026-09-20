@@ -130,6 +130,7 @@ def test_view_accepts_the_frozen_placement_the_chunked_scheduler_writes():
         _load_lifecycles={},
         _active_load_operations={},
         _load_failed_seqs={},
+        _match_memo={},
         _save_tracker={"r1": [view, 0]},
         _early_release=True,
         should_defer_free=lambda seq: False,
