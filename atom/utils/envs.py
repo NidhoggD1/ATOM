@@ -221,6 +221,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_STATE_CHECKPOINT_DEMAND": lambda: (
         os.getenv("ATOM_STATE_CHECKPOINT_DEMAND", "1") == "1"
     ),
+    # Experimental V4 FP4 decode TopK + CSA packing. Keep the AITER path as
+    # default until correctness and end-to-end performance are validated.
+    "ATOM_V4_CPP_TOPK": lambda: os.getenv("ATOM_V4_CPP_TOPK", "0") == "1",
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by

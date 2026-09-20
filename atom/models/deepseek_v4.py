@@ -1490,6 +1490,15 @@ class Indexer(nn.Module):
         self._indexer_fp4 = fp4_indexer_enabled(
             get_current_atom_config().index_cache_dtype
         )
+        self._cpp_topk = envs.ATOM_V4_CPP_TOPK and self._indexer_fp4
+        self._topk_window_size = args.window_size
+        if self._cpp_topk:
+            from atom.model_ops.v4_kernels.cpp_topk import load_cpp_topk
+
+            if not 1 <= self.index_topk <= 2048:
+                raise ValueError("ATOM_V4_CPP_TOPK requires index_topk in [1, 2048]")
+            # Compile before model warmup / graph capture, once per process.
+            load_cpp_topk()
 
         self.compressor = Compressor(
             args,
@@ -1685,6 +1694,15 @@ class Indexer(nn.Module):
         )
         return q_fp8, weights, None
 
+    def uses_cpp_topk(self) -> bool:
+        """One predicate for the fused producer and the translate bypass."""
+        fc = get_forward_context()
+        return (
+            self._cpp_topk
+            and not fc.context.is_prefill
+            and fc.attn_metadata.state is AttnState.DECODE
+        )
+
     def score_topk_from(
         self,
         q_quant: torch.Tensor,
@@ -1692,6 +1710,17 @@ class Indexer(nn.Module):
         q_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Eager paged gather + score + top-k (reads compressor KV cache)."""
+        if self.uses_cpp_topk():
+            fc = get_forward_context()
+            return torch.ops.aiter.indexer_score_topk_csa(
+                q_quant,
+                weights,
+                q_scale,
+                fc.context.positions,
+                fc.attn_metadata.kv_indices_csa,
+                self.prefix,
+                self.index_topk,
+            )
         return torch.ops.aiter.indexer_score_topk(
             q_quant, weights, q_scale, self.prefix, self.index_topk
         )  # [total_tokens, index_topk] int32
@@ -1702,6 +1731,9 @@ class Indexer(nn.Module):
         weights: torch.Tensor,  # [total_tokens, n_heads] fp32
         q_scale: torch.Tensor | None,  # FP4 e8m0 Q scale (None on the FP8 path)
         topk: int,
+        *,
+        positions: torch.Tensor | None = None,
+        packed_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Module-side entry invoked by `torch.ops.aiter.indexer_score_topk`.
 
@@ -1732,7 +1764,8 @@ class Indexer(nn.Module):
                     q_quant, q_scale, block_tables, weights, indexer_meta, topk
                 )
             return self._score_topk_decode_fp4(
-                q_quant, q_scale, block_tables, weights, indexer_meta, topk
+                q_quant, q_scale, block_tables, weights, indexer_meta, topk,
+                positions=positions, packed_indices=packed_indices,
             )
 
         # No host-side `if total_committed == 0: return torch.full(-1)`
@@ -2104,6 +2137,9 @@ class Indexer(nn.Module):
         weights: torch.Tensor,  # [padded_tokens, n_heads] fp32
         indexer_meta: dict,  # carries the varlen windows built by the attn builder
         topk: int,
+        *,
+        positions: torch.Tensor | None = None,
+        packed_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """RAGGED decode FP4 via the varqlen (ragged-prefill) MQA-logits kernel.
 
@@ -2192,6 +2228,24 @@ class Indexer(nn.Module):
             cta_info=cta_info,
             n_ctas=n_ctas,
         )  # [padded_tokens, max_seq_len] fp32, seq-local
+        if packed_indices is not None:
+            from atom.model_ops.v4_kernels.cpp_topk import cpp_topk_csa
+
+            assert positions is not None
+            attn_md = get_forward_context().attn_metadata
+            return cpp_topk_csa(
+                logits,
+                local_ends,
+                block_tables,
+                positions,
+                attn_md.kv_indptr_csa,
+                batch_id_per_q_token,
+                packed_indices,
+                topk,
+                attn_md.envelope_rows,
+                kv_block_size,
+                self._topk_window_size,
+            )
         # Seq-local output → indices returned directly. top_k writes every row
         # (real + empty pad rows → -1), so a bare torch.empty output is fine.
         topk_out = torch.empty((padded_tokens, topk), dtype=torch.int32, device=device)
@@ -3109,7 +3163,8 @@ class DeepseekV4Attention(nn.Module):
                 pre_weights=idx_weights,
                 pre_q_scale=idx_q_scale,
             )
-            self._fill_csa_paged_compress(attn_md, topk_local, positions, num_tokens)
+            if not self.indexer.uses_cpp_topk():
+                self._fill_csa_paged_compress(attn_md, topk_local, positions, num_tokens)
 
         # ===== Sparse attention dispatch =====
         # Decode SWA write fires upstream of this dispatch via the

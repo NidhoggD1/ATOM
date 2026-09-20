@@ -2,3 +2,4 @@ include atom/mesh/Cargo.toml
 include atom/mesh/Cargo.lock
 include atom/mesh/build.rs
 recursive-include atom/mesh/src *
+recursive-include atom/model_ops/v4_kernels/csrc *.h *.cuh *.cu *.cpp *.md LICENSE.apache-2.0

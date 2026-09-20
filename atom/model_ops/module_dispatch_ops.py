@@ -217,6 +217,47 @@ direct_register_custom_op(
 )
 
 
+def indexer_score_topk_csa(
+    q_quant: torch.Tensor,
+    weights: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    positions: torch.Tensor,
+    packed_indices: torch.Tensor,
+    layer_name: str,
+    topk: int,
+) -> torch.Tensor:
+    indexer = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return indexer.indexer_score_topk(
+        q_quant, weights, q_scale, topk,
+        positions=positions, packed_indices=packed_indices,
+    )
+
+
+def _indexer_score_topk_csa_fake(
+    q_quant: torch.Tensor,
+    weights: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    positions: torch.Tensor,
+    packed_indices: torch.Tensor,
+    layer_name: str,
+    topk: int,
+) -> torch.Tensor:
+    return q_quant.new_empty((q_quant.shape[0], topk), dtype=torch.int32)
+
+
+# Unlike the raw-only variant, this op has a visible output-buffer mutation.
+# In particular, Dynamo must retain it when its raw-index return is unused.
+direct_register_custom_op(
+    op_name="indexer_score_topk_csa",
+    op_func=indexer_score_topk_csa,
+    mutates_args=("packed_indices",),
+    fake_impl=_indexer_score_topk_csa_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
 def tbo_all_reduce(x: torch.Tensor) -> torch.Tensor:
     from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 

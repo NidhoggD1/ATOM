@@ -39,6 +39,12 @@ include-package-data = true
 [tool.setuptools.package-data]
 atom = [
     "mesh/target/release/libmesh.so",
+    "model_ops/v4_kernels/csrc/*.h",
+    "model_ops/v4_kernels/csrc/*.cuh",
+    "model_ops/v4_kernels/csrc/*.cu",
+    "model_ops/v4_kernels/csrc/*.cpp",
+    "model_ops/v4_kernels/csrc/*.md",
+    "model_ops/v4_kernels/csrc/LICENSE.apache-2.0",
 ]
 
 [project.entry-points."vllm.platform_plugins"]
