@@ -23,8 +23,9 @@ from .reasoning import (
 )
 from .sse import data_frame
 from .streaming_dispatch import StreamOutputCollector
-from .tool_parser import ToolCallStreamParser, parse_tool_calls
+from .tool_parser.forced import ForcedJsonToolCallParser, forced_tool_name
 from .tool_parser.registry import forbids_tool_calls
+from .tool_parser.stream import flatten_tool_events
 from .tool_parser.tool_parser import usable_tool_name
 
 logger = logging.getLogger("atom")
@@ -270,10 +271,11 @@ async def stream_chat_response(
     # the Anthropic path maps to `stop_sequence`, collapsed the same way.
     engine_finish_reason: str | None = None
     reasoning_filter = reasoning.stream()
-    tool_parser = ToolCallStreamParser(
+    tool_parser = ForcedJsonToolCallParser(
         tools=tools,
         parser_cls=_tool_parser_for_request(tool_parser_cls, tools),
         suppress_calls=forbids_tool_calls(tool_choice),
+        json_tool_name=forced_tool_name(tools, tool_choice),
     )
     has_tool_calls = False
 
@@ -407,11 +409,14 @@ def _build_chat_choice(
     without duplicating the logic.
     """
     reasoning_content, content_with_tools = reasoning.split(raw_text)
-    content, tool_calls = parse_tool_calls(
-        content_with_tools,
-        tools,
+    tool_parser = ForcedJsonToolCallParser(
+        tools=tools,
         parser_cls=_tool_parser_for_request(tool_parser_cls, tools),
         suppress_calls=forbids_tool_calls(tool_choice),
+        json_tool_name=forced_tool_name(tools, tool_choice),
+    )
+    content, tool_calls = flatten_tool_events(
+        tool_parser.process(content_with_tools) + tool_parser.flush()
     )
 
     message: dict[str, Any] = {"role": "assistant", "content": content}
@@ -572,10 +577,11 @@ async def stream_chat_response_fanout(
     # Every sibling answers the same prompt, so they start in the same state.
     reasoning_filters = [reasoning.stream() for _ in range(n)]
     tool_parsers = [
-        ToolCallStreamParser(
+        ForcedJsonToolCallParser(
             tools=tools,
             parser_cls=_tool_parser_for_request(tool_parser_cls, tools),
             suppress_calls=forbids_tool_calls(tool_choice),
+            json_tool_name=forced_tool_name(tools, tool_choice),
         )
         for _ in range(n)
     ]
