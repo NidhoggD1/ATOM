@@ -8,6 +8,9 @@ import numpy as np
 import pytest
 
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
+from atom.kv_transfer.disaggregation.multi.multi_connector import (
+    MultiConnectorScheduler,
+)
 from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     LoadOperationId,
@@ -770,6 +773,39 @@ def test_a_failed_lookup_is_not_memoized(monkeypatch):
 
     assert sched.get_num_new_matched_tokens(seq) == (16, True)
     assert calls == ["62", "62"]
+
+
+def test_a_multi_connector_disarm_does_not_restart_the_lookup(monkeypatch):
+    """Losing to another sub-connector must not cost a fresh hash every step.
+
+    `MultiConnectorScheduler` queries *every* sub on every scheduler pass and
+    then disarms the ones that did not win, so under the supported
+    `[moriio, lmcache_offload]` ordering the offload sub is asked, arms a load
+    and has it cancelled once per step. Forgetting the frontier answer on that
+    cancel would put the full-prompt hash back into every step -- the original
+    livelock, restored in the composite configuration. Demoting the answer
+    keeps both properties: one lookup per frontier, and no parking promise
+    behind a load spec that was taken away.
+    """
+
+    sched = _scheduler(monkeypatch, "kv_consumer")
+    sched._min_load_tokens = 0
+    calls = []
+    sched._lookup_client = _counting_lookup(calls, 16)
+    # moriio's shape: it matches first and implements no cancel at all.
+    moriio = SimpleNamespace(get_num_new_matched_tokens=lambda _seq: (16, True))
+    multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
+    multi._connectors = [moriio, sched]
+    multi._load_winner = {}
+    seq = _load_seq(64, num_prompt_tokens=24)
+
+    for _ in range(5):
+        assert multi.get_num_new_matched_tokens(seq) == (16, True)
+        sched.build_connector_meta()
+
+    assert calls == ["64"]
+    assert "64" not in sched._load_specs
+    assert sched._match_memo["64"][2] == (0, False)
 
 
 def test_a_finished_request_leaves_no_memo_behind(monkeypatch):

@@ -186,7 +186,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         `offload_loaded_tokens` -- are functions of the same key, so the step
         that filled the memo already applied them and repeating them would be a
         no-op. The entry is dropped when the request is admitted, when the ID is
-        handed to a new sequence, and when the request finishes.
+        handed to a new sequence, and when the request finishes; a cancel
+        demotes it to "nothing from me" rather than dropping it, see
+        `_disarm_match_memo`.
         """
 
         if not self._do_load or self._lookup_client is None:
@@ -249,27 +251,46 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             # than freezing a transport failure into the memo.
             return 0, False
         if not hit:
-            return self._memoize_match(sid, seq, frontier, (0, False))
+            return self._settle_match(sid, seq, frontier, (0, False))
         hit = self._loadable_hit(hit, num_prompt)
         self._hit_save_floors[sid] = hit
         need = hit - frontier
         if need <= 0:
             self._clear_pending_load(sid)
             self._hit_save_floors[sid] = self._chunk_floor(hit)
-            return self._memoize_match(sid, seq, frontier, (0, False))
+            return self._settle_match(sid, seq, frontier, (0, False))
         self._load_specs[sid] = LoadSpec(
             hbm_cached_tokens=frontier,
             lmcache_cached_tokens=hit,
             can_load=False,
         )
         # True => park in WAITING_FOR_REMOTE_KVS
-        return self._memoize_match(sid, seq, frontier, (need, True))
+        return self._settle_match(sid, seq, frontier, (need, True))
 
-    def _memoize_match(
+    def _refine_match(
+        self, seq, sid: str, answer: tuple[int, bool]
+    ) -> tuple[int, bool]:
+        """Subclass hook: the last word on an answer, before it is recorded.
+
+        A subclass that needs the whole picture -- the hit, the load spec and
+        the block layout -- gets it here rather than by post-processing what
+        `get_num_new_matched_tokens` returned, because a memoized answer is
+        replayed without re-entering that method. Anything decided after the
+        memo was written would be silently undone on the next repeat.
+        """
+
+        return answer
+
+    def _settle_match(
         self, sid: str, seq, frontier: int, answer: tuple[int, bool]
     ) -> tuple[int, bool]:
-        """Record an answer against the sequence and frontier it was asked for."""
+        """Refine, then record against the sequence and frontier asked about.
 
+        Refining here is what makes "the memo holds exactly what the caller was
+        told" true for subclasses too.
+        """
+
+        answer = self._refine_match(seq, sid, answer)
         self._match_memo[sid] = (seq, frontier, answer)
         return answer
 
@@ -902,12 +923,31 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._load_save_floors.pop(sid, None)
         return True
 
+    def _disarm_match_memo(self, sid: str, seq) -> None:
+        """Demote the frontier answer to a miss instead of forgetting it.
+
+        Cancelling takes the load spec away, so replaying a parking answer
+        would promise a transfer nobody is going to dispatch. Dropping the
+        entry instead would re-open the livelock the memo exists to close:
+        `MultiConnectorScheduler` queries every sub-connector on every
+        scheduler pass and then disarms the losers, so with the supported
+        `[moriio, lmcache_offload]` ordering a dropped entry means a fresh
+        full-prompt hash per step for as long as the request waits to be
+        admitted. Disarmed is also the honest answer at this frontier: this
+        connector is no longer the one loading the request.
+        """
+
+        memo = self._match_memo.get(sid)
+        if memo is None or memo[0] is not seq:
+            return
+        self._match_memo[sid] = (seq, memo[1], (0, False))
+
     def cancel_pending_load(self, seq) -> None:
         sid = str(seq.id)
         if self._load_lifecycles.get(sid) is not seq:
             return
         self._clear_pending_load(sid)
-        self._match_memo.pop(sid, None)
+        self._disarm_match_memo(sid, seq)
         active = self._active_load_operations.get(sid)
         if active is not None and active[0] is seq:
             self._active_load_operations.pop(sid, None)

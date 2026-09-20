@@ -463,7 +463,14 @@ class _MPLookupClient:
         self._poll_interval = poll_interval
         self._lookups: dict[str, _LookupState] = {}
 
-    def lookup(self, token_ids: list[int], lookup_id: str) -> int:
+    def lookup(self, token_ids: list[int], lookup_id: str) -> int | None:
+        """Hit length for this prompt, or None if the tier never answered.
+
+        None is a non-answer, not an empty answer: the caller must ask again
+        rather than record "this tier has nothing" for a prompt the tier may
+        well hold.
+        """
+
         state = _LookupState(token_ids=list(token_ids))
         self._lookups[lookup_id] = state
         self._adapter.maybe_submit_lookup_request(lookup_id, token_ids)
@@ -483,8 +490,10 @@ class _MPLookupClient:
                 # The MP API has no cancel-prefetch call. Keep the adapter job
                 # intact so request_finished() can release locks if the result
                 # becomes available; eagerly cleaning it here would orphan the
-                # server-side lookup and its locks.
-                return 0
+                # server-side lookup and its locks. `state.hit` stays None,
+                # which is what tells clear_lookup_status() the job is still
+                # outstanding.
+                return None
             time.sleep(self._poll_interval)
 
     def prepare_retrieve(
@@ -966,17 +975,25 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 shutdown()
             raise
 
-    def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
-        matched = super().get_num_new_matched_tokens(seq)
-        sid = str(seq.id)
+    def _refine_match(
+        self, seq, sid: str, answer: tuple[int, bool]
+    ) -> tuple[int, bool]:
+        """Settle what a whole-prompt hit means here, before it is memoized.
+
+        This runs inside the base answer rather than after it, so that the
+        recorded answer is this one: the base memoizes per frontier and replays
+        without re-entering `get_num_new_matched_tokens`, so a decision taken
+        after the fact would hold for one step and then be forgotten.
+        """
+
         hit = self._lookup_client.hit_tokens(sid)
         num_prompt = int(seq.num_prompt_tokens)
         if hit != num_prompt or num_prompt % self.chunk_size:
-            return matched
+            return answer
 
         load_spec = self._load_specs.get(sid)
         if load_spec is None:
-            return matched
+            return answer
         if self.block_size == 1:
             # Allocating prompt-1 one-token blocks cannot provide a destination
             # for the complete final LMCache chunk. Recompute instead.
@@ -985,7 +1002,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
 
         load_spec.transfer_end_tokens = num_prompt
         self._hit_save_floors[sid] = num_prompt
-        return matched
+        return answer
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         metadata = super().build_connector_meta()
