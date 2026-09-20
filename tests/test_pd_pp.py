@@ -1074,17 +1074,32 @@ def test_pp_head_dispatches_idle_offload_without_a_batch():
     head._dispatch_idle_offload_work.assert_called_once()
 
 
-def test_pp_head_idle_dispatch_shares_the_drain_throttle():
+def test_pp_head_idle_dispatch_shares_the_drain_throttle(monkeypatch):
     """The loop has no sleep; a direct dispatch would rebuild connector
     metadata on every turn."""
+    PPEngineCoreProc = _pp_engine_core_cls()
+    from atom.model_engine import engine_core
+
+    # CI can spend longer than the 1 ms drain interval between calls. Control
+    # the clock so this tests the throttle rather than the runner's speed.
+    now = 100.0
+    monkeypatch.setattr(engine_core, "time", SimpleNamespace(monotonic=lambda: now))
     head = _fake_head(None)
     head._dispatch_idle_offload_work.assert_called_once()
-    assert head._next_idle_kv_drain > 0, "the throttle was not armed"
+    assert head._next_idle_kv_drain == now + engine_core.KV_IDLE_DRAIN_INTERVAL_S
 
+    now += engine_core.KV_IDLE_DRAIN_INTERVAL_S / 2
     head.scheduler.schedule.side_effect = [None]
-    _pp_engine_core_cls()._pp_head_step(head)
+    PPEngineCoreProc._pp_head_step(head)
 
     head._dispatch_idle_offload_work.assert_called_once()  # still once: throttled
+
+    now = head._next_idle_kv_drain
+    head.scheduler.schedule.side_effect = [None]
+    PPEngineCoreProc._pp_head_step(head)
+
+    assert head._dispatch_idle_offload_work.call_count == 2
+    assert head._next_idle_kv_drain == now + engine_core.KV_IDLE_DRAIN_INTERVAL_S
 
 
 def test_pp_head_forwards_normal_batch_with_meta():
