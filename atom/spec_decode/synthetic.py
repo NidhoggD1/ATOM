@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: MIT
 """Token identity shared by forced-acceptance target and draft forwards."""
 
+from atom.utils import envs
+
 
 def resolve_synthetic_token_id(config) -> int | None:
-    """Pick one ordinary vocabulary ID for the entire benchmark run.
+    """Pick a shared fake ID only when synthetic forward is explicitly enabled.
 
     Avoid configured special/stop tokens so a constant stream does not end
-    immediately. Resolution is host-only and deterministic across ranks.
+    immediately. None preserves rejection-only behavior. Resolution is host-only
+    and deterministic across ranks; the environment is read at initialization.
     """
     spec = config.speculative_config
     if spec is None or spec.synthetic_acceptance_rates is None:
+        return None
+    if not envs.ATOM_SPEC_DECODE_SYNTHETIC_FORWARD:
         return None
 
     excluded = set()

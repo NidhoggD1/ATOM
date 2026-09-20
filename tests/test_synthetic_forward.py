@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Forced acceptance must feed the fake IDs back into model execution."""
+"""Forced acceptance preserves model IDs unless synthetic forward is enabled."""
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -22,12 +22,32 @@ def _config(rates=(1.0, 0.5), **kwargs):
     )
 
 
-def test_disabled_mode_needs_no_model_metadata():
+@pytest.fixture
+def synthetic_forward(monkeypatch):
+    monkeypatch.setenv("ATOM_SPEC_DECODE_SYNTHETIC_FORWARD", "1")
+
+
+@pytest.mark.parametrize("setting", [None, "0", "1"])
+def test_disabled_acceptance_needs_no_model_metadata(monkeypatch, setting):
+    monkeypatch.delenv("ATOM_SPEC_DECODE_SYNTHETIC_FORWARD", raising=False)
+    if setting is not None:
+        monkeypatch.setenv("ATOM_SPEC_DECODE_SYNTHETIC_FORWARD", setting)
     assert resolve_synthetic_token_id(SimpleNamespace(speculative_config=None)) is None
     assert resolve_synthetic_token_id(_config(rates=None)) is None
 
 
-def test_fake_id_is_shared_and_avoids_special_and_stop_tokens():
+@pytest.mark.parametrize("setting", [None, "0"])
+def test_rejection_only_is_default_and_needs_no_vocab(monkeypatch, setting):
+    monkeypatch.delenv("ATOM_SPEC_DECODE_SYNTHETIC_FORWARD", raising=False)
+    if setting is not None:
+        monkeypatch.setenv("ATOM_SPEC_DECODE_SYNTHETIC_FORWARD", setting)
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(synthetic_acceptance_rates=(1.0, 0.5))
+    )
+    assert resolve_synthetic_token_id(config) is None
+
+
+def test_fake_id_is_shared_and_avoids_special_and_stop_tokens(synthetic_forward):
     config = _config(eos_token_id=0, stop_token_ids=[1, 5])
     config.hf_config.bos_token_id = 2
     config.generation_config = SimpleNamespace(eos_token_id=[3, 4])
@@ -38,11 +58,11 @@ def test_fake_id_is_shared_and_avoids_special_and_stop_tokens():
     assert resolve_synthetic_token_id(config) == 7
 
 
-def test_zero_acceptance_still_enables_synthetic_forward():
+def test_zero_acceptance_still_enables_synthetic_forward(synthetic_forward):
     assert resolve_synthetic_token_id(_config(rates=(0.0, 0.0))) == 0
 
 
-def test_fake_id_must_fit_both_vocabularies():
+def test_fake_id_must_fit_both_vocabularies(synthetic_forward):
     config = _config(stop_token_ids=[0, 1])
     config.speculative_config.draft_model_hf_config = SimpleNamespace(vocab_size=2)
     with pytest.raises(ValueError, match="non-special token"):
@@ -140,7 +160,7 @@ def test_dspark_block_keeps_model_work_and_exports_fake_tokens(fake_id):
 GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 
 
-def _sample(rates, lengths, *, step=0, device="cuda:0"):
+def _sample(rates, lengths, *, step=0, device="cuda:0", fake_id=7, draft_id=19):
     from atom.model_ops.rejection_sampler import rejection_sample
 
     n = len(rates) if rates is not None else max(lengths)
@@ -148,7 +168,7 @@ def _sample(rates, lengths, *, step=0, device="cuda:0"):
     logits = torch.zeros(num_tokens, 32, device=device)
     logits[:, 19] = 1
     return rejection_sample(
-        torch.full((num_tokens,), 19, dtype=torch.int32, device=device),
+        torch.full((num_tokens,), draft_id, dtype=torch.int32, device=device),
         n,
         torch.tensor(lengths, dtype=torch.int32, device=device).cumsum(0).int(),
         None,
@@ -156,20 +176,46 @@ def _sample(rates, lengths, *, step=0, device="cuda:0"):
         torch.full((len(lengths), 1), 23, dtype=torch.int32, device=device),
         synthetic_acceptance_rates=rates,
         synthetic_step=step,
-        synthetic_token_id=7,
+        synthetic_token_id=fake_id,
     )
 
 
 @GPU
 @pytest.mark.parametrize("accepted", [0, 1, 3])
-def test_synthetic_kernel_preserves_counts_and_invalid_tail(accepted):
+@pytest.mark.parametrize("fake_id", [None, 0, 7])
+def test_synthetic_kernel_preserves_counts_and_invalid_tail(accepted, fake_id):
     rates = (1.0,) * accepted + (0.0,) * (3 - accepted)
-    ids, counts = _sample(rates, [3, 0, 1, 2])
-    expected_counts = [min(accepted, length) for length in [3, 0, 1, 2]]
+    lengths = [3, 0, 1, 2]
+    ids, counts = _sample(rates, lengths, fake_id=fake_id, draft_id=17)
+    expected_counts = [min(accepted, length) for length in lengths]
     assert counts.tolist() == expected_counts
-    assert ids.tolist() == [
-        [7] * (count + 1) + [-1] * (3 - count) for count in expected_counts
-    ]
+    expected = []
+    for length, count in zip(lengths, expected_counts):
+        if fake_id is None:
+            # Even when forced acceptance disagrees with the model, keep the
+            # draft ID (17), target correction (19), or bonus (23).
+            valid = [17] * count + [19 if count < length else 23]
+        else:
+            valid = [fake_id] * (count + 1)
+        expected.append(valid + [-1] * (3 - count))
+    assert ids.tolist() == expected
+
+
+@GPU
+def test_sampler_defaults_to_rejection_only():
+    from atom.model_ops.rejection_sampler import RejectionSampler
+
+    sampler = RejectionSampler(synthetic_acceptance_rates=[1.0, 0.0])
+    metadata = SimpleNamespace(
+        draft_token_ids=torch.tensor([17, 18], device="cuda", dtype=torch.int32),
+        num_spec_steps=2,
+        cu_num_draft_tokens=torch.tensor([2], device="cuda", dtype=torch.int32),
+    )
+    logits = torch.zeros(2, 32, device="cuda")
+    logits[:, 19] = 1
+    ids, counts = sampler(metadata, logits, torch.tensor([[23]], device="cuda"))
+    assert ids.tolist() == [[17, 19, -1]]
+    assert counts.tolist() == [1]
 
 
 @GPU
@@ -180,6 +226,10 @@ def test_synthetic_fractional_schedule_is_rank_consistent_and_rng_isolated():
     assert set(counts.tolist()) == {2, 3}
     assert abs(counts.float().mean().item() + 1 - 3.78) < 0.02
     assert torch.all(ids[ids >= 0] == 7)
+    legacy_ids, legacy_counts = _sample(rates, lengths, step=41, fake_id=None)
+    torch.testing.assert_close(counts, legacy_counts)
+    torch.testing.assert_close(ids == -1, legacy_ids == -1)
+    assert torch.all(legacy_ids[legacy_ids >= 0] == 19)
     torch.rand(1234, device="cuda:0")
     ids_again, counts_again = _sample(rates, lengths, step=41)
     torch.testing.assert_close(ids, ids_again)

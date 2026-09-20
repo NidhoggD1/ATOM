@@ -2863,9 +2863,8 @@ def main():
     )
 
     engine = engine_args.create_engine(tokenizer=tokenizer)
-    # Forced acceptance feeds a fixed fake token through the engine. Keep its
-    # presentation explicit and independent of the tokenizer's spelling of that
-    # ID, with one placeholder per generated token.
+    # Both forced-acceptance modes present one placeholder per generated token.
+    # Engine token IDs remain real by default; synthetic forward is opt-in.
     synthetic_token_text = (
         SYNTHETIC_TOKEN_TEXT
         if (

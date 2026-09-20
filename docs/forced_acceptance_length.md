@@ -9,9 +9,11 @@ as it measures the serving system.
 `--spec-decode-acceptance-length` takes that variable out. The rejection sampler
 stops comparing draft tokens against the target and instead accepts them with a
 fixed per-position probability, chosen so the run converges on the mean
-acceptance length you asked for. Generated tokens use one fixed fake token ID
-throughout target decoding and draft feedback. Attention, scheduling, graph
-capture, and the drafter still execute with that synthetic token stream.
+acceptance length you asked for. By default this changes rejection sampling
+only: target decoding and draft feedback retain model token IDs. Set
+`ATOM_SPEC_DECODE_SYNTHETIC_FORWARD=1` to use one fixed fake token throughout
+target decoding and draft feedback instead. Attention, scheduling, graph
+capture, and the drafter execute in both modes.
 
 Two situations call for it:
 
@@ -51,6 +53,26 @@ Forced speculative acceptance ON: mean acceptance length 3.7800 over 7 draft
 positions (per-position rates [1.0, 1.0, 0.78, 0.0, 0.0, 0.0, 0.0]). Throughput
 numbers from this run are synthetic; output text and accuracy are meaningless.
 ```
+
+## Forward mode
+
+| Environment setting | Rejection sampling | Target decode and draft feedback |
+|---|---|---|
+| Unset or `ATOM_SPEC_DECODE_SYNTHETIC_FORWARD=0` (default) | Forced acceptance, retaining draft/correction/bonus IDs | Model token IDs, matching the original behavior |
+| `ATOM_SPEC_DECODE_SYNTHETIC_FORWARD=1` | Forced acceptance, emitting one fixed fake ID | The same fixed fake ID at every generated position |
+
+Set the variable before launching the server; the mode is resolved during
+engine initialization. For example, add this prefix to the quick-start command:
+
+```bash
+ATOM_SPEC_DECODE_SYNTHETIC_FORWARD=1 python -m atom.entrypoints.openai_server \
+  ... --spec-decode-acceptance-length 3.78
+```
+
+The acceptance-length or acceptance-rate flag is still required. The environment
+variable alone does not enable forced acceptance. Startup logs identify the
+selected mode and, when enabled, the fake token ID. Both modes keep the original
+prompt IDs and present synthetic placeholder text through the OpenAI server.
 
 ## The two spellings
 
@@ -103,11 +125,16 @@ else. This is what vLLM resolves `synthetic_acceptance_length` to and what
 SGLang's `match-expected` draws, so the accepted-length *distribution* matches
 across engines and not merely its mean.
 
-All emitted positions use the same fake token ID: accepted drafts, rejection
-corrections, bonus tokens, and the first token sampled after prefill. The engine
-chooses the lowest ID shared by the target and draft vocabularies that is not a
-configured BOS, EOS, padding, or stop token, and logs it at startup. No new flag
-is needed; both acceptance flags enable this behavior, including rate `0`.
+In the default rejection-only mode, accepted positions retain their draft token
+IDs, a rejection uses the target argmax ID, and full acceptance retains the
+sampled bonus ID. The first token sampled after prefill is also unchanged.
+
+With `ATOM_SPEC_DECODE_SYNTHETIC_FORWARD=1`, all emitted positions use the same
+fake token ID: accepted drafts, rejection corrections, bonus tokens, and the
+first token sampled after prefill. The engine chooses the lowest ID shared by
+the target and draft vocabularies that is not a configured BOS, EOS, padding,
+or stop token, and logs it at startup. This applies with either acceptance
+flag, including rate `0`.
 
 The fake ID is fed into the next target forward and every subsequent MTP/EAGLE
 draft iteration. DSpark exports the same ID for every proposed position. Target
@@ -174,8 +201,8 @@ ATOM replays them; it does not collect them.
 
 ## Restrictions
 
-**No accuracy evaluation.** Generated tokens are fixed fake IDs without being
-compared against the target, so anything measuring quality — `lm_eval`,
+**No accuracy evaluation.** In both modes, accepted drafts are not checked
+against the target, so anything measuring quality — `lm_eval`,
 gsm8k, a golden-output diff — is measuring noise.
 
 **Not with the DSpark confidence scheduler.** The confidence scheduler
@@ -202,9 +229,12 @@ whichever knob was set, converts a rate into a length, and calls
 the per-position unconditional rates. Everything downstream reads only the
 resolved `synthetic_acceptance_rates`, so neither spelling survives past config.
 
-`resolve_synthetic_token_id` (`atom/spec_decode/synthetic.py`) selects the shared
-fake ID once during runner and drafter initialization. Before target metadata
-is constructed, `ModelRunner.prepare_model` fills the decode input buffer with
+`resolve_synthetic_token_id` (`atom/spec_decode/synthetic.py`) returns `None`
+unless forced acceptance and `ATOM_SPEC_DECODE_SYNTHETIC_FORWARD=1` are both
+enabled. With `None`, the runner and drafter preserve model token IDs. When
+enabled, it selects the shared fake ID during runner and drafter initialization.
+Before target metadata is constructed, `ModelRunner.prepare_model` fills the
+decode input buffer with
 that ID, including padded graph rows. This covers deferred feedback, newly
 admitted requests, and eager and graph execution. Prefill sampling seeds the
 first draft with the same ID. Serial draft heads replace their sampled IDs
@@ -215,8 +245,9 @@ inside their graph. DSpark replaces the block head's exported IDs.
 of the greedy kernel. The kernel walks positions in order and stops at the first
 rejection, so it needs `P(accept i | accepted through i-1)` rather than the
 unconditional rates the config carries; the conversion happens once and is
-cached per device. It emits the shared fake ID at each valid output position,
-including the correction or bonus, and retains `-1` in rejected/padded positions.
+cached per device. A compile-time branch preserves draft/correction/bonus IDs
+in rejection-only mode or emits the shared fake ID in synthetic forward mode.
+Both modes retain `-1` in rejected/padded positions.
 The output layout and `num_bonus_tokens` semantics are identical to the real
 path. Acceptance probabilities and the per-step RNG schedule are unchanged.
 

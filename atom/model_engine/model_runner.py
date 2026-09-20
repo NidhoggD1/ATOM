@@ -740,6 +740,15 @@ class ModelRunner:
                 "decode and draft feedback.",
                 self.synthetic_token_id,
             )
+        elif (
+            self.config.speculative_config is not None
+            and self.config.speculative_config.synthetic_acceptance_rates is not None
+        ):
+            logger.info(
+                "Forced speculative acceptance affects rejection sampling only; "
+                "target and draft forwards retain model token IDs. Set "
+                "ATOM_SPEC_DECODE_SYNTHETIC_FORWARD=1 to use a fixed fake token."
+            )
 
         self._pp_pending_send: list = []
         self.tokenID_processor = tokenIDProcessor(
@@ -793,7 +802,7 @@ class ModelRunner:
                 synthetic_acceptance_rates=(
                     self.config.speculative_config.synthetic_acceptance_rates
                 ),
-                synthetic_token_id=self.synthetic_token_id or 0,
+                synthetic_token_id=self.synthetic_token_id,
             )
             torch.set_default_device(None)
             logger.info("Loading drafter model...")
