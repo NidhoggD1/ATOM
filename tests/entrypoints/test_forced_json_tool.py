@@ -105,37 +105,6 @@ def test_explicit_call_takes_precedence_over_bare_json():
     assert json.loads(calls[0].function["arguments"]) == {"actual": "two"}
 
 
-@pytest.mark.parametrize("width", [1, 7, 1000])
-def test_forced_tool_accepts_a_complete_alternate_call_format(width):
-    # Observed in K3 output, inside its response channel.
-    text = frame(
-        "<tool_call>\n<function=submit>\n"
-        "<parameter=value></parameter>\n</function>\n</tool_call>"
-    )
-    reader = parser()
-    events = []
-    for offset in range(0, len(text), width):
-        events.extend(reader.process(text[offset : offset + width]))
-    content, calls = flatten_tool_events(events + reader.flush())
-    assert content == ""
-    assert len(calls) == 1
-    assert json.loads(calls[0].function["arguments"]) == {"value": ""}
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "<tool_call><function=another><parameter=x>1</parameter></function></tool_call>",
-        "<tool_call><function=submit><parameter=x>1</parameter></function></tool_call> is an example",
-    ],
-)
-def test_alternate_format_requires_the_selected_name_and_no_prose(text):
-    reader = parser()
-    content, calls = flatten_tool_events(reader.process(frame(text)) + reader.flush())
-    assert content == text
-    assert calls == []
-
-
 def test_named_tool_uses_request_destination_and_does_not_repair_arguments():
     tools = TOOLS + [{"type": "function", "function": {"name": "another"}}]
     choice = {"type": "function", "function": {"name": "another"}}

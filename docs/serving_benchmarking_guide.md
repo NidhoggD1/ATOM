@@ -378,10 +378,8 @@ one declared tool, also accepts a complete bare JSON object as that tool's
 arguments. Kimi-K3 can produce valid arguments in its response channel without
 native call framing. The JSON is preserved verbatim; no argument values are
 repaired or synthesized. Streaming holds candidate JSON until completion so it
-does not first appear as content and then again as a tool call. A complete call
-in another supported wire format is also accepted when it consumes the entire
-answer and names the selected tool. The configured format takes priority.
-`auto`, `none`, and `required` with multiple tools do not infer a
+does not first appear as content and then again as a tool call. Explicit calls
+take priority. `auto`, `none`, and `required` with multiple tools do not infer a
 destination from bare JSON. This is output parsing, not schema-constrained
 decoding: `strict: true` does not itself prevent invalid model generations.
 

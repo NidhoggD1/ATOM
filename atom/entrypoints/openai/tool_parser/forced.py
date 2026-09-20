@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Read arguments when the request uniquely selects a tool."""
+"""Read bare JSON arguments when the request uniquely selects a tool."""
 
 import json
 
@@ -35,9 +35,8 @@ class ForcedJsonToolCallParser(ToolCallStreamParser):
     K3 sometimes emits that object in its response channel instead of wrapping
     it in a call. The caller supplies the destination from tool_choice; no
     destination is inferred for auto choice or multiple required tools.
-    Candidate JSON or alternate call markup is held until EOF. Alternate
-    formats are accepted only when they consume the entire answer and every
-    call names the selected tool. The configured format takes priority.
+    Candidate JSON is held until EOF so a partial object never leaks as
+    content before being returned as arguments. Explicit calls take priority.
     """
 
     def __init__(self, *args, json_tool_name: str | None, **kwargs):
@@ -54,7 +53,7 @@ class ForcedJsonToolCallParser(ToolCallStreamParser):
             if kind == "content" and self._json_tool_name is not None:
                 self._json_parts.append(value)
                 if not self._json_started and value.lstrip():
-                    if value.lstrip().startswith(("{", "<")):
+                    if value.lstrip().startswith("{"):
                         self._json_started = True
                     else:
                         self._json_tool_name = None
@@ -79,26 +78,6 @@ class ForcedJsonToolCallParser(ToolCallStreamParser):
             return events
         text = "".join(self._json_parts)
         self._json_parts.clear()
-        if name is not None and text.lstrip().startswith("<"):
-            # K3 occasionally generates a complete call in another supported
-            # wire format. The request already selected its destination; only
-            # a whole answer consisting of calls to that destination qualifies.
-            from .registry import PARSERS_BY_NAME
-            from .stream import read_whole
-
-            for parser_cls in PARSERS_BY_NAME.values():
-                if parser_cls is self.parser_cls or not parser_cls.detect(text):
-                    continue
-                content, calls = read_whole(parser_cls, text, self.tools)
-                if (
-                    calls
-                    and not content.strip()
-                    and all(call.function["name"] == name for call in calls)
-                ):
-                    for call in calls:
-                        events.extend(self._emit_call(call))
-                    events.append(("tool_call_end", None))
-                    return events
         try:
             arguments = json.loads(text)
         except (ValueError, RecursionError):
