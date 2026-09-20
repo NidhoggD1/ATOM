@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789838094538,
+  "lastUpdate": 1789924297523,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -3098,6 +3098,57 @@ window.BENCHMARK_DATA = {
             "value": 0.8976,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35454416832 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609191458 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1766 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Satya K Jandhyala",
+            "username": "sajandhy",
+            "email": "satya.jandhyala@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "bd892e5a3f7d47f07bf117db85bd2b161bb67c47",
+          "message": "feat(k3): Kimi-K3 vLLM plugin vision + DSpark draft support (#1910)\n\n* feat(k3): reapply remaining K3 DSpark/vision delta on main\n\nKeep main's later K3/DSpark/core fixes; overlay only the still-unique\nplugin vision, DSpark draft, MLA/metadata, and recipe changes.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Added changes required due to other changes on main.\n\n* Fix Black and Ruff warnings.\n\n* fix(k3): restore vision imports dropped during rebase\n\nThe multimodal plugin classes in kimi_k3.py referenced symbols without\nimporting them, which made Ruff fail in pre-checks CI.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Removed unnecessary files.\n\n* Addressed PR reviews.\n\n---------\n\nCo-authored-by: whx-sjtu <xiaowang990929@gmail.com>\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-09-20T17:04:26Z",
+          "url": "https://github.com/ROCm/ATOM/commit/bd892e5a3f7d47f07bf117db85bd2b161bb67c47"
+        },
+        "date": 1789924296663,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9454,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35522210327 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202609191458 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9431 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.953,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35522210327 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609191458 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.953 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 66.15,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35522210327 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609191458 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.953 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8901,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35522210327 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609191458 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1721 | fewshot: 3 | Model: openai/gpt-oss-120b"
           }
         ]
       }
