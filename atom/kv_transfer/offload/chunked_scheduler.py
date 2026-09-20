@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import ceil
 
 from atom.kv_transfer.disaggregation.base import KVConnectorSchedulerBase
@@ -33,6 +33,7 @@ from atom.kv_transfer.offload.metadata import (
 from atom.kv_transfer.offload.save_admission import (
     PrefixDemandKey,
     PrefixDemandTracker,
+    SaveBlockReservation,
     load_save_admission_config,
 )
 
@@ -132,6 +133,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._save_min_observed_count = save_admission.min_observed_count
         self._save_aging_weight = save_admission.aging_weight
         self._save_release_weight = save_admission.release_weight
+        self._save_max_pinned_ratio = save_admission.max_pinned_ratio
+        self._save_max_pinned_blocks = save_admission.max_pinned_blocks
+        self._save_pin_total_blocks = 0
+        self._save_pin_budget_blocks: int | None = None
+        self._save_block_reservations: dict[
+            str | SaveOperationId, SaveBlockReservation
+        ] = {}
         self._prefix_demand = PrefixDemandTracker(
             block_tokens=save_admission.demand_block_tokens,
             max_entries=save_admission.demand_max_entries,
@@ -148,6 +156,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._finished_save_failed: set[str] = set()
         self._save_inflight_since: dict[SaveOperationId, float] = {}
         self.total_save_admitted = 0
+        self.total_save_budget_rejected = 0
+        self.total_save_budget_rejected_blocks = 0
+        self.total_save_budget_evicted = 0
+        self.total_save_budget_evicted_blocks = 0
+        self.total_save_oversized = 0
         self._save_drop_totals = {
             "capacity": 0,
             "low_value": 0,
@@ -212,6 +225,15 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if self._block_manager is not None and self._block_manager is not block_manager:
             raise RuntimeError("offload scheduler is already bound to a block manager")
         self._block_manager = block_manager
+        total_blocks = int(block_manager.total_allocatable_kv_blocks)
+        if total_blocks <= 0:
+            raise ValueError("BlockManager must expose a positive KV block capacity")
+        ratio_budget = int(total_blocks * self._save_max_pinned_ratio)
+        absolute = self._save_max_pinned_blocks
+        self._save_pin_total_blocks = total_blocks
+        self._save_pin_budget_blocks = (
+            ratio_budget if absolute is None else min(ratio_budget, absolute)
+        )
 
     # -- match: how many extra tokens can come from CPU/NVMe -------------
     def _begin_load_lifecycle(self, seq) -> None:
@@ -339,7 +361,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                     self._save_candidate_nonce,
                 )
                 self._save_candidate_nonce += 1
-                self._save_committed.pop(sid, None)
+                previous_committed = self._save_committed.pop(sid, None)
+                if previous_committed is not None:
+                    self._release_save_reservation(sid, owner=previous_committed)
                 self._finished_save_requests.pop(sid, None)
                 self._finished_save_failed.discard(sid)
             else:
@@ -409,6 +433,18 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._save_aging_weight = 0.01
         if not hasattr(self, "_save_release_weight"):
             self._save_release_weight = 1.0
+        if not hasattr(self, "_save_max_pinned_ratio"):
+            self._save_max_pinned_ratio = 0.20
+        if not hasattr(self, "_save_max_pinned_blocks"):
+            self._save_max_pinned_blocks = None
+        if not hasattr(self, "_save_pin_total_blocks"):
+            self._save_pin_total_blocks = 0
+        if not hasattr(self, "_save_pin_budget_blocks"):
+            self._save_pin_budget_blocks = None
+        if not hasattr(self, "_save_block_reservations"):
+            self._save_block_reservations = {}
+        if not hasattr(self, "_save_lease_blocks"):
+            self._save_lease_blocks = {}
         if not hasattr(self, "_prefix_demand"):
             self._prefix_demand = PrefixDemandTracker()
         for name in (
@@ -427,6 +463,15 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._finished_save_failed = set()
         if not hasattr(self, "total_save_admitted"):
             self.total_save_admitted = 0
+        for name in (
+            "total_save_budget_rejected",
+            "total_save_budget_rejected_blocks",
+            "total_save_budget_evicted",
+            "total_save_budget_evicted_blocks",
+            "total_save_oversized",
+        ):
+            if not hasattr(self, name):
+                setattr(self, name, 0)
         if not hasattr(self, "_save_drop_totals"):
             self._save_drop_totals = {
                 "capacity": 0,
@@ -436,6 +481,180 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             }
         if not hasattr(self, "_save_drop_token_totals"):
             self._save_drop_token_totals = dict.fromkeys(self._save_drop_totals, 0)
+
+    def _reserved_save_resources_allow(self, committed_after: int) -> bool:
+        """Layout-specific admission hook evaluated before any mutation."""
+
+        del committed_after
+        return True
+
+    def _save_count_allows(self, committed_after: int) -> bool:
+        limit = getattr(self, "_max_pending_saves", None)
+        return limit is None or len(self._save_inflight) + committed_after <= limit
+
+    def _pinned_save_block_ids(self) -> set[int]:
+        pinned: set[int] = set()
+        for blocks in self._save_lease_blocks.values():
+            pinned.update(blocks)
+        return pinned
+
+    def _save_block_usage(
+        self,
+        reservations: dict[str | SaveOperationId, SaveBlockReservation] | None = None,
+    ) -> tuple[int, int, int]:
+        """Return ``(reserved, pinned, total_budget_usage)`` without double count."""
+
+        current = (
+            self._save_block_reservations if reservations is None else reservations
+        )
+        pinned_ids = self._pinned_save_block_ids()
+        reserved_ids: set[int] = set()
+        estimated = 0
+        for reservation in current.values():
+            reserved_ids.update(reservation.block_ids)
+            estimated += int(reservation.estimated_blocks)
+        reserved = len(reserved_ids - pinned_ids) + estimated
+        return reserved, len(pinned_ids), len(pinned_ids | reserved_ids) + estimated
+
+    def _candidate_block_reservation(
+        self,
+        candidate: _ChunkedSaveCandidate,
+        *,
+        priority_score: float,
+    ) -> SaveBlockReservation:
+        source_block_size = int(getattr(self, "virtual_block_size", self.block_size))
+        start_block = candidate.saved // source_block_size
+        end_block = ceil(candidate.aligned / source_block_size)
+        required = max(0, end_block - start_block)
+        table = list(getattr(candidate.seq, "block_table", ()))
+        # A frozen table records old identities only. Once early deallocation
+        # clears the live table those IDs may already belong to another request,
+        # so retain a conservative count rather than a false exact reservation.
+        if candidate.finished and not table:
+            block_ids = frozenset()
+            estimated = required
+        else:
+            available = table[start_block : min(end_block, len(table))]
+            block_ids = frozenset(
+                physical_id
+                for block_id in available
+                if (physical_id := int(block_id)) >= 0
+            )
+            estimated = max(0, required - len(available))
+        return SaveBlockReservation(
+            sid=candidate.sid,
+            seq=candidate.seq,
+            generation=candidate.generation,
+            block_ids=block_ids,
+            estimated_blocks=estimated,
+            priority_score=float(priority_score),
+            committed=True,
+        )
+
+    @staticmethod
+    def _reservation_footprint(reservation: SaveBlockReservation) -> int:
+        return len(reservation.block_ids) + int(reservation.estimated_blocks)
+
+    def _reservation_fits(
+        self,
+        reservation: SaveBlockReservation,
+        *,
+        victim_keys: tuple[str, ...] = (),
+    ) -> bool:
+        projected = dict(self._save_block_reservations)
+        for key in victim_keys:
+            projected.pop(key, None)
+        projected[reservation.sid] = reservation
+        committed_after = sum(item.committed for item in projected.values())
+        if not self._save_count_allows(committed_after):
+            return False
+        if not self._reserved_save_resources_allow(committed_after):
+            return False
+        budget = self._save_pin_budget_blocks
+        return budget is None or self._save_block_usage(projected)[2] <= budget
+
+    def _try_reserve_save_candidate(
+        self,
+        candidate: _ChunkedSaveCandidate,
+        *,
+        allow_eviction: bool,
+    ) -> bool:
+        """Atomically reserve PAGE/count/state budget for one candidate.
+
+        Victims are simulated first and are restricted to lower-priority,
+        undispatched committed saves owned by this same scheduler. Inflight
+        operation reservations are never considered.
+        """
+
+        existing = self._save_block_reservations.get(candidate.sid)
+        if (
+            existing is not None
+            and existing.seq is candidate.seq
+            and existing.generation == candidate.generation
+            and existing.committed
+        ):
+            return True
+
+        score = self._candidate_priority(candidate, time.monotonic())
+        reservation = self._candidate_block_reservation(candidate, priority_score=score)
+        victims: list[SaveBlockReservation] = []
+        if not self._reservation_fits(reservation):
+            if allow_eviction:
+                eligible = sorted(
+                    (
+                        item
+                        for key, item in self._save_block_reservations.items()
+                        if isinstance(key, str)
+                        and item.committed
+                        and item.priority_score < reservation.priority_score
+                        and self._save_committed.get(key) is item.seq
+                        and key not in self._save_inflight
+                        and (entry := self._save_tracker.get(key)) is not None
+                        and entry[0] is item.seq
+                    ),
+                    key=lambda item: (
+                        item.priority_score,
+                        item.sid,
+                        item.generation,
+                    ),
+                )
+                for victim in eligible:
+                    victims.append(victim)
+                    if self._reservation_fits(
+                        reservation,
+                        victim_keys=tuple(item.sid for item in victims),
+                    ):
+                        break
+                else:
+                    victims = []
+            if not victims and not self._reservation_fits(reservation):
+                footprint = self._reservation_footprint(reservation)
+                self.total_save_budget_rejected += 1
+                self.total_save_budget_rejected_blocks += footprint
+                budget = self._save_pin_budget_blocks
+                if budget is not None and footprint > budget:
+                    self.total_save_oversized += 1
+                return False
+
+        # Every condition was checked against the same simulated state. Apply
+        # the replacement only now so a candidate that still cannot fit never
+        # destroys useful committed work.
+        for victim in victims:
+            self.total_save_budget_evicted += 1
+            self.total_save_budget_evicted_blocks += self._reservation_footprint(victim)
+            self.drop_unadmitted_save(victim.seq, reason="capacity")
+        self._save_committed[candidate.sid] = candidate.seq
+        self._save_block_reservations[candidate.sid] = reservation
+        self.total_save_admitted += 1
+        return True
+
+    def _release_save_reservation(
+        self, key: str | SaveOperationId, *, owner=None
+    ) -> SaveBlockReservation | None:
+        reservation = self._save_block_reservations.get(key)
+        if reservation is None or (owner is not None and reservation.seq is not owner):
+            return None
+        return self._save_block_reservations.pop(key)
 
     def _candidate_generation_for(self, sid: str, seq) -> int:
         record = self._save_candidate_generation.get(sid)
@@ -507,7 +726,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         release_bonus = (
             self._save_release_weight
             * candidate.held_blocks
-            * max(1, int(self.virtual_block_size))
+            * max(1, int(getattr(self, "virtual_block_size", self.block_size)))
         )
         age = max(0.0, now - candidate.enqueued_at)
         return (benefit + release_bonus) / cost_units + self._save_aging_weight * age
@@ -529,14 +748,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     def _commit_finished_save(self, candidate: _ChunkedSaveCandidate) -> bool:
         if not candidate.finished or not self._meets_save_value_threshold(candidate):
             return False
-        if not self._may_emit_save():
-            return False
         entry = self._save_tracker.get(candidate.sid)
         if entry is None or entry[0] is not candidate.seq:
             return False
-        self._save_committed[candidate.sid] = candidate.seq
-        self.total_save_admitted += 1
-        return True
+        return self._try_reserve_save_candidate(
+            candidate,
+            allow_eviction=self._save_policy == "priority",
+        )
 
     def _forget_save_candidate(self, sid: str, seq) -> None:
         for mapping in (
@@ -562,6 +780,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._save_tracker.pop(sid, None)
         if self._save_committed.get(sid) is seq:
             self._save_committed.pop(sid, None)
+        self._release_save_reservation(sid, owner=seq)
         if self._finished_save_requests.get(sid) is seq:
             self._finished_save_requests.pop(sid, None)
         self._finished_save_failed.discard(sid)
@@ -666,6 +885,14 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         entry = self._save_tracker.get(sid)
         if entry is None or entry[0] is not seq:
             return False
+        committed_reservation = self._save_block_reservations.get(sid)
+        if (
+            committed_reservation is None
+            or committed_reservation.seq is not seq
+            or committed_reservation.generation != candidate.generation
+            or not committed_reservation.committed
+        ):
+            return False
         computed = min(
             int(
                 getattr(
@@ -687,6 +914,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 if self._save_policy == "priority" and candidate.finished:
                     self.drop_unadmitted_save(seq, reason="stale")
                 else:
+                    self._save_committed.pop(sid, None)
+                    self._release_save_reservation(sid, owner=seq)
                     self._save_tracker.pop(sid, None)
                     self._forget_save_candidate(sid, seq)
                 return False
@@ -709,6 +938,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if request is None:
             if late_acquired:
                 self._block_manager.free_leased_blocks(late_acquired)
+            self._save_committed.pop(sid, None)
+            self._release_save_reservation(sid, owner=seq)
             if candidate.finished:
                 self.drop_unadmitted_save(seq, reason="capacity")
             return False
@@ -728,6 +959,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._save_inflight_since[save_operation] = time.monotonic()
         meta.add_request(request)
         entry[1] = aligned
+        self._save_committed.pop(sid, None)
+        self._release_save_reservation(sid, owner=seq)
         self._save_inflight[sid] = save_operation
         if getattr(self, "_early_release", False):
             # Freeze the exact token-index -> block-id mapping before a
@@ -736,14 +969,29 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             source_block_size = getattr(self, "virtual_block_size", self.block_size)
             start_block = candidate.saved // source_block_size
             end_block = -(-aligned // source_block_size)  # ceil div
-            self._save_operation_blocks[save_operation] = {
+            block_map = {
                 index: block_ids[index]
                 for index in range(start_block, min(end_block, len(block_ids)))
             }
+            self._save_operation_blocks[save_operation] = block_map
             self._save_operation_safe[save_operation] = set()
             self._save_operation_owner[save_operation] = seq
+            self._save_block_reservations[save_operation] = replace(
+                committed_reservation,
+                block_ids=frozenset(
+                    int(block_id)
+                    for block_id in block_map.values()
+                    if int(block_id) >= 0
+                ),
+                estimated_blocks=max(0, end_block - start_block - len(block_map)),
+                committed=False,
+            )
             if late_acquired:
                 self.activate_block_leases(seq, late_acquired)
+        else:
+            self._save_block_reservations[save_operation] = replace(
+                committed_reservation, committed=False
+            )
         return True
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
@@ -817,32 +1065,23 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             for sid in self._lookup_in_step
             if sid in loading_sids or sid not in self._load_specs
         ]
-        # Saves: dispatch finished reservations before selecting new work.
+        # Saves. Priority mode admits/replaces the complete candidate set before
+        # dispatch so a newly hotter candidate can still evict lower-value
+        # committed work. Dispatching first would make that work inflight and
+        # therefore correctly, but prematurely, non-evictable.
         if self._do_save:
             now = time.monotonic()
-            committed = []
             for sid, seq in list(self._save_committed.items()):
                 entry = self._save_tracker.get(sid)
                 if entry is None or entry[0] is not seq:
                     self._save_committed.pop(sid, None)
+                    self._release_save_reservation(sid, owner=seq)
                     continue
                 candidate = self._build_save_candidate(sid, now=now)
                 if candidate is None:
                     self._save_committed.pop(sid, None)
+                    self._release_save_reservation(sid, owner=seq)
                     self._settle_finished_save(sid)
-                    continue
-                committed.append(candidate)
-            committed.sort(
-                key=lambda candidate: self._candidate_sort_key(candidate, now)
-            )
-            for candidate in committed:
-                sid = candidate.sid
-                if sid in self._reqs_need_recv or sid in loading_sids:
-                    continue
-                if sid in self._save_inflight:
-                    continue
-                self._save_committed.pop(sid, None)
-                self._emit_save_candidate(meta, candidate)
 
             tracker_sids = list(self._save_tracker.keys())
             if self._save_policy == "round_robin":
@@ -869,19 +1108,50 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                     key=lambda candidate: self._candidate_sort_key(candidate, now)
                 )
 
-            for candidate in candidates:
-                sid = candidate.sid
-                if not self._may_emit_save():
-                    break
-                if sid in self._save_committed:
-                    continue
-                if sid in self._reqs_need_recv or sid in loading_sids:
-                    continue
-                if sid in self._save_inflight:
-                    continue
-                if self._emit_save_candidate(meta, candidate):
-                    self.total_save_admitted += 1
-                    if self._save_policy == "round_robin":
+            if self._save_policy == "priority":
+                for candidate in candidates:
+                    sid = candidate.sid
+                    if sid in self._save_committed or sid in self._save_inflight:
+                        continue
+                    if sid in self._reqs_need_recv or sid in loading_sids:
+                        continue
+                    if not self._try_reserve_save_candidate(
+                        candidate, allow_eviction=True
+                    ):
+                        self.drop_unadmitted_save(candidate.seq, reason="capacity")
+
+                committed = []
+                for sid, seq in list(self._save_committed.items()):
+                    candidate = self._build_save_candidate(sid, now=now)
+                    if candidate is None or candidate.seq is not seq:
+                        self._save_committed.pop(sid, None)
+                        self._release_save_reservation(sid, owner=seq)
+                        continue
+                    committed.append(candidate)
+                committed.sort(
+                    key=lambda candidate: self._candidate_sort_key(candidate, now)
+                )
+                for candidate in committed:
+                    sid = candidate.sid
+                    if sid in self._reqs_need_recv or sid in loading_sids:
+                        continue
+                    if sid in self._save_inflight:
+                        continue
+                    self._emit_save_candidate(meta, candidate)
+            else:
+                for candidate in candidates:
+                    sid = candidate.sid
+                    if not self._may_emit_save():
+                        break
+                    if sid in self._save_committed or sid in self._save_inflight:
+                        continue
+                    if sid in self._reqs_need_recv or sid in loading_sids:
+                        continue
+                    if not self._try_reserve_save_candidate(
+                        candidate, allow_eviction=False
+                    ):
+                        break
+                    if self._emit_save_candidate(meta, candidate):
                         self._save_rr_last = sid
         dispatched = set(meta.lookup_requests_in_step)
         for sid in dispatched:
@@ -961,7 +1231,30 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     def activate_block_leases(self, seq, block_ids: frozenset[int]) -> None:
         """Record the refcount shares transferred at request deallocation."""
 
-        if not self._early_release or not block_ids:
+        if not self._early_release:
+            return
+        sid = str(seq.id)
+        committed = self._save_block_reservations.get(sid)
+        if committed is not None and committed.seq is seq and committed.committed:
+            # The scheduler is about to clear the request's live block table.
+            # Its old physical IDs can be reused, so a not-yet-dispatched save
+            # keeps only a conservative count reservation from this point on.
+            self._save_block_reservations[sid] = replace(
+                committed,
+                block_ids=frozenset(),
+                estimated_blocks=self._reservation_footprint(committed),
+            )
+        for operation, reservation in list(self._save_block_reservations.items()):
+            if (
+                isinstance(operation, SaveOperationId)
+                and reservation.seq is seq
+                and not reservation.committed
+            ):
+                # The future reservation becomes an actual save-owned physical
+                # lease. Removing it before adding the lease avoids double
+                # charging the same IDs during the ownership transition.
+                self._save_block_reservations.pop(operation, None)
+        if not block_ids:
             return
         lease_key = id(seq)
         leased = self._save_lease_blocks.setdefault(lease_key, set())
@@ -1011,12 +1304,14 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._save_operation_safe.pop(candidate, None)
                 self._save_operation_owner.pop(candidate, None)
                 self._source_safe_waiting_for_store.pop(candidate, None)
+                self._release_save_reservation(candidate, owner=owner)
             if sid is not None:
                 entry = self._save_tracker.get(sid)
                 if entry is not None and entry[0] is owner:
                     self._save_tracker.pop(sid, None)
                 if self._save_committed.get(sid) is owner:
                     self._save_committed.pop(sid, None)
+                    self._release_save_reservation(sid, owner=owner)
                 if self._finished_save_requests.get(sid) is owner:
                     self._finished_save_requests.pop(sid, None)
                 self._finished_save_failed.discard(sid)
@@ -1158,6 +1453,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         safe.update(newly_safe)
         if not newly_safe:
             return
+        reservation = self._save_block_reservations.get(operation)
+        if reservation is not None:
+            remaining = reservation.block_ids - newly_safe
+            self._save_block_reservations[operation] = replace(
+                reservation, block_ids=frozenset(remaining)
+            )
         sid = str(operation.req_id)
         owner = self._save_operation_owner.get(operation)
         lease_key = id(owner) if owner is not None else None
@@ -1179,6 +1480,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._save_operation_blocks.pop(operation, None)
             self._save_operation_safe.pop(operation, None)
             self._save_operation_owner.pop(operation, None)
+            self._release_save_reservation(operation)
 
     def _store_finished(self, operation: SaveOperationId, *, succeeded: bool) -> None:
         sid = str(operation.req_id)
@@ -1220,6 +1522,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     def _release_operation_lease(self, operation) -> None:
         if not isinstance(operation, SaveOperationId):
             return
+        self._release_save_reservation(operation)
         block_map = self._save_operation_blocks.pop(operation, {})
         self._save_operation_safe.pop(operation, None)
         owner = self._save_operation_owner.pop(operation, None)
@@ -1244,6 +1547,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             seq
         ):
             self._save_tracker.pop(sid, None)
+            if self._save_committed.get(sid) is seq:
+                self._save_committed.pop(sid, None)
+            self._release_save_reservation(sid, owner=seq)
             if self._finished_save_requests.get(sid) is seq:
                 self._finished_save_requests.pop(sid, None)
             self._finished_save_failed.discard(sid)
@@ -1271,7 +1577,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._save_operation_blocks.pop(operation, None)
             self._save_operation_safe.pop(operation, None)
             self._source_safe_waiting_for_store.pop(operation, None)
+            self._release_save_reservation(operation, owner=owner)
         committed = self._save_committed.pop(sid, None)
+        if committed is not None:
+            self._release_save_reservation(sid, owner=committed)
         finished = self._finished_save_requests.pop(sid, None)
         seq = finished if finished is not None else committed
         if seq is None and tracker is not None:
@@ -1306,7 +1615,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         candidate_scores = [
             self._candidate_priority(candidate, now) for candidate in candidates
         ]
-        pinned_blocks = sum(len(blocks) for blocks in self._save_lease_blocks.values())
+        reserved_blocks, pinned_blocks, budget_used = self._save_block_usage()
+        budget = self._save_pin_budget_blocks
+        total_blocks = self._save_pin_total_blocks
         statistics.update(
             save_candidates=len(candidates),
             save_candidates_finished=len(finished),
@@ -1326,6 +1637,17 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             ),
             save_pinned_blocks=pinned_blocks,
             save_pinned_tokens=pinned_blocks * int(self.virtual_block_size),
+            save_pin_budget_blocks=0 if budget is None else budget,
+            save_reserved_blocks=reserved_blocks,
+            save_pinned_ratio=(budget_used / total_blocks if total_blocks > 0 else 0.0),
+            save_budget_available_blocks=(
+                0 if budget is None else max(0, budget - budget_used)
+            ),
+            save_budget_rejected=self.total_save_budget_rejected,
+            save_budget_rejected_blocks=self.total_save_budget_rejected_blocks,
+            save_budget_evicted=self.total_save_budget_evicted,
+            save_budget_evicted_blocks=self.total_save_budget_evicted_blocks,
+            save_oversized=self.total_save_oversized,
             deferred_free_requests=sum(
                 bool(blocks) for blocks in self._save_lease_blocks.values()
             ),

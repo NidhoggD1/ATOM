@@ -880,6 +880,8 @@ Connector-specific tuning (env):
 | `OFFLOAD_MAX_PENDING_SAVES` | `max(2, 2 × OFFLOAD_COPY_WORKERS)` | Positive integer bound on total admitted worker saves (running + queued), acquired before SLOT snapshot or executor submission. |
 | `OFFLOAD_SAVE_POLICY` | `round_robin` | Chunked LMCache save selection, including `lmcache_mp` and DSV4. `priority` uses reuse demand and dirty cost, and hard-drops a finished request's unadmitted save instead of pinning its KV indefinitely. |
 | `OFFLOAD_SAVE_MIN_OBSERVED_COUNT` | 2 | Priority mode's hard minimum rank-local prefix observations. |
+| `OFFLOAD_SAVE_MAX_PINNED_RATIO` | 0.20 | Maximum fraction of this scheduler's physical KV block pool that committed reservations plus unsafe save leases may occupy. Valid range: 0.0–0.30. It is local per DP scheduler and is never multiplied by TP size. |
+| `OFFLOAD_SAVE_MAX_PINNED_BLOCKS` | — | Optional absolute PAGE-block clamp. The effective local budget is `min(floor(total_blocks × ratio), absolute)`. |
 | `OFFLOAD_SAVE_AGING_WEIGHT` | 0.01 | Priority score added per candidate wait-second. It cannot bypass the minimum observation count. |
 | `OFFLOAD_SAVE_RELEASE_WEIGHT` | 1.0 | Priority weight for blocks released by a finished save. |
 | `OFFLOAD_SAVE_DEMAND_BLOCK_TOKENS` | 8192 | Coarse cumulative-prefix size for the independent rank-local demand tracker. |

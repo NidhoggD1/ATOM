@@ -41,6 +41,9 @@ export LMCACHE_CHUNK_SIZE=256
 export OFFLOAD_MAX_PENDING_SAVES=2
 export OFFLOAD_SAVE_POLICY=priority
 export OFFLOAD_SAVE_MIN_OBSERVED_COUNT=2
+export OFFLOAD_SAVE_MAX_PINNED_RATIO=0.20
+# Optional test/operations clamp; effective budget is min(ratio, absolute).
+# export OFFLOAD_SAVE_MAX_PINNED_BLOCKS=128
 export OFFLOAD_MIN_LOAD_TOKENS=8192
 export OFFLOAD_MIN_SAVE_TOKENS=8192
 
@@ -84,10 +87,15 @@ minimum-gain threshold. Explicit
 `lmcache.mp.max_pinned_state_bytes` optionally limits native checkpoint sources
 and temporary restore images together. Its default is
 `OFFLOAD_MAX_PENDING_SAVES * units_per_checkpoint * page_unit_bytes`, per TP
-worker's geometry. PAGE KV sources continue to use normal request ownership.
-Candidates consume no PAGE or image pin until admission. If a request finishes
-while waiting, admission resolves the original token/hash chain back through
-the live prefix index and stores only its still-resident contiguous prefix.
+worker's geometry. `OFFLOAD_SAVE_MAX_PINNED_RATIO` (default 0.20, valid range
+0.0 through 0.30) separately bounds PAGE reservations plus physically leased
+source blocks against the real local `BlockManager` pool. The optional
+`OFFLOAD_SAVE_MAX_PINNED_BLOCKS` is an absolute clamp, so the effective budget
+is the smaller of the ratio and absolute limits. A ratio of zero disables any
+save that could extend PAGE lifetime. Candidates consume neither budget until
+admission. If a request finishes while waiting, admission resolves the original
+token/hash chain back through the live prefix index and stores only its
+still-resident contiguous prefix.
 `OFFLOAD_MIN_SAVE_TOKENS` (default 8192) suppresses a late save whose remaining
 prefix is too small. The shared save limit defaults to
 `max(2, 2 * OFFLOAD_COPY_WORKERS)` when not configured.
@@ -110,16 +118,29 @@ The final image region is trimmed at `image_bytes`, preserving the original
 physical PAGE stride.
 
 The scheduler dispatches one combined PAGE/STATE save generation at a time per
-request, with count/byte bounds. `OFFLOAD_SAVE_POLICY=round_robin` preserves the
-compatibility order. `priority` ranks candidates by rank-local prefix demand,
-dirty-token cost, age, and finished-request release value. A finished candidate
-must reserve capacity immediately or its PAGE+STATE save is dropped atomically;
-the request never waits in an unbounded save backlog. It acquires the exact
-READY image only after admission. An IPC producer event orders MP reads after
-native checkpoint creation. Source-safe events release PAGE leases chunk by
-chunk and release the READY STATE image once its endpoint is safe; terminal
-completion then settles the logical operation. Decode-only PAGEs and the live
-SLOT are not save sources and can be returned as soon as the request ends.
+request, with count/PAGE/byte bounds. `OFFLOAD_SAVE_POLICY=round_robin`
+preserves the compatibility order. `priority` ranks candidates by rank-local
+prefix demand, dirty-token cost, age, and finished-request release value. Before
+dispatch it reserves the candidate's physical PAGE footprint. If that does not
+fit, it simulates removing one or more strictly lower-scored, undispatched
+committed reservations and applies the replacement only if every count, PAGE,
+and native-state constraint then passes. Inflight saves are never victims. A
+rejected or evicted lifecycle is cancelled rather than deferred or retried, so
+it cannot hold a finished request's blocks. GLM native PAGE+STATE reservations
+are admitted and rolled back as one unit; MiniMax-M3 uses the PAGE and count
+budgets only. It acquires the exact READY image only after admission. An IPC
+producer event orders MP reads after native checkpoint creation. Source-safe
+events release PAGE leases chunk by chunk and release the READY STATE image once
+its endpoint is safe; terminal completion then settles the logical operation.
+Decode-only PAGEs and the live SLOT are not save sources and can be returned as
+soon as the request ends.
+
+The PAGE budget is local to each EngineCore/BlockManager. DPA+EP therefore gets
+one independent budget per runtime DP scheduler even when a process-local CLI
+field reports DP size one; capacity is never borrowed across DP schedulers.
+TP ranks share the scheduler's logical block IDs, so neither reservations nor
+the budget are multiplied by TP size. With TP rank collapse, native state and
+the pending operation are likewise counted once after the TP completion quorum.
 Failed saves from active requests roll back the watermark for at most three
 attempts at that boundary. A failed save whose request has already finished is
 dropped immediately, including any residual tail. Native saves never reclaim

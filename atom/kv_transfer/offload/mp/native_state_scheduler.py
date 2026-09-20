@@ -119,7 +119,7 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             if callable(shutdown):
                 shutdown()
             raise
-        self._block_manager = block_manager
+        super().bind_block_manager(block_manager)
         self._checkpoints = coordinator
         self._pinned_state_bytes = 0
         self._native_saves: dict[SaveOperationId, _NativeSave] = {}
@@ -179,6 +179,12 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             <= self._max_pinned_state_bytes
         )
 
+    def _reserved_save_resources_allow(self, committed_after: int) -> bool:
+        return (
+            self._pinned_state_bytes + committed_after * self._image_reservation_bytes
+            <= self._max_pinned_state_bytes
+        )
+
     def _save_frontier(self, seq: Any) -> int:
         if not getattr(seq, "has_per_req_cache", False):
             return 0
@@ -204,17 +210,14 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         return saved
 
     def _may_emit_save(self) -> bool:
-        return (
-            len(self._save_inflight) + len(self._save_committed)
-            < self._max_pending_saves
-            and self._has_state_budget()
-        )
+        committed_after = len(self._save_committed) + 1
+        return self._save_count_allows(
+            committed_after
+        ) and self._reserved_save_resources_allow(committed_after)
 
     def _build_save_request(
         self, seq, saved, aligned, operation, block_ids, is_last_prefill
     ):
-        if not self._may_emit_save():
-            return None
         prefix_hash = self._boundary_hash(seq, aligned)
         # Reserve admission bytes before taking any source pin. All mutations
         # run on the scheduler thread, and a miss rolls this reservation back.

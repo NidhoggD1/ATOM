@@ -15,12 +15,17 @@ import torch
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
     KVTransferRegion,
     KVTransferTensors,
     LoadOperationId,
     SaveOperationId,
+    SaveSourceGroupId,
 )
-from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+from atom.kv_transfer.offload.chunked_scheduler import (
+    DENSE_PAGE_STORE_CHANNEL,
+    ChunkedOffloadSchedulerBase,
+)
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -28,6 +33,7 @@ from atom.kv_transfer.offload.metadata import (
     SaveSpec,
 )
 from atom.kv_transfer.offload.mp import backend as mp_connector
+from atom.kv_transfer.offload.save_admission import load_save_admission_config
 
 
 def _config(
@@ -425,6 +431,277 @@ def test_page_only_mp_counts_committed_reservations_against_save_capacity():
 
     scheduler._save_committed = {"reserved": object()}
     assert not scheduler._may_emit_save()
+
+
+def _page_save_scheduler(
+    monkeypatch,
+    *,
+    total_blocks=20,
+    ratio="0.20",
+    absolute=None,
+    capacity=3,
+    tp=1,
+):
+    monkeypatch.setenv("OFFLOAD_SAVE_POLICY", "priority")
+    monkeypatch.setenv("OFFLOAD_SAVE_MIN_OBSERVED_COUNT", "1")
+    monkeypatch.setenv("OFFLOAD_SAVE_AGING_WEIGHT", "0")
+    monkeypatch.setenv("OFFLOAD_SAVE_MAX_PINNED_RATIO", ratio)
+    if absolute is None:
+        monkeypatch.delenv("OFFLOAD_SAVE_MAX_PINNED_BLOCKS", raising=False)
+    else:
+        monkeypatch.setenv("OFFLOAD_SAVE_MAX_PINNED_BLOCKS", str(absolute))
+    scheduler = mp_connector.LMCacheMPConnectorScheduler.__new__(
+        mp_connector.LMCacheMPConnectorScheduler
+    )
+    ChunkedOffloadSchedulerBase.__init__(
+        scheduler,
+        _config(model_type="MiniMaxM3SparseForCausalLM", tp=tp),
+        chunk_size=8,
+        lookup_client=None,
+    )
+    scheduler._max_pending_saves = capacity
+    scheduler._min_save_tokens = 0
+    scheduler.bind_block_manager(
+        SimpleNamespace(total_allocatable_kv_blocks=total_blocks)
+    )
+    return scheduler
+
+
+def _page_save_seq(req_id, *, tokens=16, block_offset=0):
+    return SimpleNamespace(
+        id=req_id,
+        num_prompt_tokens=tokens,
+        num_cached_tokens=tokens,
+        token_ids=list(range(block_offset * 100, block_offset * 100 + tokens)),
+        block_table=list(range(block_offset, block_offset + (tokens + 3) // 4)),
+    )
+
+
+def _finish_page_candidate(scheduler, seq):
+    scheduler.update_state_after_alloc(seq)
+    scheduler.request_finished(seq)
+    protected = scheduler.protected_block_ids(seq)
+    assert protected == frozenset()
+    scheduler.activate_block_leases(seq, protected)
+    seq.block_table = []
+
+
+@pytest.mark.parametrize("ratio", ["-0.01", "0.31", "nan", "inf"])
+def test_save_pin_ratio_validation(monkeypatch, ratio):
+    monkeypatch.setenv("OFFLOAD_SAVE_POLICY", "priority")
+    monkeypatch.setenv("OFFLOAD_SAVE_MAX_PINNED_RATIO", ratio)
+    with pytest.raises(ValueError, match="OFFLOAD_SAVE_MAX_PINNED_RATIO"):
+        load_save_admission_config()
+
+
+def test_save_pin_budget_uses_minimum_of_ratio_and_absolute(monkeypatch):
+    ratio_limited = _page_save_scheduler(
+        monkeypatch, total_blocks=101, ratio="0.20", absolute=50
+    )
+    assert ratio_limited._save_pin_budget_blocks == 20
+
+    absolute_limited = _page_save_scheduler(
+        monkeypatch, total_blocks=101, ratio="0.30", absolute=7
+    )
+    assert absolute_limited._save_pin_budget_blocks == 7
+
+
+@pytest.mark.parametrize("absolute", ["-1", "1.5", "blocks"])
+def test_save_pin_absolute_budget_validation(monkeypatch, absolute):
+    monkeypatch.setenv("OFFLOAD_SAVE_POLICY", "priority")
+    monkeypatch.setenv("OFFLOAD_SAVE_MAX_PINNED_BLOCKS", absolute)
+    with pytest.raises(ValueError, match="OFFLOAD_SAVE_MAX_PINNED_BLOCKS"):
+        load_save_admission_config()
+
+
+def test_page_budget_zero_rejects_without_deferring_free(monkeypatch):
+    scheduler = _page_save_scheduler(monkeypatch, ratio="0")
+    seq = _page_save_seq("zero")
+    scheduler.update_state_after_alloc(seq)
+    scheduler.request_finished(seq)
+
+    assert scheduler._save_tracker == {}
+    assert scheduler._save_committed == {}
+    assert scheduler._save_block_reservations == {}
+    assert not scheduler.should_defer_free(seq)
+    stats = scheduler.get_statistics()
+    assert stats["save_budget_rejected"] == 1
+    assert stats["save_oversized"] == 1
+
+
+def test_exact_shared_physical_blocks_are_counted_once(monkeypatch):
+    scheduler = _page_save_scheduler(monkeypatch, capacity=2)
+    first = _page_save_seq("first", block_offset=0)
+    second = _page_save_seq("second", block_offset=0)
+    for seq in (first, second):
+        scheduler.update_state_after_alloc(seq)
+        scheduler.request_finished(seq)
+
+    assert set(scheduler._save_committed) == {"first", "second"}
+    assert scheduler.get_statistics()["save_reserved_blocks"] == 4
+
+
+def test_reserved_and_pinned_physical_blocks_share_one_union_budget(monkeypatch):
+    scheduler = _page_save_scheduler(monkeypatch, total_blocks=10, ratio="0.30")
+    lease_owner = SimpleNamespace(id="lease")
+    scheduler.activate_block_leases(lease_owner, frozenset({1, 2}))
+    candidate = _page_save_seq("candidate", tokens=8, block_offset=2)
+    scheduler.update_state_after_alloc(candidate)
+    scheduler.request_finished(candidate)
+
+    assert scheduler._save_committed == {"candidate": candidate}
+    stats = scheduler.get_statistics()
+    assert stats["save_pinned_blocks"] == 2
+    assert stats["save_reserved_blocks"] == 1
+    assert stats["save_budget_available_blocks"] == 0
+
+
+def test_higher_priority_candidate_replaces_lower_committed_save(monkeypatch):
+    scheduler = _page_save_scheduler(monkeypatch, capacity=2)
+    low = _page_save_seq("low", block_offset=0)
+    _finish_page_candidate(scheduler, low)
+    high = _page_save_seq("high", block_offset=10)
+    scheduler.update_state_after_alloc(high)
+    scheduler._prefix_demand.observe(high.token_ids, high.num_prompt_tokens)
+    scheduler.request_finished(high)
+
+    assert scheduler._save_committed == {"high": high}
+    assert "low" not in scheduler._save_tracker
+    assert not scheduler.should_defer_free(low)
+    assert scheduler.should_defer_free(high)
+    stats = scheduler.get_statistics()
+    assert stats["save_budget_evicted"] == 1
+    assert stats["save_budget_evicted_blocks"] == 4
+
+
+def test_higher_priority_candidate_can_replace_multiple_committed_saves(monkeypatch):
+    scheduler = _page_save_scheduler(monkeypatch, capacity=3)
+    lows = [
+        _page_save_seq("low-a", tokens=8, block_offset=0),
+        _page_save_seq("low-b", tokens=8, block_offset=10),
+    ]
+    for seq in lows:
+        _finish_page_candidate(scheduler, seq)
+    high = _page_save_seq("high", tokens=16, block_offset=20)
+    scheduler.update_state_after_alloc(high)
+    scheduler._prefix_demand.observe(high.token_ids, high.num_prompt_tokens)
+    scheduler._prefix_demand.observe(high.token_ids, high.num_prompt_tokens)
+    scheduler.request_finished(high)
+
+    assert scheduler._save_committed == {"high": high}
+    assert all(str(seq.id) not in scheduler._save_tracker for seq in lows)
+    assert scheduler.get_statistics()["save_budget_evicted"] == 2
+
+
+def test_failed_replacement_simulation_does_not_evict_any_victim(monkeypatch):
+    scheduler = _page_save_scheduler(monkeypatch, capacity=3)
+    lows = [
+        _page_save_seq("low-a", tokens=8, block_offset=0),
+        _page_save_seq("low-b", tokens=8, block_offset=10),
+    ]
+    for seq in lows:
+        _finish_page_candidate(scheduler, seq)
+    oversized = _page_save_seq("high", tokens=24, block_offset=20)
+    scheduler.update_state_after_alloc(oversized)
+    scheduler._prefix_demand.observe(oversized.token_ids, oversized.num_prompt_tokens)
+    scheduler._prefix_demand.observe(oversized.token_ids, oversized.num_prompt_tokens)
+    scheduler.request_finished(oversized)
+
+    assert set(scheduler._save_committed) == {"low-a", "low-b"}
+    assert all(str(seq.id) in scheduler._save_tracker for seq in lows)
+    assert "high" not in scheduler._save_tracker
+    stats = scheduler.get_statistics()
+    assert stats["save_budget_evicted"] == 0
+    assert stats["save_oversized"] == 1
+
+
+def test_equal_priority_candidate_cannot_replace_committed_save(monkeypatch):
+    scheduler = _page_save_scheduler(monkeypatch, capacity=2)
+    first = _page_save_seq("a", block_offset=0)
+    _finish_page_candidate(scheduler, first)
+    equal = _page_save_seq("b", block_offset=10)
+    scheduler.update_state_after_alloc(equal)
+    scheduler.request_finished(equal)
+
+    assert scheduler._save_committed == {"a": first}
+    assert "b" not in scheduler._save_tracker
+    assert scheduler.get_statistics()["save_budget_evicted"] == 0
+
+
+def test_inflight_save_is_never_a_replacement_victim(monkeypatch):
+    scheduler = _page_save_scheduler(monkeypatch, capacity=1)
+    low = _page_save_seq("low", block_offset=0)
+    scheduler.update_state_after_alloc(low)
+    [request] = scheduler.build_connector_meta().requests
+    assert scheduler._save_inflight == {"low": request.save_operation}
+
+    high = _page_save_seq("high", block_offset=10)
+    scheduler.update_state_after_alloc(high)
+    scheduler._prefix_demand.observe(high.token_ids, high.num_prompt_tokens)
+    scheduler.request_finished(high)
+
+    assert scheduler._save_inflight == {"low": request.save_operation}
+    assert "high" not in scheduler._save_tracker
+    assert not scheduler.should_defer_free(high)
+
+
+def test_dp_budgets_are_independent_and_tp_does_not_scale_them(monkeypatch):
+    dp0 = _page_save_scheduler(monkeypatch, total_blocks=20, tp=8)
+    dp1 = _page_save_scheduler(monkeypatch, total_blocks=20, tp=8)
+    assert dp0._save_pin_budget_blocks == 4
+    assert dp1._save_pin_budget_blocks == 4
+
+    seq0 = _page_save_seq("dp0", block_offset=0)
+    seq1 = _page_save_seq("dp1", block_offset=0)
+    _finish_page_candidate(dp0, seq0)
+    _finish_page_candidate(dp1, seq1)
+    assert dp0.get_statistics()["save_reserved_blocks"] == 4
+    assert dp1.get_statistics()["save_reserved_blocks"] == 4
+
+
+def test_reservation_transitions_to_lease_and_source_safe_releases_budget(
+    monkeypatch,
+):
+    scheduler = _page_save_scheduler(monkeypatch, capacity=1)
+    seq = _page_save_seq("lifecycle", block_offset=10)
+    scheduler.update_state_after_alloc(seq)
+    [request] = scheduler.build_connector_meta().requests
+    operation = request.save_operation
+    assert scheduler.get_statistics()["save_reserved_blocks"] == 4
+    assert scheduler.get_statistics()["save_pinned_blocks"] == 0
+
+    scheduler._source_group_finished(SaveSourceGroupId(operation, ((0, 8),)))
+    assert scheduler.get_statistics()["save_reserved_blocks"] == 2
+    scheduler.request_finished(seq)
+    protected = scheduler.protected_block_ids(seq)
+    assert protected == frozenset(seq.block_table[2:4])
+    scheduler.activate_block_leases(seq, protected)
+    seq.block_table = []
+    stats = scheduler.get_statistics()
+    assert stats["save_reserved_blocks"] == 0
+    assert stats["save_pinned_blocks"] == 2
+
+    scheduler._source_group_finished(SaveSourceGroupId(operation, ((8, 16),)))
+    assert scheduler.get_statistics()["save_pinned_blocks"] == 0
+    assert scheduler.take_source_safe_releases() == [protected]
+    assert scheduler.connector_completion(
+        ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, operation, True)
+    )
+    assert scheduler._save_block_reservations == {}
+
+
+def test_request_id_reuse_does_not_retain_old_committed_reservation(monkeypatch):
+    scheduler = _page_save_scheduler(monkeypatch, capacity=1)
+    old = _page_save_seq("same", block_offset=0)
+    _finish_page_candidate(scheduler, old)
+
+    new = _page_save_seq("same", block_offset=10)
+    scheduler.update_state_after_alloc(new)
+    assert scheduler._save_committed == {}
+    assert scheduler._save_block_reservations == {}
+    scheduler.request_finished(new)
+    assert scheduler._save_committed == {"same": new}
+    assert scheduler._save_block_reservations["same"].seq is new
 
 
 def _transfer_tensors(*, tp_replication_factor: int = 1) -> KVTransferTensors:

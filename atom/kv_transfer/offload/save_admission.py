@@ -11,6 +11,7 @@ import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from typing import Any
 
 PrefixDemandKey = tuple[int, bytes]
 
@@ -44,6 +45,19 @@ def _positive_float(name: str, default: float) -> float:
     return value
 
 
+def _optional_nonnegative_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be nonnegative")
+    return value
+
+
 @dataclass(frozen=True)
 class SaveAdmissionConfig:
     policy: str
@@ -53,6 +67,28 @@ class SaveAdmissionConfig:
     demand_block_tokens: int
     demand_max_entries: int
     demand_ttl_seconds: float
+    max_pinned_ratio: float
+    max_pinned_blocks: int | None
+
+
+@dataclass(frozen=True)
+class SaveBlockReservation:
+    """One scheduler-local PAGE budget reservation.
+
+    ``block_ids`` are physical IDs from this scheduler's own BlockManager.
+    ``estimated_blocks`` accounts for source blocks whose current physical IDs
+    are unavailable (notably a finished request after early deallocation).
+    The two fields are additive; exact IDs are unioned across reservations and
+    leases before the conservative estimate is added.
+    """
+
+    sid: str
+    seq: Any
+    generation: int
+    block_ids: frozenset[int]
+    estimated_blocks: int
+    priority_score: float
+    committed: bool
 
 
 def load_save_admission_config() -> SaveAdmissionConfig:
@@ -63,8 +99,22 @@ def load_save_admission_config() -> SaveAdmissionConfig:
         raise ValueError(
             f"OFFLOAD_SAVE_POLICY must be 'round_robin' or 'priority', got {policy!r}"
         )
+    max_pinned_ratio = _nonnegative_float("OFFLOAD_SAVE_MAX_PINNED_RATIO", 0.20)
+    if max_pinned_ratio > 0.30:
+        raise ValueError("OFFLOAD_SAVE_MAX_PINNED_RATIO must be at most 0.30")
+    max_pinned_blocks = _optional_nonnegative_int("OFFLOAD_SAVE_MAX_PINNED_BLOCKS")
     if policy == "round_robin":
-        return SaveAdmissionConfig(policy, 2, 0.01, 1.0, 8192, 65536, 600.0)
+        return SaveAdmissionConfig(
+            policy,
+            2,
+            0.01,
+            1.0,
+            8192,
+            65536,
+            600.0,
+            max_pinned_ratio,
+            max_pinned_blocks,
+        )
     return SaveAdmissionConfig(
         policy=policy,
         min_observed_count=_nonnegative_int("OFFLOAD_SAVE_MIN_OBSERVED_COUNT", 2),
@@ -73,6 +123,8 @@ def load_save_admission_config() -> SaveAdmissionConfig:
         demand_block_tokens=_nonnegative_int("OFFLOAD_SAVE_DEMAND_BLOCK_TOKENS", 8192),
         demand_max_entries=_nonnegative_int("OFFLOAD_SAVE_DEMAND_MAX_ENTRIES", 65536),
         demand_ttl_seconds=_positive_float("OFFLOAD_SAVE_DEMAND_TTL_SECONDS", 600),
+        max_pinned_ratio=max_pinned_ratio,
+        max_pinned_blocks=max_pinned_blocks,
     )
 
 
@@ -186,5 +238,6 @@ __all__ = [
     "PrefixDemandKey",
     "PrefixDemandTracker",
     "SaveAdmissionConfig",
+    "SaveBlockReservation",
     "load_save_admission_config",
 ]

@@ -85,10 +85,13 @@ def make_scheduler(
     role="offload",
     policy="round_robin",
     min_observed=2,
+    total_blocks=100,
+    pin_ratio="0.20",
 ):
     monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", str(capacity))
     monkeypatch.setenv("OFFLOAD_SAVE_POLICY", policy)
     monkeypatch.setenv("OFFLOAD_SAVE_MIN_OBSERVED_COUNT", str(min_observed))
+    monkeypatch.setenv("OFFLOAD_SAVE_MAX_PINNED_RATIO", pin_ratio)
     adapter = Adapter()
     connections = []
 
@@ -118,6 +121,7 @@ def make_scheduler(
         paged_state_checkpoints=checkpoints,
         hash_block_size=4,
         compute_hash=BlockManager.compute_hash,
+        total_allocatable_kv_blocks=total_blocks,
     )
     scheduler.bind_block_manager(manager)
     scheduler.bind_block_manager(manager)
@@ -134,7 +138,7 @@ def test_native_scheduler_exports_route_lookup_descriptor(monkeypatch):
     )
 
 
-def sequence(request_id=1, *, count=24, computed=16, token_offset=0):
+def sequence(request_id=1, *, count=24, computed=16, token_offset=0, block_offset=0):
     seq = Sequence(
         list(range(token_offset, token_offset + count)),
         4,
@@ -143,7 +147,7 @@ def sequence(request_id=1, *, count=24, computed=16, token_offset=0):
     )
     seq.num_cached_tokens = computed
     seq.state_slots = [5]
-    seq.block_table = list(range((count + 3) // 4))
+    seq.block_table = list(range(block_offset, block_offset + (count + 3) // 4))
     return seq
 
 
@@ -272,6 +276,67 @@ def test_priority_save_has_stable_request_id_tie_break(monkeypatch):
     assert request.req_id == "a"
 
 
+def test_glm_page_and_state_budgets_replace_atomically(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(
+        monkeypatch,
+        capacity=3,
+        budget=60,
+        policy="priority",
+        min_observed=1,
+        total_blocks=20,
+    )
+    lows = [
+        sequence("low-a", count=8, computed=8, block_offset=0),
+        sequence("low-b", count=8, computed=8, token_offset=50, block_offset=0),
+    ]
+    for seq in lows:
+        checkpoint(scheduler, checkpoints, seq, 8)
+        scheduler.update_state_after_alloc(seq)
+        scheduler.request_finished(seq)
+    # PAGE IDs are shared, so the new disjoint two-block candidate still fits
+    # the four-block PAGE budget. The native byte budget nevertheless requires
+    # one lower-score committed PAGE+STATE pair to be removed as one unit.
+    high = sequence("high", count=8, computed=8, token_offset=100, block_offset=10)
+    checkpoint(scheduler, checkpoints, high, 8)
+    scheduler.update_state_after_alloc(high)
+    scheduler._prefix_demand.observe(high.token_ids, high.num_prompt_tokens)
+    scheduler.request_finished(high)
+
+    assert len(scheduler._save_committed) == 2
+    assert scheduler._save_committed["high"] is high
+    assert sum(str(seq.id) in scheduler._save_committed for seq in lows) == 1
+    assert scheduler.get_statistics()["save_budget_evicted"] == 1
+
+
+def test_glm_failed_state_budget_simulation_keeps_all_committed_victims(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(
+        monkeypatch,
+        capacity=2,
+        budget=60,
+        policy="priority",
+        min_observed=1,
+        total_blocks=20,
+    )
+    low = sequence("low", count=8, computed=8)
+    checkpoint(scheduler, checkpoints, low, 8)
+    scheduler.update_state_after_alloc(low)
+    scheduler.request_finished(low)
+    # Model an unrelated inflight native transfer/load consuming the remaining
+    # state-image bytes. Evicting the PAGE reservation still cannot admit a new
+    # PAGE+STATE pair, so the simulation must make no mutation.
+    scheduler._pinned_state_bytes = 60
+    high = sequence("high", count=8, computed=8, token_offset=100, block_offset=10)
+    checkpoint(scheduler, checkpoints, high, 8)
+    scheduler.update_state_after_alloc(high)
+    scheduler._prefix_demand.observe(high.token_ids, high.num_prompt_tokens)
+    scheduler.request_finished(high)
+
+    assert scheduler._save_committed == {"low": low}
+    assert "low" in scheduler._save_tracker
+    assert "high" not in scheduler._save_tracker
+    assert scheduler.get_statistics()["save_budget_evicted"] == 0
+
+
 def test_priority_aging_can_reorder_eligible_candidates_but_not_bypass_threshold(
     monkeypatch,
 ):
@@ -338,7 +403,7 @@ def test_finished_priority_save_drops_immediately_when_capacity_is_full(monkeypa
     assert scheduler.get_statistics()["save_dropped_capacity"] == 1
 
 
-def test_committed_and_inflight_saves_share_one_capacity_bound(monkeypatch):
+def test_priority_capacity_rejection_cancels_save_instead_of_retrying(monkeypatch):
     scheduler, checkpoints, _ = make_scheduler(
         monkeypatch, capacity=2, policy="priority", min_observed=1
     )
@@ -359,8 +424,9 @@ def test_committed_and_inflight_saves_share_one_capacity_bound(monkeypatch):
     assert set(scheduler._save_inflight) == {"first", "second"}
     assert scheduler.build_connector_meta().requests == []
     terminal(scheduler, first_request.save_operation)
-    [third_request] = scheduler.build_connector_meta().requests
-    assert third_request.req_id == "third"
+    assert scheduler.build_connector_meta().requests == []
+    assert "third" not in scheduler._save_tracker
+    assert not scheduler.should_defer_free(third)
 
 
 def test_finished_inflight_save_commits_one_residual_tail(monkeypatch):

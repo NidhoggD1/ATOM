@@ -44,6 +44,9 @@ def _config(role="kv_producer", *, block_size=4):
 
 def _early_release_scheduler(monkeypatch, role="kv_producer", *, chunk_size=8):
     monkeypatch.setenv("OFFLOAD_MIN_SAVE_TOKENS", "0")
+    # These lifecycle tests predate the PAGE admission budget and intentionally
+    # exercise eight-block saves from a 32-block pool.
+    monkeypatch.setenv("OFFLOAD_SAVE_MAX_PINNED_RATIO", "0.30")
     monkeypatch.setattr(
         offcfg,
         "build_lmcache_config",

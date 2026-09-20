@@ -428,6 +428,31 @@ class _AtomMetricsCollector:
                 "Number of source leases reclaimed after an abnormal timeout.",
                 offload.get("abnormal_lease_reclaims", 0),
             ),
+            (
+                "atom:lmcache_save_budget_rejected_total",
+                "Number of LMCache save admissions rejected by a hard budget.",
+                offload.get("save_budget_rejected", 0),
+            ),
+            (
+                "atom:lmcache_save_budget_rejected_blocks_total",
+                "Requested PAGE blocks in budget-rejected LMCache saves.",
+                offload.get("save_budget_rejected_blocks", 0),
+            ),
+            (
+                "atom:lmcache_save_budget_evicted_total",
+                "Committed LMCache saves evicted for higher-priority admissions.",
+                offload.get("save_budget_evicted", 0),
+            ),
+            (
+                "atom:lmcache_save_budget_evicted_blocks_total",
+                "Reserved PAGE blocks evicted for higher-priority admissions.",
+                offload.get("save_budget_evicted_blocks", 0),
+            ),
+            (
+                "atom:lmcache_save_oversized_total",
+                "LMCache saves whose source alone exceeded the PAGE budget.",
+                offload.get("save_oversized", 0),
+            ),
         ):
             metric = CounterMetricFamily(name, documentation)
             metric.add_metric([], float(value))
@@ -496,9 +521,29 @@ class _AtomMetricsCollector:
                 offload.get("save_inflight_wait_seconds", 0),
             ),
             (
+                "atom:lmcache_save_pin_budget_blocks",
+                "Scheduler-local PAGE block budget for admitted LMCache saves.",
+                offload.get("save_pin_budget_blocks", 0),
+            ),
+            (
+                "atom:lmcache_save_reserved_blocks",
+                "PAGE blocks reserved by committed or active LMCache saves.",
+                offload.get("save_reserved_blocks", 0),
+            ),
+            (
                 "atom:lmcache_save_pinned_blocks",
-                "GPU KV blocks held by finished admitted saves.",
+                "Unique physical GPU KV blocks leased by admitted saves.",
                 offload.get("save_pinned_blocks", 0),
+            ),
+            (
+                "atom:lmcache_save_pinned_ratio",
+                "Fraction of the local KV pool reserved or pinned by saves.",
+                offload.get("save_pinned_ratio", 0),
+            ),
+            (
+                "atom:lmcache_save_budget_available_blocks",
+                "Unused scheduler-local LMCache save PAGE budget.",
+                offload.get("save_budget_available_blocks", 0),
             ),
             (
                 "atom:lmcache_save_pinned_tokens",
