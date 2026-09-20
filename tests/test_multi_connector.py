@@ -239,9 +239,6 @@ def _worker(connectors):
     obj = MultiConnector.__new__(MultiConnector)
     obj._connectors = connectors
     obj.is_producer = any(getattr(c, "is_producer", False) for c in connectors)
-    obj._pp_is_head = pp_is_head
-    obj._pending_save_ops = {}
-    obj._sent = {}
     obj._state_tier = None
     return obj
 
@@ -757,7 +754,7 @@ def test_send_without_pending_save_is_released_immediately():
     assert out.finished_sending == {"r1"}
 
 
-def test_send_is_withheld_until_save_completes():
+def test_send_is_reported_before_pending_save_completes():
     # One producer (moriio) + one offload sub, sharing req "r9".
     moriio = FakeWorkerSub(is_producer=True)
     off = FakeWorkerSub()
@@ -765,22 +762,20 @@ def test_send_is_withheld_until_save_completes():
 
     # offload will save r9
     w.start_load_kv(MultiConnectorMetadata([ConnectorMetadata(), _save_meta(9)]))
-    assert w._pending_save_ops == {"9": {9}}
 
     # Step 1: moriio reports send done, offload's save still in flight.
     moriio._finished = ({9}, set())
     off._finished = KVConnectorOutput()
     out1 = w.get_finished()
-    assert out1.finished_sending == set()  # withheld
+    assert out1.finished_sending == {9}
     assert out1.finished_saving == set()
 
-    # Step 2: offload reports save done -> both released together.
+    # Step 2: offload reports save done without reporting the send again.
     moriio._finished = (set(), set())
     off._finished = KVConnectorOutput(finished_saving={9})
     out2 = w.get_finished()
-    assert out2.finished_sending == {9}
+    assert out2.finished_sending == set()
     assert out2.finished_saving == {9}
-    assert w._pending_save_ops == {}  # cleared after release
 
 
 def test_save_is_reported_before_send():
@@ -795,7 +790,7 @@ def test_save_is_reported_before_send():
     assert out1.finished_sending == set()
     assert out1.finished_saving == {9}
 
-    # Step 2: send completes -> both released.
+    # Step 2: send completes without reporting the save again.
     off._finished = KVConnectorOutput()
     moriio._finished = ({9}, set())
     out2 = w.get_finished()
@@ -819,7 +814,6 @@ def test_save_registered_after_send_is_still_reported():
         out = w.get_finished()
         assert out.finished_saving == {op}
         assert out.finished_sending == set()
-        assert w._pending_save_ops == {}
 
 
 def test_send_and_save_keep_their_distinct_operation_ids():
@@ -835,8 +829,6 @@ def test_send_and_save_keep_their_distinct_operation_ids():
     out = w.get_finished()
     assert out.finished_sending == {9}
     assert out.finished_saving == {op}
-    assert w._pending_save_ops == {}
-    assert w._sent == {}
 
 
 def test_each_save_generation_is_reported_as_it_finishes():
@@ -855,10 +847,8 @@ def test_each_save_generation_is_reported_as_it_finishes():
     moriio._finished = (set(), set())
     off._finished = KVConnectorOutput(finished_saving={op1})
     out2 = w.get_finished()
-    assert out2.finished_sending == {9}
+    assert out2.finished_sending == set()
     assert out2.finished_saving == {op1}
-    assert w._pending_save_ops == {}
-    assert w._sent == {}
 
 
 @pytest.mark.parametrize("pp_rank", [0, 1])

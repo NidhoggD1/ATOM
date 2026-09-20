@@ -36,22 +36,19 @@ Merge strategy mirrors vLLM's ``MultiConnector``, adapted to ATOM's
 * ``build_connector_meta`` — returns :class:`MultiConnectorMetadata` carrying one
   sub-metadata per connector, in connector order. The worker de-multiplexes by
   index in ``start_load_kv``.
-* ``get_finished`` — union the completion sets, **but** see the send/save
-  pairing below.
+* ``get_finished`` — union each sub-connector's completion sets independently.
 * ``_state_tier`` — the state offload tier, if a sub built one, re-exposed on
   the composite by ``_adopt_state_tier`` at ``register_kv_caches`` time (which
   also refuses a config that lists two offload subs). Mirroring the sub's tier
   on the composite keeps the attribute defined, so a probe for it resolves to
   the real tier instead of raising ``AttributeError``.
 
-Send/save pairing (the one tricky correctness point)
-----------------------------------------------------
-Save completions are reported immediately so chunked prefill can submit its
-next save. Holding them for a send that has already been reported strands the
-scheduler's save generation forever. Sends wait for all worker-known saves;
-the scheduler additionally waits for any final save not yet dispatched before
-freeing the blocks. It remembers send completion on the deferred sequence, so
-neither completion order can free a source still in use.
+Completion reporting and source-block retention
+----------------------------------------------
+Send and save completions are reported immediately so each transfer can make
+progress independently. The scheduler retains source blocks through the
+sub-connectors' ``should_defer_free`` predicates until pending sends, active
+saves, and computed KV awaiting save dispatch have all finished.
 """
 
 from __future__ import annotations
@@ -235,19 +232,6 @@ class MultiConnector(KVConnectorBase):
             getattr(c, "is_producer", False) for c in self._connectors
         )
 
-        pp_rank = getattr(
-            getattr(config, "parallel_config", None),
-            "pipeline_parallel_rank",
-            0,
-        )
-        self._pp_is_head = pp_rank == 0
-
-        # Send/save pairing state, all keyed by str(req_id). See module
-        # docstring. The values below are completion identities, not keys: a
-        # pending save is named by its SaveOperationId, or by the bare req_id
-        # when the metadata carries none -- whichever the worker will report.
-        self._pending_save_ops: dict[str, set[SaveCompletionId]] = {}
-        self._sent: dict[str, Any] = {}
         # The state tier of whichever sub owns one. Adopted in
         # `register_kv_caches` via `_adopt_state_tier`; set to None here so the
         # attribute exists before the subs register -- a probe for it must
@@ -333,37 +317,6 @@ class MultiConnector(KVConnectorBase):
             failed_loading=load_failed,
             connector_completions=completions,
         )
-
-        if not self._pairs_send_and_save:
-            out.finished_sending = set(send_now)
-            out.finished_saving = set(save_now)
-            return out
-
-        # Hold sends for known saves, but never hold a local save completion
-        # for a future (or already consumed) send notification.
-        for r in send_now:
-            self._sent[str(r)] = r
-        # State stores have no request/send counterpart.
-        for r in save_now:
-            if isinstance(r, StateStoreOperationId):
-                continue
-            key = completion_req_key(r)
-            pending_ops = self._pending_save_ops.get(key)
-            if pending_ops is not None:
-                pending_ops.discard(r)
-                if not pending_ops:
-                    self._pending_save_ops.pop(key, None)
-
-        rel_send: set = set()
-        for key, raw in list(self._sent.items()):
-            if self._pending_save_ops.get(key):
-                continue  # hold: save still in flight for this request
-            rel_send.add(raw)
-            del self._sent[key]
-
-        out.finished_sending = rel_send
-        out.finished_saving = set(save_now)
-        return out
 
     def get_finished_recv_blocks(self) -> list[int]:
         blocks: list[int] = []

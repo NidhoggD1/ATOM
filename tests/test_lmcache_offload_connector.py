@@ -4933,7 +4933,6 @@ def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight(
     if send_first:
         report(KVConnectorOutput(finished_sending={seq.id}))
         assert not freed
-        assert seq._deferred_save_at > 0
 
     first_save = meta1.requests[0].save_operation
     report(KVConnectorOutput(finished_saving={first_save}))
@@ -5037,13 +5036,17 @@ def test_producer_waits_for_send_and_final_save(send_first):
     class Connector(_OffloadMixinStub):
         is_producer = True
         is_offload = True
-        pending = True  # Also represents a final save not yet dispatched.
+        pending_save = True  # Also represents a final save not yet dispatched.
+        pending_send = True
 
         def save_finished(self, req_id):
-            self.pending = False
+            self.pending_save = False
+
+        def send_finished(self, req_id):
+            self.pending_send = False
 
         def should_defer_free(self, seq):
-            return self.pending
+            return self.pending_save or self.pending_send
 
     host = Scheduler.__new__(Scheduler)
     host.kv_connector = Connector()

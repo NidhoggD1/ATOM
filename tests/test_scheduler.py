@@ -448,10 +448,14 @@ class TestSchedule:
         assert sched._num_parked_remote_kv == 0
         assert sched._rejected == [seq]
 
+    @pytest.mark.parametrize("producer", [False, True])
+    @pytest.mark.parametrize("load_outcome", ["finished_loading", "failed_loading"])
     @pytest.mark.parametrize("first_terminal", ["load", "save"])
     def test_aborted_load_and_save_both_finish_before_release(
         self,
         first_terminal,
+        load_outcome,
+        producer,
     ):
         load = 97
         save = 97
@@ -466,13 +470,18 @@ class TestSchedule:
 
         class _Connector(_OffloadMixinStub):
             is_offload = True
-            is_producer = False
+            is_producer = producer
 
             def __init__(self):
                 self.pending_save = True
+                self.pending_send = False
 
             def load_finished(self, operation):
                 events.append(("load_finished", operation))
+                return operation == load
+
+            def load_failed(self, operation):
+                events.append(("load_failed", operation))
                 return operation == load
 
             def save_finished(self, operation):
@@ -482,10 +491,18 @@ class TestSchedule:
 
             def should_defer_free(self, value):
                 assert value is seq
-                return self.pending_save
+                return self.pending_save or self.pending_send
 
             def request_finished(self, value):
                 events.append(("request_finished", value.id))
+                self.pending_send = self.is_producer
+
+            def send_finished(self, req_id):
+                assert req_id == seq.id
+                self.pending_send = False
+
+            def source_blocks_released(self, value):
+                events.append(("source_blocks_released", value.id))
 
         sched = Scheduler.__new__(Scheduler)
         sched.waiting = deque()
@@ -505,7 +522,7 @@ class TestSchedule:
         assert seq._awaiting_aborted_load_cleanup is True
 
         outputs = {
-            "load": KVConnectorOutput(finished_loading={load}),
+            "load": KVConnectorOutput(**{load_outcome: {load}}),
             "save": KVConnectorOutput(finished_saving={save}),
         }
         second_terminal = "save" if first_terminal == "load" else "load"
@@ -519,8 +536,13 @@ class TestSchedule:
 
         assert sched.deferred_free_blocks == {}
         assert sched._num_parked_remote_kv == 0
+        assert not sched.kv_connector.pending_send
         assert events.count(("request_finished", seq.id)) == 1
         assert events.count(("deallocate", seq.id)) == 1
+        assert events[-2:] == [
+            ("deallocate", seq.id),
+            ("source_blocks_released", seq.id),
+        ]
 
     def test_empty_returns_none(self, scheduler):
         assert scheduler.schedule() is None
