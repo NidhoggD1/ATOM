@@ -92,10 +92,6 @@ for shifted_port_name in \
 done
 unset shifted_port_name
 unset -f validate_shifted_port
-USE_EXPLICIT_DP_PORTS=0
-if [[ "${SINGLE_NODE_PD}" == "1" || "${PREFILL_SINGLE_NODE_PD}" == "1" || "${DECODE_SINGLE_NODE_PD}" == "1" ]]; then
-  USE_EXPLICIT_DP_PORTS=1
-fi
 
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
@@ -506,6 +502,17 @@ if [[ -n "${STATE_CHECKPOINT_INTERVAL_TOKENS}" ]]; then
     --state-checkpoint-interval-tokens "${STATE_CHECKPOINT_INTERVAL_TOKENS}"
   )
 fi
+check_peer_failures() {
+  # Manual launches need not have scheduler status files. CI submissions use
+  # a unique token so that stale status from a previous run cannot abort us.
+  [[ -n "${ATOMESH_RUN_TOKEN:-}" ]] || return 0
+  local -a peer_ips=()
+  IFS=',' read -r -a peer_ips <<< "${IPADDRS}"
+  python3 "${ATOMESH_SCRIPT_DIR}/pd_job_result.py" check-failures \
+    --run-dir "${RUN_DIR}" --job-id "${SLURM_JOB_ID:-${SPUR_JOB_ID:-local}}" \
+    --run-token "${ATOMESH_RUN_TOKEN}" --num-ranks "${#peer_ips[@]}"
+}
+
 wait_http() {
   local url="$1"
   local name="$2"
@@ -513,14 +520,18 @@ wait_http() {
   local pid="${4:-}"
   local deadline=$(( $(date +%s) + timeout ))
   echo "[wait] ${name} ${url} timeout=${timeout}s"
-  until curl -sf --max-time 10 "${url}" >/dev/null 2>&1; do
+  while true; do
+    check_peer_failures || exit $?
+    if curl -sf --max-time 10 "${url}" >/dev/null 2>&1; then
+      break
+    fi
     if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
       set +e
       wait "${pid}"
       local rc=$?
       set -e
       [[ "${rc}" -eq 0 ]] && rc=1
-      echo "[wait][FAIL] ${name} process exited before becoming ready rc=${rc}" >&2
+      echo "[wait][FAIL] local worker pid=${pid} exited while waiting for ${name} rc=${rc}; logs: ${RUNTIME_LOG_DIR}" >&2
       exit "${rc}"
     fi
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
@@ -537,6 +548,7 @@ wait_router_closed() {
   local max_misses=3
   echo "[wait] router shutdown http://${NODE0_ADDR}:${ROUTER_PORT}/health"
   while true; do
+    check_peer_failures || exit $?
     if curl -sf --max-time 10 "http://${NODE0_ADDR}:${ROUTER_PORT}/health" >/dev/null 2>&1; then
       miss_count=0
       if [[ -n "${server_pid:-}" ]] && ! kill -0 "${server_pid}" 2>/dev/null; then
@@ -680,13 +692,12 @@ start_prefill() {
   reset_lmcache_disk
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
-  local -a prefill_dp_env=()
-  if [[ "${USE_EXPLICIT_DP_PORTS}" == "1" ]]; then
-    prefill_dp_env=(
-      "ATOM_DP_MASTER_PORT=${dp_master_port}"
-      "ATOM_DP_BASE_PORT=${dp_base_port}"
-    )
-  fi
+  # Every layout must use the planned ports, including one worker per node.
+  # Auto-selected ports are released before the distributed store binds them.
+  local -a prefill_dp_env=(
+    "ATOM_DP_MASTER_PORT=${dp_master_port}"
+    "ATOM_DP_BASE_PORT=${dp_base_port}"
+  )
   local prefill_kv_transfer_config
   if [[ -n "${PREFILL_KV_TRANSFER_CONFIG}" ]]; then
     prefill_kv_transfer_config="${PREFILL_KV_TRANSFER_CONFIG}"
@@ -732,13 +743,10 @@ start_decode() {
   fi
   local -a decode_cache_env=()
   build_server_cache_env "decode" "${server_port}" decode_cache_env
-  local -a decode_dp_env=()
-  if [[ "${USE_EXPLICIT_DP_PORTS}" == "1" ]]; then
-    decode_dp_env=(
-      "ATOM_DP_MASTER_PORT=${dp_master_port}"
-      "ATOM_DP_BASE_PORT=${dp_base_port}"
-    )
-  fi
+  local -a decode_dp_env=(
+    "ATOM_DP_MASTER_PORT=${dp_master_port}"
+    "ATOM_DP_BASE_PORT=${dp_base_port}"
+  )
   local decode_kv_transfer_config
   if [[ -n "${DECODE_KV_TRANSFER_CONFIG}" ]]; then
     decode_kv_transfer_config="${DECODE_KV_TRANSFER_CONFIG}"

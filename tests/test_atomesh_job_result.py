@@ -1,6 +1,8 @@
 """Validate CI reconciliation without a scheduler, containers or GPUs."""
 
+import contextlib
 import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -97,6 +99,53 @@ class JobResultTest(unittest.TestCase):
     def test_empty_submission_token_or_rank_set_is_not_proof(self):
         self.assertFalse(RESULT.workload_completed(self.root, "3619", "", 2))
         self.assertFalse(RESULT.workload_completed(self.root, "3619", "this-run", 0))
+
+    def test_peer_failure_reports_rank_log_and_original_code(self):
+        for rc in (1, 7, 143):
+            with self.subTest(rc=rc):
+                (self.root / "rank-rc-1").write_text(f"{rc}\n")
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    result = RESULT.check_failures(self.root, "3619", "this-run", 2)
+                self.assertEqual(result, rc)
+                self.assertIn(f"rank 1 exited rc={rc}", stderr.getvalue())
+                self.assertIn("rank-1/container*.log", stderr.getvalue())
+
+    def test_peer_check_ignores_stale_missing_and_malformed_status(self):
+        marker = self.root / "rank-workload-1.json"
+        original = json.loads(marker.read_text())
+        rc_file = self.root / "rank-rc-1"
+        rc_file.write_text("7\n")
+        for change in (
+            {"run_token": "old-run"},
+            {"job_id": "3618"},
+            {"rank": 0},
+            {"num_ranks": 3},
+            {"schema_version": 2},
+        ):
+            with self.subTest(change=change):
+                marker.write_text(json.dumps({**original, **change}))
+                self.assertEqual(
+                    RESULT.check_failures(self.root, "3619", "this-run", 2), 0
+                )
+        for content in ("", "not json", "null", "[]"):
+            marker.write_text(content)
+            self.assertEqual(RESULT.check_failures(self.root, "3619", "this-run", 2), 0)
+        marker.unlink()
+        self.assertEqual(RESULT.check_failures(self.root, "3619", "this-run", 2), 0)
+        marker.write_text(json.dumps(original))
+        self.assertEqual(RESULT.check_failures(self.root, "3619", "", 2), 0)
+        for content in ("0\n", "-1\n", "256\n", "bad", ""):
+            rc_file.write_text(content)
+            self.assertEqual(RESULT.check_failures(self.root, "3619", "this-run", 2), 0)
+        rc_file.unlink()
+        self.assertEqual(RESULT.check_failures(self.root, "3619", "this-run", 2), 0)
+
+    def test_new_attempt_clears_previous_exit_code(self):
+        (self.root / "rank-rc-1").write_text("7\n")
+        RESULT.publish(self.root, "3619", "new-run", 1, 2, "running")
+        self.assertFalse((self.root / "rank-rc-1").exists())
+        self.assertEqual(RESULT.check_failures(self.root, "3619", "new-run", 2), 0)
 
     def test_cli_exits_with_effective_result_and_retains_raw_failure(self):
         args = [

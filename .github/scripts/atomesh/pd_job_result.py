@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 
@@ -13,6 +14,9 @@ def write_json(path, payload):
 
 
 def publish(run_dir, job_id, run_token, rank, num_ranks, status):
+    if status == "running":
+        # Clear a previous attempt's exit code before publishing this token.
+        (run_dir / f"rank-rc-{rank}").unlink(missing_ok=True)
     write_json(
         run_dir / f"rank-workload-{rank}.json",
         {
@@ -48,6 +52,36 @@ def workload_completed(run_dir, job_id, run_token, num_ranks):
     return True
 
 
+def check_failures(run_dir, job_id, run_token, num_ranks):
+    if not run_token or num_ranks < 1:
+        return 0
+    for rank in range(num_ranks):
+        try:
+            workload = json.loads((run_dir / f"rank-workload-{rank}.json").read_text())
+            rc = int((run_dir / f"rank-rc-{rank}").read_text().strip())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(workload, dict) or any(
+            workload.get(key) != value
+            for key, value in {
+                "schema_version": 1,
+                "job_id": job_id,
+                "run_token": run_token,
+                "rank": rank,
+                "num_ranks": num_ranks,
+            }.items()
+        ):
+            continue
+        if 1 <= rc <= 255:
+            print(
+                f"[wait][FAIL] rank {rank} exited rc={rc}; "
+                f"full logs: {run_dir / f'rank-{rank}'}/container*.log",
+                file=sys.stderr,
+            )
+            return rc
+    return 0
+
+
 def resolve(run_dir, job_id, run_token, num_ranks, state, exit_code, rc, spur):
     completed = workload_completed(run_dir, job_id, run_token, num_ranks)
     # Only the generic Spur failure may be reconciled. Explicit cancellation,
@@ -69,7 +103,7 @@ def resolve(run_dir, job_id, run_token, num_ranks, state, exit_code, rc, spur):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("publish", "resolve"))
+    parser.add_argument("action", choices=("publish", "resolve", "check-failures"))
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--run-token", required=True)
@@ -81,6 +115,10 @@ def main():
     parser.add_argument("--scheduler-rc", type=int)
     parser.add_argument("--spur", choices=("0", "1"), default="0")
     args = parser.parse_args()
+    if args.action == "check-failures":
+        return check_failures(
+            args.run_dir, args.job_id, args.run_token, args.num_ranks
+        )
     if args.action == "publish":
         if args.rank is None or not 0 <= args.rank < args.num_ranks or not args.status:
             parser.error("publish requires a valid --rank and --status")
