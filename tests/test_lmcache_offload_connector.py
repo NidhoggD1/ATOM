@@ -161,9 +161,10 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._hit_save_floors = {}
     sched._save_tracker = {}
     sched._max_pending_saves = 4
-    sched._save_rr_last = None
-    sched._save_policy = "round_robin"
-    sched._save_min_observed_count = 2
+    # Most lifecycle tests below insert tracker entries directly instead of
+    # exercising demand observation. Keep their threshold open; focused
+    # priority-admission tests restore the production default of two.
+    sched._save_min_observed_count = 0
     sched._save_aging_weight = 0.01
     sched._save_release_weight = 1.0
     sched._save_max_pinned_ratio = 0.20
@@ -238,7 +239,6 @@ def _stateful_scheduler(hit: int) -> LMCacheOffloadConnectorScheduler:
 
 def _priority_scheduler(*, capacity: int = 2) -> LMCacheOffloadConnectorScheduler:
     sched = _scheduler()
-    sched._save_policy = "priority"
     sched._max_pending_saves = capacity
     sched._save_min_observed_count = 2
     return sched
@@ -4508,7 +4508,7 @@ def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight():
     assert meta3.requests[0].is_last_prefill is True
 
 
-def test_dsv4_save_admission_is_bounded_and_round_robin():
+def test_dsv4_save_admission_is_bounded_and_drops_unadmitted_work():
     sched = _scheduler()
     sched._max_pending_saves = 2
     for req_id in (100, 101, 102):
@@ -4526,12 +4526,12 @@ def test_dsv4_save_admission_is_bounded_and_round_robin():
     assert [request.req_id for request in first.requests] == [100, 101]
     assert sched._may_emit_save() is False
 
-    # The worker has one slot again. Resume after the last admitted request,
-    # rather than letting request 100 win the queue repeatedly.
+    # A candidate that could not reserve capacity was rejected rather than
+    # retained behind the admitted work.
+    assert "102" not in sched._save_tracker
     sched.save_finished(first.requests[0].save_operation)
     second = sched.build_connector_meta()
-    assert [request.req_id for request in second.requests] == [102]
-    assert sched._may_emit_save() is False
+    assert second.requests == []
 
 
 def test_dsv4_priority_save_admits_hotter_prefix_first():
@@ -4633,14 +4633,11 @@ def test_dsv4_zero_save_budget_rejects_without_deferring_free():
     assert stats["save_oversized"] == 1
 
 
-def test_dsv4_round_robin_finished_budget_rejection_stops_deferring_free():
+def test_dsv4_finished_budget_rejection_stops_deferring_free():
     sched = _scheduler()
     _set_save_budget(sched, total_blocks=10, absolute=0)
     seq = _priority_seq(sched, req_id=238, token_ids=list(range(8)))
     sched.request_finished(seq)
-    assert sched.should_defer_free(seq) is True
-
-    assert sched.build_connector_meta().requests == []
 
     assert sched.should_defer_free(seq) is False
     assert "238" not in sched._save_tracker
@@ -4756,7 +4753,6 @@ def test_dsv4_equal_priority_candidate_cannot_replace_committed_save():
 
 def test_dsv4_inflight_page_slot_save_is_never_an_eviction_victim():
     sched = _stateful_scheduler(hit=0)
-    sched._save_policy = "priority"
     sched._save_min_observed_count = 2
     sched._save_aging_weight = 0
     sched._max_pending_saves = 2
@@ -4811,7 +4807,6 @@ def test_dsv4_request_id_reuse_releases_old_committed_reservation():
 
 def test_dsv4_page_slot_replacement_is_atomic():
     sched = _stateful_scheduler(hit=0)
-    sched._save_policy = "priority"
     sched._save_min_observed_count = 2
     sched._save_aging_weight = 0
     sched._max_pending_saves = 2
@@ -4958,7 +4953,6 @@ def test_dsv4_priority_late_failure_does_not_touch_reused_request_id():
 
 def test_dsv4_priority_drop_removes_page_and_sidecar_candidate_together():
     sched = _stateful_scheduler(hit=0)
-    sched._save_policy = "priority"
     sched._save_min_observed_count = 2
     seq = _stateful_seq(
         req_id=214,
@@ -5640,7 +5634,6 @@ def _k3_scheduler() -> KimiK3OffloadScheduler:
     s._save_inflight = {}
     s._save_committed = {}
     s._save_tracker = {}
-    s._save_rr_last = None
     s._pending_state_loads = []
     s._pending_state_stores = []
     s._save_inflight_since = {}
@@ -5665,59 +5658,6 @@ def _k3_seq(*, hbm: int, joint: int = 0, kv: int = 0, claimed: int = 0):
             claim_tokens=claimed,
         ),
     )
-
-
-def test_bounded_saves_are_shared_round_robin_not_head_first():
-    """With a bounded ``_may_emit_save`` (kimi_k3 caps outstanding saves), the
-    save scan must rotate over ``_save_tracker`` so a long multi-chunk request
-    at the insertion-ordered head cannot re-win the freed slot every step and
-    starve later requests -- whose blocks stay pinned by ``should_defer_free``
-    until their save drains. Without the round-robin cursor the emission order
-    would be [100, 100, 100]; with it, each request gets a turn."""
-
-    class _Cap1(DenseOffloadScheduler):
-        def _may_emit_save(self):  # one save outstanding at a time
-            return len(self._save_inflight) < 1
-
-        def _track_save_statistics(self, *a, **k):
-            pass
-
-    s = _Cap1.__new__(_Cap1)
-    s.chunk_size = 256
-    s.block_size = 256
-    s._do_save = True
-    s._do_load = False
-    s._reqs_need_recv = {}
-    s._lookup_in_step = []
-    s._save_tracker = {}
-    s._save_inflight = {}
-    s._save_nonce = 0
-    s._save_rr_last = None
-
-    seqs = {}
-    for i in range(3):
-        sid = str(100 + i)
-        seq = SimpleNamespace(
-            id=100 + i,
-            num_prompt_tokens=4096,
-            token_ids=list(range(4096)),
-            num_cached_tokens=0,
-            block_table=list(range(16)),
-        )
-        s._save_tracker[sid] = [seq, 0]
-        seqs[sid] = seq
-
-    emitted = []
-    for _ in range(3):
-        for seq in seqs.values():  # every request computes one more chunk
-            seq.num_cached_tokens += 256
-        meta = s.build_connector_meta()
-        saves = [r for r in meta.requests if r.save_spec is not None]
-        assert len(saves) == 1  # the cap admits exactly one per step
-        emitted.append(str(saves[0].req_id))
-        s._save_inflight.clear()  # that save completes, freeing the one slot
-
-    assert emitted == ["100", "101", "102"]
 
 
 def test_layout_selection_picks_kimi_k3_for_a_kda_config():

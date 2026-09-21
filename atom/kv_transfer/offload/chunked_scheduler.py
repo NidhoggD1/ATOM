@@ -124,12 +124,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         # prefix is stored to LMCache once prefill computes it
         # (seq.prefix_hashes_published flips True), chunk by chunk.
         self._save_tracker: dict[str, list] = {}
-        # Round-robin cursor over `_save_tracker`: the last sid that emitted a
-        # save. Subclasses may bound the number of outstanding saves through
-        # `_may_emit_save`; resuming after this sid prevents starvation.
-        self._save_rr_last: str | None = None
         save_admission = load_save_admission_config()
-        self._save_policy = save_admission.policy
         self._save_min_observed_count = save_admission.min_observed_count
         self._save_aging_weight = save_admission.aging_weight
         self._save_release_weight = save_admission.release_weight
@@ -339,14 +334,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if entry is None or entry[0] is not seq:
                 self._save_tracker[sid] = [seq, initial_saved]
                 now = time.monotonic()
-                demand_keys = (
-                    self._prefix_demand.observe(
-                        seq.token_ids,
-                        int(seq.num_prompt_tokens),
-                        now,
-                    )
-                    if self._save_policy == "priority"
-                    else ()
+                demand_keys = self._prefix_demand.observe(
+                    seq.token_ids,
+                    int(seq.num_prompt_tokens),
+                    now,
                 )
                 self._save_demand_keys[sid] = (seq, demand_keys)
                 self._save_candidate_generation[sid] = (
@@ -418,8 +409,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     def _ensure_save_admission_state(self) -> None:
         """Supply compatibility defaults for lightweight/manual schedulers."""
 
-        if not hasattr(self, "_save_policy"):
-            self._save_policy = "round_robin"
         if not hasattr(self, "_save_min_observed_count"):
             self._save_min_observed_count = 2
         if not hasattr(self, "_save_aging_weight"):
@@ -750,7 +739,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return False
         return self._try_reserve_save_candidate(
             candidate,
-            allow_eviction=self._save_policy == "priority",
+            allow_eviction=True,
         )
 
     def _forget_save_candidate(self, sid: str, seq) -> None:
@@ -908,7 +897,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if hasattr(seq, "_offload_finished_block_ids") and not seq.block_table:
             late_source = self._late_save_source(seq, candidate.saved, aligned)
             if late_source is None:
-                if self._save_policy == "priority" and candidate.finished:
+                if candidate.finished:
                     self.drop_unadmitted_save(seq, reason="stale")
                 else:
                     self._save_committed.pop(sid, None)
@@ -943,13 +932,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
         logger.debug(
             "[OFFLOAD-SAVE-EMIT] seq=%s computed=%d num_prompt=%d "
-            "aligned=%d saved=%d policy=%s observed=%d",
+            "aligned=%d saved=%d observed=%d",
             seq.id,
             computed,
             int(seq.num_prompt_tokens),
             aligned,
             candidate.saved,
-            self._save_policy,
             candidate.observed_count,
         )
         self._track_save_statistics(save_operation, aligned - candidate.saved)
@@ -1063,7 +1051,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             for sid in self._lookup_in_step
             if sid in loading_sids or sid not in self._load_specs
         ]
-        # Saves. Priority mode admits/replaces the complete candidate set before
+        # Saves. Admit/replace the complete candidate set before
         # dispatch so a newly hotter candidate can still evict lower-value
         # committed work. Dispatching first would make that work inflight and
         # therefore correctly, but prematurely, non-evictable.
@@ -1081,80 +1069,47 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                     self._release_save_reservation(sid, owner=seq)
                     self._settle_finished_save(sid)
 
-            tracker_sids = list(self._save_tracker.keys())
-            if self._save_policy == "round_robin":
-                if tracker_sids and self._save_rr_last in self._save_tracker:
-                    start = (tracker_sids.index(self._save_rr_last) + 1) % len(
-                        tracker_sids
-                    )
-                    tracker_sids = tracker_sids[start:] + tracker_sids[:start]
-                candidates = [
-                    candidate
-                    for sid in tracker_sids
-                    if (candidate := self._build_save_candidate(sid, now=now))
-                    is not None
-                ]
-            else:
-                candidates = [
-                    candidate
-                    for sid in tracker_sids
-                    if (candidate := self._build_save_candidate(sid, now=now))
-                    is not None
-                    and self._meets_save_value_threshold(candidate)
-                ]
-                candidates.sort(
-                    key=lambda candidate: self._candidate_sort_key(candidate, now)
-                )
+            candidates = [
+                candidate
+                for sid in self._save_tracker
+                if (candidate := self._build_save_candidate(sid, now=now)) is not None
+                and self._meets_save_value_threshold(candidate)
+            ]
+            candidates.sort(
+                key=lambda candidate: self._candidate_sort_key(candidate, now)
+            )
 
-            if self._save_policy == "priority":
-                for candidate in candidates:
-                    sid = candidate.sid
-                    if sid in self._save_committed or sid in self._save_inflight:
-                        continue
-                    if sid in self._reqs_need_recv or sid in loading_sids:
-                        continue
-                    if not self._try_reserve_save_candidate(
-                        candidate,
-                        allow_eviction=True,
-                        now=now,
-                    ):
-                        self.drop_unadmitted_save(candidate.seq, reason="capacity")
+            for candidate in candidates:
+                sid = candidate.sid
+                if sid in self._save_committed or sid in self._save_inflight:
+                    continue
+                if sid in self._reqs_need_recv or sid in loading_sids:
+                    continue
+                if not self._try_reserve_save_candidate(
+                    candidate,
+                    allow_eviction=True,
+                    now=now,
+                ):
+                    self.drop_unadmitted_save(candidate.seq, reason="capacity")
 
-                committed = []
-                for sid, seq in list(self._save_committed.items()):
-                    candidate = self._build_save_candidate(sid, now=now)
-                    if candidate is None or candidate.seq is not seq:
-                        self._save_committed.pop(sid, None)
-                        self._release_save_reservation(sid, owner=seq)
-                        continue
-                    committed.append(candidate)
-                committed.sort(
-                    key=lambda candidate: self._candidate_sort_key(candidate, now)
-                )
-                for candidate in committed:
-                    sid = candidate.sid
-                    if sid in self._reqs_need_recv or sid in loading_sids:
-                        continue
-                    if sid in self._save_inflight:
-                        continue
-                    self._emit_save_candidate(meta, candidate)
-            else:
-                for candidate in candidates:
-                    sid = candidate.sid
-                    if not self._may_emit_save():
-                        break
-                    if sid in self._save_committed or sid in self._save_inflight:
-                        continue
-                    if sid in self._reqs_need_recv or sid in loading_sids:
-                        continue
-                    if not self._try_reserve_save_candidate(
-                        candidate,
-                        allow_eviction=False,
-                        now=now,
-                    ):
-                        break
-                    if self._emit_save_candidate(meta, candidate):
-                        self._save_rr_last = sid
+            committed = []
+            for sid, seq in list(self._save_committed.items()):
+                candidate = self._build_save_candidate(sid, now=now)
+                if candidate is None or candidate.seq is not seq:
+                    self._save_committed.pop(sid, None)
+                    self._release_save_reservation(sid, owner=seq)
+                    continue
+                committed.append(candidate)
+            committed.sort(
+                key=lambda candidate: self._candidate_sort_key(candidate, now)
+            )
+            for candidate in committed:
+                sid = candidate.sid
+                if sid in self._reqs_need_recv or sid in loading_sids:
+                    continue
+                if sid in self._save_inflight:
+                    continue
+                self._emit_save_candidate(meta, candidate)
         dispatched = set(meta.lookup_requests_in_step)
         for sid in dispatched:
             self._lookup_results.pop(sid, None)
@@ -1521,11 +1476,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 # block-map bookkeeping forever.
                 self._release_operation_lease(operation)
         self._save_inflight_since.pop(operation, None)
-        if (
-            self._save_policy == "priority"
-            and owner is not None
-            and self._finished_save_requests.get(sid) is owner
-        ):
+        if owner is not None and self._finished_save_requests.get(sid) is owner:
             self._settle_finished_save(sid, failed=not succeeded)
         self._finish_retired_request(sid)
 
@@ -1728,41 +1679,25 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._load_lifecycles.pop(sid, None)
         entry = self._save_tracker.get(sid)
         if entry is not None and entry[0] is seq:
-            if self._save_policy == "priority":
-                self._finished_save_requests[sid] = seq
-                # Freeze the final source identity before request teardown.
-                # Priority reservations dispatch on a later metadata build and
-                # reacquire only the still-canonical prefix blocks.
-                if self._early_release:
-                    seq._offload_finished_cached_tokens = min(
-                        int(getattr(seq, "num_cached_tokens", 0)),
-                        int(seq.num_prompt_tokens),
-                    )
-                if sid in self._save_inflight or self._save_committed.get(sid) is seq:
-                    pass
-                else:
-                    candidate = self._build_save_candidate(sid)
-                    if candidate is None:
-                        self._settle_finished_save(sid)
-                    elif not self._meets_save_value_threshold(candidate):
-                        self.drop_unadmitted_save(seq, reason="low_value")
-                    elif not self._commit_finished_save(candidate):
-                        self.drop_unadmitted_save(seq, reason="capacity")
-            elif self._early_release:
-                # Freeze the final computed frontier before BlockManager
-                # clears it during partial deallocation. Keep the tracker when
-                # a final chunk still needs emission; a later metadata build
-                # uses the frozen block table recorded by
-                # `protected_block_ids`.
+            self._finished_save_requests[sid] = seq
+            # Freeze the final source identity before request teardown. A
+            # reservation dispatches on a later metadata build and reacquires
+            # only the still-canonical prefix blocks.
+            if self._early_release:
                 seq._offload_finished_cached_tokens = min(
                     int(getattr(seq, "num_cached_tokens", 0)),
                     int(seq.num_prompt_tokens),
                 )
-                if not self.should_defer_free(seq):
-                    self._save_tracker.pop(sid, None)
-            elif not self.should_defer_free(seq):
-                self._save_tracker.pop(sid, None)
-                self._forget_save_candidate(sid, seq)
+            if sid in self._save_inflight or self._save_committed.get(sid) is seq:
+                pass
+            else:
+                candidate = self._build_save_candidate(sid)
+                if candidate is None:
+                    self._settle_finished_save(sid)
+                elif not self._meets_save_value_threshold(candidate):
+                    self.drop_unadmitted_save(seq, reason="low_value")
+                elif not self._commit_finished_save(candidate):
+                    self.drop_unadmitted_save(seq, reason="capacity")
         if hasattr(seq, "_load_operation"):
             delattr(seq, "_load_operation")
 

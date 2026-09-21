@@ -878,8 +878,7 @@ Connector-specific tuning (env):
 | `OFFLOAD_MIN_LOAD_TOKENS` | 8192 | Don't reload a hit smaller than this; recompute is cheaper. |
 | `OFFLOAD_COPY_WORKERS` | 1 | SAVE daemon threads. LOAD is always a single thread (TTFT-critical). |
 | `OFFLOAD_MAX_PENDING_SAVES` | `max(2, 2 × OFFLOAD_COPY_WORKERS)` | Positive integer bound on total admitted worker saves (running + queued), acquired before SLOT snapshot or executor submission. |
-| `OFFLOAD_SAVE_POLICY` | `round_robin` | Chunked LMCache save selection, including `lmcache_mp` and DSV4. `priority` uses reuse demand and dirty cost, and hard-drops a finished request's unadmitted save instead of pinning its KV indefinitely. |
-| `OFFLOAD_SAVE_MIN_OBSERVED_COUNT` | 2 | Priority mode's hard minimum rank-local prefix observations. |
+| `OFFLOAD_SAVE_MIN_OBSERVED_COUNT` | 2 | Hard minimum rank-local prefix observations for save admission. |
 | `OFFLOAD_SAVE_MAX_PINNED_RATIO` | 0.20 | Maximum fraction of this scheduler's physical KV block pool that committed reservations plus unsafe save leases may occupy. Valid range: 0.0–0.30. It is local per DP scheduler and is never multiplied by TP size. |
 | `OFFLOAD_SAVE_MAX_PINNED_BLOCKS` | — | Optional absolute PAGE-block clamp. The effective local budget is `min(floor(total_blocks × ratio), absolute)`. |
 | `OFFLOAD_SAVE_AGING_WEIGHT` | 0.01 | Priority score added per candidate wait-second. It cannot bypass the minimum observation count. |
@@ -910,7 +909,7 @@ still falls back safely to per-group ID preparation and blocking host copies.
 `max_pending_saves` is intentionally process-wide and is configured only with
 `OFFLOAD_MAX_PENDING_SAVES`, so the scheduler and every worker use one bound.
 
-In priority mode the chunked and DSV4 save lifecycle is explicitly
+The chunked and DSV4 save lifecycle is explicitly
 `candidate -> committed -> inflight`. A finished candidate must reserve one of
 the pending-save slots immediately or be dropped atomically (PAGE and SLOT
 together); only committed/inflight saves may keep its source blocks alive. An
@@ -921,7 +920,7 @@ it observes requests at allocation time and does not publish an HBM owner.
 
 Admission also reserves physical block IDs from the scheduler-local
 `BlockManager` against the effective ratio/absolute budget. Shared IDs are
-counted once. Priority admission may replace one or more lower-scored,
+counted once. Admission may replace one or more lower-scored,
 undispatched committed saves, but it simulates the complete victim set before
 mutating state and never evicts an inflight PAGE or SLOT operation. DSV4 counts
 the full retained request block table because this branch does not yet release

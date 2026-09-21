@@ -1918,17 +1918,12 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._max_pending_saves = max_pending_saves(
             int(os.environ.get("OFFLOAD_COPY_WORKERS", "1") or 1)
         )
-        # Resume after the last admitted request when capacity becomes free so
-        # a long request at the head of the insertion-ordered tracker cannot
-        # monopolize the bounded save queue.
-        self._save_rr_last: str | None = None
-        # Priority mode separates a lightweight candidate from a capacity-
+        # Save admission separates a lightweight candidate from a capacity-
         # holding reservation.  This matters at request finish: connector
         # metadata for the current step has already been built, so the request
         # cannot be dispatched immediately.  A committed entry reserves one
         # worker slot until the next metadata build emits it.
         save_admission = load_save_admission_config()
-        self._save_policy = save_admission.policy
         self._save_max_pinned_ratio = save_admission.max_pinned_ratio
         self._save_max_pinned_blocks = save_admission.max_pinned_blocks
         self._block_manager = None
@@ -1937,20 +1932,14 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._save_block_reservations: dict[
             str | SaveOperationId, SaveBlockReservation
         ] = {}
-        if self._save_policy == "priority":
-            self._save_min_observed_count = save_admission.min_observed_count
-            self._save_aging_weight = save_admission.aging_weight
-            self._save_release_weight = save_admission.release_weight
-            self._prefix_demand = PrefixDemandTracker(
-                block_tokens=save_admission.demand_block_tokens,
-                max_entries=save_admission.demand_max_entries,
-                ttl_seconds=save_admission.demand_ttl_seconds,
-            )
-        else:
-            self._save_min_observed_count = 2
-            self._save_aging_weight = 0.01
-            self._save_release_weight = 1.0
-            self._prefix_demand = PrefixDemandTracker()
+        self._save_min_observed_count = save_admission.min_observed_count
+        self._save_aging_weight = save_admission.aging_weight
+        self._save_release_weight = save_admission.release_weight
+        self._prefix_demand = PrefixDemandTracker(
+            block_tokens=save_admission.demand_block_tokens,
+            max_entries=save_admission.demand_max_entries,
+            ttl_seconds=save_admission.demand_ttl_seconds,
+        )
         self._save_demand_keys: dict[
             str, tuple[object, tuple[PrefixDemandKey, ...]]
         ] = {}
@@ -2182,14 +2171,10 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             if entry is None or entry[0] is not seq:
                 self._save_tracker[sid] = [seq, initial_saved]
                 now = time.monotonic()
-                demand_keys = (
-                    self._prefix_demand.observe(
-                        seq.token_ids,
-                        int(seq.num_prompt_tokens),
-                        now,
-                    )
-                    if self._save_policy == "priority"
-                    else ()
+                demand_keys = self._prefix_demand.observe(
+                    seq.token_ids,
+                    int(seq.num_prompt_tokens),
+                    now,
                 )
                 self._save_demand_keys[sid] = (seq, demand_keys)
                 self._save_candidate_generation[sid] = (
@@ -2642,7 +2627,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             return False
         return self._try_reserve_save_candidate(
             candidate,
-            allow_eviction=self._save_policy == "priority",
+            allow_eviction=True,
         )
 
     def _forget_save_candidate(self, sid: str, seq) -> None:
@@ -2754,14 +2739,13 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         )
         logger.debug(
             "[OFFLOAD-SAVE-EMIT] seq=%s computed=%d num_prompt=%d "
-            "aligned=%d saved=%d sidecar=%s policy=%s observed=%d",
+            "aligned=%d saved=%d sidecar=%s observed=%d",
             seq.id,
             candidate.computed,
             int(seq.num_prompt_tokens),
             candidate.aligned,
             candidate.saved,
             candidate.sidecar_candidate,
-            self._save_policy,
             candidate.observed_count,
         )
         save_operation = self._next_save_operation(seq)
@@ -3002,7 +2986,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         meta.lookup_requests_in_step = [
             sid for sid in self._lookup_in_step if sid not in self._handoff_loads
         ]
-        # Saves. Priority mode admits/replaces the complete candidate set before
+        # Saves. Admit/replace the complete candidate set before
         # dispatch so a newly hotter candidate can still evict lower-value
         # committed work. Dispatching first would make that work inflight and
         # therefore correctly, but prematurely, non-evictable.
@@ -3020,90 +3004,49 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                     self._release_save_reservation(sid, owner=seq)
                     self._settle_finished_save(sid)
 
-            tracker_sids = list(self._save_tracker.keys())
-            if self._save_policy == "round_robin":
-                if tracker_sids and self._save_rr_last in self._save_tracker:
-                    start = (tracker_sids.index(self._save_rr_last) + 1) % len(
-                        tracker_sids
-                    )
-                    tracker_sids = tracker_sids[start:] + tracker_sids[:start]
-                candidates = [
-                    candidate
-                    for sid in tracker_sids
-                    if (candidate := self._build_save_candidate(sid, now=now))
-                    is not None
-                ]
-            else:
-                candidates = [
-                    candidate
-                    for sid in tracker_sids
-                    if (candidate := self._build_save_candidate(sid, now=now))
-                    is not None
-                    and self._meets_save_value_threshold(candidate)
-                ]
-                candidates.sort(
-                    key=lambda candidate: self._candidate_sort_key(candidate, now)
-                )
+            candidates = [
+                candidate
+                for sid in self._save_tracker
+                if (candidate := self._build_save_candidate(sid, now=now)) is not None
+                and self._meets_save_value_threshold(candidate)
+            ]
+            candidates.sort(
+                key=lambda candidate: self._candidate_sort_key(candidate, now)
+            )
 
-            if self._save_policy == "priority":
-                for candidate in candidates:
-                    sid = candidate.sid
-                    if sid in self._save_committed:
-                        continue
-                    if sid in self._reqs_need_recv or sid in loading_sids:
-                        continue
-                    if sid in self._save_inflight or sid in self._sidecar_save_inflight:
-                        continue
-                    if not self._try_reserve_save_candidate(
-                        candidate,
-                        allow_eviction=True,
-                        now=now,
-                    ):
-                        self.drop_unadmitted_save(candidate.seq, reason="capacity")
+            for candidate in candidates:
+                sid = candidate.sid
+                if sid in self._save_committed:
+                    continue
+                if sid in self._reqs_need_recv or sid in loading_sids:
+                    continue
+                if sid in self._save_inflight or sid in self._sidecar_save_inflight:
+                    continue
+                if not self._try_reserve_save_candidate(
+                    candidate,
+                    allow_eviction=True,
+                    now=now,
+                ):
+                    self.drop_unadmitted_save(candidate.seq, reason="capacity")
 
-                committed = []
-                for sid, seq in list(self._save_committed.items()):
-                    candidate = self._build_save_candidate(sid, now=now)
-                    if candidate is None or candidate.seq is not seq:
-                        self._save_committed.pop(sid, None)
-                        self._release_save_reservation(sid, owner=seq)
-                        continue
-                    committed.append(candidate)
-                committed.sort(
-                    key=lambda candidate: self._candidate_sort_key(candidate, now)
-                )
-                for candidate in committed:
-                    sid = candidate.sid
-                    if sid in self._reqs_need_recv or sid in loading_sids:
-                        continue
-                    if sid in self._save_inflight or sid in self._sidecar_save_inflight:
-                        continue
-                    self._emit_save_candidate(meta, candidate)
-            else:
-                for candidate in candidates:
-                    sid = candidate.sid
-                    if not self._may_emit_save():
-                        break
-                    if sid in self._save_committed:
-                        continue
-                    if sid in self._reqs_need_recv or sid in loading_sids:
-                        continue  # loading this step; defer its save
-                    if sid in self._save_inflight or sid in self._sidecar_save_inflight:
-                        # PAGE and SLOT describe one ordered checkpoint stream.
-                        continue
-                    if not self._try_reserve_save_candidate(
-                        candidate,
-                        allow_eviction=False,
-                        now=now,
-                    ):
-                        if candidate.finished:
-                            self.drop_unadmitted_save(
-                                candidate.seq,
-                                reason="capacity",
-                            )
-                        break
-                    self._emit_save_candidate(meta, candidate)
-                    self._save_rr_last = sid
+            committed = []
+            for sid, seq in list(self._save_committed.items()):
+                candidate = self._build_save_candidate(sid, now=now)
+                if candidate is None or candidate.seq is not seq:
+                    self._save_committed.pop(sid, None)
+                    self._release_save_reservation(sid, owner=seq)
+                    continue
+                committed.append(candidate)
+            committed.sort(
+                key=lambda candidate: self._candidate_sort_key(candidate, now)
+            )
+            for candidate in committed:
+                sid = candidate.sid
+                if sid in self._reqs_need_recv or sid in loading_sids:
+                    continue
+                if sid in self._save_inflight or sid in self._sidecar_save_inflight:
+                    continue
+                self._emit_save_candidate(meta, candidate)
         dispatched = set(meta.lookup_requests_in_step)
         self._lookup_in_step = [
             sid for sid in self._lookup_in_step if sid not in dispatched
@@ -3217,11 +3160,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             self._save_inflight_since.pop(req_id, None)
             self._finish_save_statistics(req_id)
             self._retire_save_operation_owner(req_id)
-            if (
-                self._save_policy == "priority"
-                and owner is not None
-                and self._finished_save_requests.get(sid) is owner
-            ):
+            if owner is not None and self._finished_save_requests.get(sid) is owner:
                 self._settle_finished_save(sid)
             return
 
@@ -3239,8 +3178,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 self._save_inflight_since.pop(operation, None)
                 self._retire_save_operation_owner(operation)
         self._finish_save_statistics(req_id)
-        if self._save_policy == "priority":
-            self._settle_finished_save(sid)
+        self._settle_finished_save(sid)
 
     def abandon_save(self, req_id) -> None:
         """Force-drop a save the scheduler reclaimed after it stalled.
@@ -3359,11 +3297,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             if not failed:
                 self._failed_sidecar_saves.pop(sid, None)
         self._retire_save_operation_owner(operation)
-        if (
-            self._save_policy == "priority"
-            and owner is not None
-            and self._finished_save_requests.get(sid) is owner
-        ):
+        if owner is not None and self._finished_save_requests.get(sid) is owner:
             self._settle_finished_save(sid)
 
     def sidecar_save_failed(self, req_id) -> None:
@@ -3385,11 +3319,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         identity = (inflight[1], inflight[2])
         self._failed_sidecar_saves.setdefault(sid, set()).add(identity)
         self._retire_save_operation_owner(operation)
-        if (
-            self._save_policy == "priority"
-            and owner is not None
-            and self._finished_save_requests.get(sid) is owner
-        ):
+        if owner is not None and self._finished_save_requests.get(sid) is owner:
             self._settle_finished_save(sid)
 
     def load_failed(self, req_id) -> bool:
@@ -3518,29 +3448,22 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if entry is not None and entry[0] is seq:
             self._finished_save_requests[sid] = seq
             self._refresh_finished_save_reservations(seq)
-            if self._save_policy == "priority":
-                if (
-                    sid in self._save_inflight
-                    or sid in self._sidecar_save_inflight
-                    or self._save_committed.get(sid) is seq
-                ):
-                    # Already committed/dispatched. Its terminal callbacks will
-                    # either reserve one residual tail or drop it.
-                    pass
-                else:
-                    candidate = self._build_save_candidate(sid)
-                    if candidate is None:
-                        self._settle_finished_save(sid)
-                    elif not self._meets_save_value_threshold(candidate):
-                        self.drop_unadmitted_save(seq, reason="low_value")
-                    elif not self._commit_finished_save(candidate):
-                        self.drop_unadmitted_save(seq, reason="capacity")
-            elif not self.should_defer_free(seq):
-                self._save_tracker.pop(sid, None)
-                self._finished_save_requests.pop(sid, None)
-                self._failed_sidecar_saves.pop(sid, None)
-                self._save_watermark_rollback.pop(sid, None)
-                self._forget_save_candidate(sid, seq)
+            if (
+                sid in self._save_inflight
+                or sid in self._sidecar_save_inflight
+                or self._save_committed.get(sid) is seq
+            ):
+                # Already committed/dispatched. Its terminal callbacks will
+                # either reserve one residual tail or drop it.
+                pass
+            else:
+                candidate = self._build_save_candidate(sid)
+                if candidate is None:
+                    self._settle_finished_save(sid)
+                elif not self._meets_save_value_threshold(candidate):
+                    self.drop_unadmitted_save(seq, reason="low_value")
+                elif not self._commit_finished_save(candidate):
+                    self.drop_unadmitted_save(seq, reason="capacity")
         if hasattr(seq, "_load_operation"):
             delattr(seq, "_load_operation")
 

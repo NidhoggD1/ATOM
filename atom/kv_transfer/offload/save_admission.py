@@ -60,7 +60,6 @@ def _optional_nonnegative_int(name: str) -> int | None:
 
 @dataclass(frozen=True)
 class SaveAdmissionConfig:
-    policy: str
     min_observed_count: int
     aging_weight: float
     release_weight: float
@@ -92,31 +91,13 @@ class SaveBlockReservation:
 
 
 def load_save_admission_config() -> SaveAdmissionConfig:
-    """Read the shared save policy, preserving old defaults when disabled."""
+    """Read the shared priority save-admission configuration."""
 
-    policy = os.environ.get("OFFLOAD_SAVE_POLICY", "round_robin").strip().lower()
-    if policy not in {"round_robin", "priority"}:
-        raise ValueError(
-            f"OFFLOAD_SAVE_POLICY must be 'round_robin' or 'priority', got {policy!r}"
-        )
     max_pinned_ratio = _nonnegative_float("OFFLOAD_SAVE_MAX_PINNED_RATIO", 0.20)
     if max_pinned_ratio > 0.30:
         raise ValueError("OFFLOAD_SAVE_MAX_PINNED_RATIO must be at most 0.30")
     max_pinned_blocks = _optional_nonnegative_int("OFFLOAD_SAVE_MAX_PINNED_BLOCKS")
-    if policy == "round_robin":
-        return SaveAdmissionConfig(
-            policy,
-            2,
-            0.01,
-            1.0,
-            8192,
-            65536,
-            600.0,
-            max_pinned_ratio,
-            max_pinned_blocks,
-        )
     return SaveAdmissionConfig(
-        policy=policy,
         min_observed_count=_nonnegative_int("OFFLOAD_SAVE_MIN_OBSERVED_COUNT", 2),
         aging_weight=_nonnegative_float("OFFLOAD_SAVE_AGING_WEIGHT", 0.01),
         release_weight=_nonnegative_float("OFFLOAD_SAVE_RELEASE_WEIGHT", 1.0),
