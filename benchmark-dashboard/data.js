@@ -1,60 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789964629171,
+  "lastUpdate": 1789968689168,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "PerryZhang01",
-            "username": "PerryZhang01",
-            "email": "Perry.Zhang@amd.com"
-          },
-          "committer": {
-            "name": "GitHub",
-            "username": "web-flow",
-            "email": "noreply@github.com"
-          },
-          "id": "1e7659fde32eeaa0d9aa868c3e90847e5e46a51c",
-          "message": "[feat](k3): support dcp on vllm-atom kimi k3 (#1951)\n\n* [feat](k3): support dcp on vllm-atom kimi k3\n\n* fix(k3): preserve non-DCP vLLM execution\n\nOnly bind and validate the aiter TP group when decode context parallelism is actually enabled.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* refactor(k3): reuse shared DCP query gather\n\nKeep the vLLM Kimi-K3 path aligned with the common DCP communication implementation introduced by #1930.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(vllm): defer DCP patch to platform registration\n\nKeep native ATOM imports independent of vLLM while still installing the ROCm DCP full-graph patch for actual vLLM plugin runs.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n---------\n\nCo-authored-by: perzhang <perzhang@amd.com>\nCo-authored-by: Cursor <cursoragent@cursor.com>",
-          "timestamp": "2026-08-20T14:00:36Z",
-          "url": "https://github.com/ROCm/ATOM/commit/1e7659fde32eeaa0d9aa868c3e90847e5e46a51c"
-        },
-        "date": 1787242038580,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3-32B-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.8795,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32274022601 | Threshold: 0.8 | BaselineModel: Qwen/Qwen3-32B-FP8 | BaselineNote: Adds max_gen_toks=1024 for the MI308 CI gsm8k path to avoid truncating Qwen3-32B reasoning output. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260818 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8939 | fewshot: 3 | Model: /models/Qwen/Qwen3-32B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-35B-A3B-FP8 TP1 accuracy (GSM8K)",
-            "value": 0.8324,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32274022601 | Threshold: 0.76 | BaselineModel: Qwen/Qwen3.5-35B-A3B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260818 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8188 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-35B-A3B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP1 accuracy (GSM8K)",
-            "value": 0.8484,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32274022601 | Threshold: 0.76 | BaselineModel: amd/Qwen3.5-35B-A3B-PTPC-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260818 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8302 | fewshot: 3 | Model: /models/amd/Qwen3.5-35B-A3B-PTPC-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP4 accuracy (GSM8K)",
-            "value": 0.8688,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32274022601 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260818 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8514 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.8704,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32274022601 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260818 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8522 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -317573,6 +317521,34 @@ window.BENCHMARK_DATA = {
             "value": 0.8954,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35557312473 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1691 | fewshot: 3 | Model: openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "yajizhan",
+            "username": "Jasen2201",
+            "email": "yajizhan@amd.com"
+          },
+          "committer": {
+            "name": "yajizhan",
+            "username": "Jasen2201",
+            "email": "yajizhan@amd.com"
+          },
+          "id": "53b523a9c7a2ea267a7f4a590a8f7e1a3bb35034",
+          "message": "Merge origin/main into Jasen/pd-lmcache-fix\n\nResolve the conflicts introduced by the Kimi-K3 P/D revert while preserving independent send/save completion reporting and scheduler-owned source-block retention. Keep producer save completions on the deferred-release path and retain the corresponding regression coverage.",
+          "timestamp": "2026-09-21T01:12:22Z",
+          "url": "https://github.com/ROCm/ATOM/commit/53b523a9c7a2ea267a7f4a590a8f7e1a3bb35034"
+        },
+        "date": 1789968688499,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "Atomesh::GLM-5.2-MXFP4 mi355x_atomesh-atom_mxfp4_1p1d_cpp4_dcp4_tp1_tp4 1048576/1024 c=40 perf point",
+            "value": 129.2896,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35551436986 | docker_image=rocm/atom-dev:nightly_202609201725 | precision=MXFP4 | display_topology=1P1D-CPP4-DCP4-TP1-TP4 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9708%2C%22cache_hit_tokens%22%3A524342384%2C%22cache_total_tokens%22%3A540098819%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A3884%2C%22concurrency%22%3A40%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p1d_cpp4_dcp4_tp1_tp4%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22duration%22%3A3628.887%2C%22e2el_ms%22%3A22992.3558%2C%22e2el_p90%22%3A54619.2069%2C%22e2el_p99%22%3A158890.9834%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202609201725%22%2C%22input_tput%22%3A137429.6711%2C%22input_tput_per_gpu%22%3A17178.7089%2C%22interactivity%22%3A10.9722%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A3883%2C%22interactivity_p90_itl%22%3A62.4143%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A13.0674%2C%22itl_p90%22%3A16.022%2C%22median_e2el_ms%22%3A11595.0241%2C%22median_itl_ms%22%3A13.3318%2C%22median_tpot_ms%22%3A13.3318%2C%22median_ttft_ms%22%3A2956.2607%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A1034.3169%2C%22output_tput_per_gpu%22%3A129.2896%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A1%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A0.9883%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d_cpp4_dcp4-isl1048576-osl1024-conc40-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F35551436986%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A138463.988%2C%22tpot_ms%22%3A13.0674%2C%22tpot_p90%22%3A16.022%2C%22tpot_p99%22%3A17.6444%2C%22tput_per_gpu%22%3A17307.9985%2C%22ttft_ms%22%3A9413.2384%2C%22ttft_p90%22%3A20470.8932%2C%22ttft_p99%22%3A105505.9989%7D"
           }
         ]
       }
