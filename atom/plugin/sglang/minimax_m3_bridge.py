@@ -244,9 +244,13 @@ class ATOMMiniMaxM3SGLangKVPool:
         self, layer_id: int
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         mapped = self._layer_mapping.get(int(layer_id))
-        if mapped is None or not self.k_scale_buffer:
-            return None, None
-        return self.k_scale_buffer[mapped], self.v_scale_buffer[mapped]
+        if mapped is not None and self.k_scale_buffer:
+            return self.k_scale_buffer[mapped], self.v_scale_buffer[mapped]
+        # Prefer scales that already live on the upstream pool (FP8/MXFP4).
+        getter = getattr(self.main_pool, "get_kv_scale_buffer", None)
+        if getter is not None:
+            return getter(layer_id)
+        return None, None
 
 
 def _minimax_sparse_kv_scale_buffer(self, layer_id: int):
@@ -269,16 +273,34 @@ def _minimax_sparse_kv_scale_buffer(self, layer_id: int):
     return k_buf[idx], v_buf[idx]
 
 
-def install_minimax_m3_pool_patch() -> None:
-    """Attach the scale ABI; do not wrap the pool when upstream already has it.
+def _atom_m3_index_dtype(owner: Any) -> torch.dtype:
+    """ATOM index dtype for MiniMax-M3: fp8 when KV/index config says fp8."""
 
-    ``maybe_get_minimax_m3_pools_from_sglang_batch`` reads whatever pool
-    SGLang published. It does not require ``ATOMMiniMaxM3SGLangKVPool``.
-    Index-K comes from ``MiniMaxSparseKVPool.get_index_k_buffer``. The old
-    wrapper's extra job was ``get_kv_scale_buffer`` for MXFP4/FP8 accuracy.
+    fallback = getattr(owner, "model_dtype", torch.bfloat16)
+    index_dtype = _resolve_m3_index_cache_dtype(fallback)
+    if _is_fp8_dtype(index_dtype):
+        return index_dtype
+    kv_dtype = getattr(owner, "kv_cache_dtype", None)
+    kv_str = str(getattr(owner, "kv_cache_dtype_str", "") or "")
+    if _is_fp8_dtype(kv_dtype) or kv_str.startswith("fp8"):
+        from aiter import dtypes
+
+        return dtypes.d_dtypes["fp8"]
+    return index_dtype
+
+
+def install_minimax_m3_pool_patch() -> None:
+    """Keep ATOM FP8 index dtype + scale ABI on MiniMaxSparseKVPool.
+
+    SGLang 0.5.19 builds ``MiniMaxSparseKVPool`` natively, but ``index_dtype``
+    stays ``model_dtype`` (bf16) unless NVIDIA ``m3_fp8_attn_gemm`` is on.
+    ATOM's sparse kernels follow ``index_cache_dtype`` (fp8 when KV is fp8),
+    so temporarily align ``model_dtype`` for that builder only. Also attach
+    ``get_kv_scale_buffer``, which upstream still omits.
     """
 
     try:
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
         from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
     except ImportError:
         import logging
@@ -291,6 +313,28 @@ def install_minimax_m3_pool_patch() -> None:
 
     if not hasattr(MiniMaxSparseKVPool, "get_kv_scale_buffer"):
         MiniMaxSparseKVPool.get_kv_scale_buffer = _minimax_sparse_kv_scale_buffer
+
+    cls = KVCacheConfigurator
+    if getattr(cls, "_atom_minimax_m3_pool_patched", False):
+        return
+
+    original_build = cls._build_minimax_sparse_kv_pool
+
+    def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int):
+        wanted = _atom_m3_index_dtype(self)
+        # Upstream picks index_dtype = model_dtype when m3_fp8_attn_gemm is off.
+        # Main KV still uses kv_cache_dtype, so this swap only affects index-K.
+        old_model_dtype = self.model_dtype
+        if wanted != old_model_dtype:
+            self.model_dtype = wanted
+        try:
+            return original_build(self, max_total_num_tokens=max_total_num_tokens)
+        finally:
+            if wanted != old_model_dtype:
+                self.model_dtype = old_model_dtype
+
+    cls._build_minimax_sparse_kv_pool = _build_minimax_sparse_kv_pool
+    cls._atom_minimax_m3_pool_patched = True
 
 
 def maybe_get_minimax_m3_pools_from_sglang_batch(forward_batch=None):
