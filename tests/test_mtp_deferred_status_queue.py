@@ -17,6 +17,7 @@ from atom.model_engine.model_runner import (
     tokenIDProcessor,
 )
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.utils.selector import Family
 
 
 def _prefill_batch(is_final_chunk: list[bool]) -> ScheduledBatch:
@@ -137,6 +138,20 @@ def test_detects_remote_prefill_producer(kv_config, expected):
     assert _kv_config_has_producer(kv_config) is expected
 
 
+def _processor_for(*, kv_config: dict, family: Family) -> tokenIDProcessor:
+    runner = SimpleNamespace(
+        config=SimpleNamespace(pipeline_parallel_size=1, kv_transfer_config=kv_config),
+        attn_family=family,
+        device="cuda",
+    )
+    with (
+        mock.patch("atom.model_engine.model_runner.CpuGpuBuffer"),
+        mock.patch("atom.model_engine.model_runner.torch.cuda.Stream"),
+        mock.patch("atom.model_engine.model_runner.torch.zeros"),
+    ):
+        return tokenIDProcessor(runner, max_num_batched_tokens=8)
+
+
 @pytest.mark.parametrize(
     ("kv_config", "expected"),
     [
@@ -155,20 +170,26 @@ def test_detects_remote_prefill_producer(kv_config, expected):
     ],
 )
 def test_remote_prefill_producer_disables_deferred_output(kv_config, expected):
-    runner = SimpleNamespace(
-        config=SimpleNamespace(
-            pipeline_parallel_size=1,
-            kv_transfer_config=kv_config,
-        ),
-        device="cuda",
-    )
-    with (
-        mock.patch("atom.model_engine.model_runner.CpuGpuBuffer"),
-        mock.patch("atom.model_engine.model_runner.torch.cuda.Stream"),
-        mock.patch("atom.model_engine.model_runner.torch.zeros"),
-    ):
-        processor = tokenIDProcessor(runner, max_num_batched_tokens=8)
+    processor = _processor_for(kv_config=kv_config, family=Family.KIMI_MLA)
+    assert processor.is_deferred_out is expected
 
+
+@pytest.mark.parametrize(
+    ("family", "expected"),
+    [
+        (Family.KIMI_MLA, False),
+        (Family.QSA_GDN, False),
+        (Family.GDN, False),
+        (Family.V4, True),
+        (Family.MLA, True),
+        (Family.MHA, True),
+    ],
+)
+def test_only_recurrent_state_producers_give_up_deferred_output(family, expected):
+    """A paged write lands at T0's own position, so the consumer repeating it
+    changes nothing -- V4 and the other paged models stay on the path they
+    used before P/D handoff existed."""
+    processor = _processor_for(kv_config={"kv_role": "kv_producer"}, family=family)
     assert processor.is_deferred_out is expected
 
 
