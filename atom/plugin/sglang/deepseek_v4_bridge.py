@@ -1301,6 +1301,9 @@ class _V4SGLangVerifyGraphBuffers:
         self.block_tables = i32(s, self.max_blocks)
 
         self.indptr_extend = i32(t + 1)
+        # Decode always reads this CSR, including when MTP verify/draft-extend
+        # metadata is captured before the decode graph buffers exist.
+        self.empty_kv_indptr = i32(t + 1)
         self.indptr_prefix_swa = i32(t + 1)
         self.indptr_prefix_csa = i32(t + 1)
         self.indptr_prefix_hca = i32(t + 1)
@@ -2082,6 +2085,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
         "cu_starts_gpu": seq_base_gpu,
         "cu_ends_gpu": visible_end_gpu,
     }
+    _publish_empty_kv_indptr(md, total, bufs=bufs)
     return md
 
 

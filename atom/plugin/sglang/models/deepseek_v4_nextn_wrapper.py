@@ -172,7 +172,10 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             hc_eps=getattr(config, "hc_eps", 1e-6),
         )
-        self._bind_shared_modules()
+        # Embed/head are shared with the target via set_embed_and_head after
+        # both models load. Binding them onto MTP blocks here registers
+        # model.mtp.0.embed/head as MTP parameters, and spec_decode loading
+        # never writes those names, so they stay at init.
         self.logits_head = _DeepseekV4MTPLogitsHeadAdapter(self.model)
         self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
 

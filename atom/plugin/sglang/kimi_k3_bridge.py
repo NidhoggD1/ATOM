@@ -36,7 +36,6 @@ def _restore_kimi_k3_mem_fraction(owner: Any) -> None:
     owner_id = id(owner)
     if owner_id in _KIMI_K3_MEM_FRACTION_RESTORED:
         return
-    _KIMI_K3_MEM_FRACTION_RESTORED.add(owner_id)
 
     model_config = getattr(owner, "model_config", None)
     context_len = int(getattr(model_config, "context_len", 0) or 0)
@@ -49,6 +48,8 @@ def _restore_kimi_k3_mem_fraction(owner: Any) -> None:
         )
         current = float(schedule.mem_fraction_static)
     except Exception:  # noqa: BLE001 - fall back when context is unpublished
+        # Do not record the owner until the schedule is readable. The first
+        # call can run before RuntimeContext is published.
         return
 
     if attention_backend == "aiter" and context_len > 8192:
@@ -65,6 +66,7 @@ def _restore_kimi_k3_mem_fraction(owner: Any) -> None:
                 current,
                 restored,
             )
+    _KIMI_K3_MEM_FRACTION_RESTORED.add(owner_id)
 
 
 def install_kimi_k3_pool_patch() -> None:
