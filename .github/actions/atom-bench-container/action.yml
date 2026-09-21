@@ -68,14 +68,6 @@ runs:
           echo "Model cache directory not found, skipping model download"
           exit 0
         fi
-        remote_revision_check=1
-        if [ "${{ inputs.runner }}" = "atom-mi355-8gpu.predownload" ]; then
-          # PITT predownload caches may be populated outside
-          # download_model_with_lock.sh and therefore may not have the
-          # script's .hf-revision marker. Treat a complete local payload as
-          # authoritative instead of refreshing multi-hundred-GB models.
-          remote_revision_check=0
-        fi
         model_dir="/models/${{ inputs.model-path }}"
         echo "Lock-protected download for ${model_dir}"
         if docker exec \
@@ -86,7 +78,6 @@ runs:
           -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
           -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
           -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
-          -e MODEL_ENABLE_REMOTE_REVISION_CHECK="${remote_revision_check}" \
           "${{ inputs.container-name }}" \
           bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
           echo "Model ready: ${model_dir}"
