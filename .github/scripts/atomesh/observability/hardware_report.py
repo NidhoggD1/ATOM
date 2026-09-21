@@ -124,9 +124,9 @@ def panels_from_vectors(vectors, start, end, *, step, interval, diagnostics):
         }
         panel["detail"] = panel["detail"].replace("5-second", f"{step:g}-second")
         if sensor == "memory_busy":
-            panel["detail"] += (
-                " Memory busy is activity, not measured HBM bandwidth utilization."
-            )
+            panel[
+                "detail"
+            ] += " Memory busy is activity, not measured HBM bandwidth utilization."
         pooled = []
         for identity, labels in sorted(devices.items()):
             points = samples.get((identity, metric), [])
@@ -183,6 +183,9 @@ def collect_hardware(url, start, end, *, step=5, interval=1, diagnostics):
     if payload.get("status") != "success":
         raise RuntimeError(payload.get("error", "Hardware query failed"))
     vectors = payload["data"]["result"]
-    return panels_from_vectors(
-        vectors, start, end, step=step, interval=interval, diagnostics=diagnostics
-    ), vectors
+    return (
+        panels_from_vectors(
+            vectors, start, end, step=step, interval=interval, diagnostics=diagnostics
+        ),
+        vectors,
+    )
