@@ -76,7 +76,15 @@ def install_kimi_k3_pool_patch() -> None:
     ``KVCacheConfigurator`` and replaced the ``ModelRunner.kimi_linear_config``
     property with ``hybrid_arch.kimi_linear_config(model_config)``. Patch those
     surfaces for 0.5.19+.
+
+    Important: several SGLang modules already did
+    ``from sglang.srt.configs.hybrid_arch import kimi_linear_config`` before
+    prepare_model runs. Rebinding only ``hybrid_arch.kimi_linear_config``
+    leaves those local names on the original function, so also rebind the
+    known importers.
     """
+
+    import sys
 
     from sglang.srt.configs import hybrid_arch
     from sglang.srt.configs.kimi_linear import KimiLinearConfig
@@ -196,9 +204,23 @@ def install_kimi_k3_pool_patch() -> None:
         return pools
 
     hybrid_arch.kimi_linear_config = _kimi_linear_config
+    # Rebind already-imported local names. prepare_model runs after SGLang has
+    # imported these modules, so module-attribute patch alone is a no-op there.
+    for mod_name in (
+        "sglang.srt.mem_cache.kv_cache_configurator",
+        "sglang.srt.mem_cache.kv_cache_builder",
+        "sglang.srt.layers.attention.attention_registry",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is not None and hasattr(mod, "kimi_linear_config"):
+            mod.kimi_linear_config = _kimi_linear_config
     cls._resolve_memory_pool_config = _resolve_memory_pool_config
     cls._init_pools = _init_pools
     cls._atom_kimi_k3_pool_patched = True
+    logger.info(
+        "Kimi-K3 patched hybrid_arch.kimi_linear_config and rebound "
+        "kv_cache_configurator/kv_cache_builder/attention_registry imports"
+    )
 
 
 @contextmanager
