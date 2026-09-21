@@ -93,9 +93,7 @@ def fp4_indexer_block_fields(
     if layout == FP4_GFX1250_NATURAL:
         return [
             EntryField(CSA_INDEXER_DATA, 1, (rows, index_head_dim // 2), torch.uint8),
-            EntryField(
-                CSA_INDEXER_SCALE, 1, (rows, index_head_dim // 32), torch.uint8
-            ),
+            EntryField(CSA_INDEXER_SCALE, 1, (rows, index_head_dim // 32), torch.uint8),
         ]
     if layout != FP4_GFX950_PRESHUFFLE:
         raise ValueError(f"unknown FP4 indexer layout {layout!r}")
