@@ -434,6 +434,22 @@ class BlockGPUConnector:
             states[key] = state
         return state
 
+    def wait_for_save_source(self, producer_event) -> None:
+        """Order this thread's pack stream after the KV producer stream.
+
+        Dense saves run on a background executor while the KV writes they read
+        were issued on the model/RPC stream. Enqueueing the event dependency on
+        the thread-local pack stream preserves that ordering without blocking
+        the CPU save worker. The following ``batched_from_gpu`` call runs on
+        the same thread and therefore reuses this stream state.
+        """
+
+        state = self._thread_state()
+        if state.pack_stream is None:
+            producer_event.synchronize()
+            return
+        state.pack_stream.wait_event(producer_event)
+
     def _ensure_staging_buffer(
         self,
         staging_buffer: _StagingBuffer,

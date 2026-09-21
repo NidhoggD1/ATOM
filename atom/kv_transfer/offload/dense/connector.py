@@ -186,6 +186,15 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         for lookup_id in metadata.lookup_requests_in_step:
             if str(lookup_id) not in loading_lookup_ids:
                 self._lookup_unpin(lookup_id)
+        save_ready_event = None
+        if self._do_save and any(
+            req.save_spec is not None for req in metadata.requests
+        ):
+            # Save metadata is dispatched after the producing forward. Record
+            # that stream here so the background pack stream cannot read KV
+            # blocks before their writes are complete.
+            save_ready_event = torch.cuda.Event()
+            save_ready_event.record(torch.cuda.current_stream())
         for req in metadata.requests:
             # The futures are tracked, not discarded: `wait_for_requests` fences
             # them when vLLM preempts a request and reuses its blocks.
@@ -200,7 +209,11 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 self._track_job(
                     req.req_id,
                     self._save_executor.submit(
-                        self._guard, "save", self._do_save_req, req
+                        self._guard,
+                        "save",
+                        self._do_save_req,
+                        req,
+                        save_ready_event,
                     ),
                 )
 
@@ -323,7 +336,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 total_ms,
             )
 
-    def _do_save_req(self, req: LMCacheReqMeta) -> None:
+    def _do_save_req(self, req: LMCacheReqMeta, producer_event=None) -> None:
         ss = req.save_spec
         assert ss is not None
         toks = req.token_ids
@@ -342,6 +355,8 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         t_store0 = time.perf_counter()
         self._reset_gpu_connector_transfer_stats()
         gpu_connector = self._engine.gpu_connector
+        if producer_event is not None:
+            gpu_connector.wait_for_save_source(producer_event)
         track_source = getattr(gpu_connector, "track_save_source", None)
         source_context = (
             track_source(req.save_operation)

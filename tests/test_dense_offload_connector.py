@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
@@ -15,11 +16,13 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
 )
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
 )
 from atom.kv_transfer.offload.metadata import (
+    LMCacheOffloadMetadata,
     LMCacheReqMeta,
     LoadSpec,
     SaveSpec,
@@ -330,6 +333,78 @@ def test_dense_worker_exact_save_generations_do_not_form_cross_tp_quorum():
         for worker in workers:
             worker._save_executor.shutdown(wait=True)
             worker._load_executor.shutdown(wait=True)
+
+
+def test_dense_save_waits_for_one_step_producer_event(monkeypatch):
+    trace = []
+    rpc_stream = object()
+
+    class Event:
+        def record(self, stream):
+            assert stream is rpc_stream
+            trace.append(("record", self))
+
+    event = Event()
+    monkeypatch.setattr(torch.cuda, "Event", lambda: event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: rpc_stream)
+
+    class GPUConnector:
+        def wait_for_save_source(self, producer_event):
+            assert producer_event is event
+            trace.append(("wait", producer_event))
+
+    class Engine:
+        gpu_connector = GPUConnector()
+
+        @staticmethod
+        def store(_tokens, **_kwargs):
+            trace.append(("store", None))
+
+    worker = DenseOffloadConnector(_config("kv_producer"))
+    worker.chunk_size = 8
+    worker._engine = Engine()
+    metadata = LMCacheOffloadMetadata()
+    metadata.requests.extend(
+        [
+            LMCacheReqMeta(
+                req_id=req_id,
+                token_ids=list(range(8)),
+                block_ids=[req_id],
+                save_spec=SaveSpec(skip_leading_tokens=0),
+            )
+            for req_id in (31, 32)
+        ]
+    )
+
+    try:
+        worker.start_load_kv(metadata)
+        worker.close()
+
+        assert trace[0] == ("record", event)
+        assert trace[1:] == [
+            ("wait", event),
+            ("store", None),
+            ("wait", event),
+            ("store", None),
+        ]
+    finally:
+        worker.close()
+
+
+def test_block_gpu_connector_waits_on_pack_stream_without_host_sync():
+    trace = []
+    producer_event = SimpleNamespace(
+        synchronize=lambda: pytest.fail("producer event must not host-synchronize")
+    )
+    pack_stream = SimpleNamespace(
+        wait_event=lambda event: trace.append(("wait", event))
+    )
+    connector = BlockGPUConnector.__new__(BlockGPUConnector)
+    connector._thread_state = lambda: SimpleNamespace(pack_stream=pack_stream)
+
+    connector.wait_for_save_source(producer_event)
+
+    assert trace == [("wait", producer_event)]
 
 
 @pytest.mark.parametrize("outcome", ["exception", "miss"])
