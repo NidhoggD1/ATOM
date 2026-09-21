@@ -89,7 +89,7 @@ class DraftKvBuilder(PoolRowsMixin):
         if self._kv_pool is None:
             self._kv_pool = self._make_pool(
                 layers=self.row_counts()[DRAFT_KV_ROWS],
-                target_block_size=self.model_runner.attn_metadata_builder.block_size,
+                target_block_size=self.model_runner.block_size,
             )
         return self._kv_pool
 
