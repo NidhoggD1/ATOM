@@ -483,7 +483,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
     def source_blocks_released(self, seq: Any) -> None:
         # The terminal half of `request_finished` for whichever sub deferred
         # the free. Fanned to all: only the offload sub keeps block-lifetime
-        # state, and the default is a no-op.
+        # state, and P/D backends explicitly do nothing.
         for c in self._connectors:
             fn = getattr(c, "source_blocks_released", None)
             if callable(fn):
@@ -728,8 +728,8 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
                 c.save_finished(req_id)
 
     def send_finished(self, req_id: Any) -> None:
-        # Only the producer sub defines this; fanning out saves the composite
-        # from tracking which index that is.
+        # Offload subs explicitly do nothing; fanning out saves the composite
+        # from tracking which index owns the send.
         for c in self._connectors:
             if hasattr(c, "send_finished"):
                 c.send_finished(req_id)

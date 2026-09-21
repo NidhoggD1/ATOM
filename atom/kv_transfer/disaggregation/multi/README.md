@@ -61,7 +61,7 @@ blocks / wake sequences.
 | scheduler | `update_state_after_alloc(seq)` | After HBM blocks are allocated, record the "to recv / to save" intent. |
 | scheduler | `build_connector_meta()` | Pack this step's transfer requests into a `meta`. |
 | scheduler | `request_finished(seq)` | Clean up when a request finishes. |
-| scheduler | `source_blocks_released(seq)` | The finished request's HBM is back in the pool — drop the state whose lifetime was those blocks. Default no-op. |
+| scheduler | `source_blocks_released(seq)` | The finished request's HBM is back in the pool — drop the state whose lifetime was those blocks, or explicitly do nothing if none is owned. |
 | worker | `register_kv_caches(tensors)` | Once at init: hand the HBM KV tensor addresses to the connector (it reads/writes through these). |
 | worker | `start_load_kv(meta)` | Kick off the async transfers (load in / save out). |
 | worker | `get_finished()` | Report which req IDs finished sending / recving / saving / failed. |
@@ -355,9 +355,13 @@ iterates, reading `seq.block_table` out of it.
 `_maybe_release_deferred` right after `block_manager.deallocate`. It is
 deliberately not `request_finished` a second time: that call also *takes* the
 send claim, so re-invoking it would re-arm the claim the release just cleared.
-The default on `KVConnectorSchedulerBase` is a no-op; only the offload
-schedulers implement it, and `MultiConnectorScheduler` fans it out. The vLLM
-plugin's `_collect_releases` makes the same split at its own release point.
+`KVConnectorSchedulerBase` requires explicit implementations of
+`should_defer_free`, `send_finished`, and `source_blocks_released`; omitting
+one prevents a backend from being instantiated. P/D backends implement
+`source_blocks_released` as a no-op, while offload backends implement
+`send_finished` as a no-op. `MultiConnectorScheduler` fans out the calls.
+The vLLM plugin's `_collect_releases` makes the same split at its own release
+point.
 
 ### Regression coverage
 

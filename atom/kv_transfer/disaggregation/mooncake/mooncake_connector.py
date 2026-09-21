@@ -541,6 +541,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
     def send_finished(self, req_id) -> None:
         self._awaiting_send.discard(str(req_id))
 
+    def source_blocks_released(self, seq: Sequence) -> None:
+        """No block-lifetime state remains after the send claim is retired."""
+
 
 # ===================================================================
 # MooncakeConnector — worker-side connector (runs inside each TP rank)

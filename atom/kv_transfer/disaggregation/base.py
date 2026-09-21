@@ -75,7 +75,11 @@ class KVConnectorBase(ABC):
 
 
 class KVConnectorSchedulerBase(ABC):
-    """Scheduler-side KV connector interface."""
+    """Scheduler-side KV connector interface.
+
+    Every backend implements the retention hooks explicitly, including no-ops
+    for lifecycle events it does not own.
+    """
 
     is_producer: bool
 
@@ -103,6 +107,21 @@ class KVConnectorSchedulerBase(ABC):
         """Populate KV transfer output metadata when a request completes."""
         ...
 
+    @abstractmethod
+    def should_defer_free(self, seq: Any) -> bool:
+        """Whether this connector still owns the request's source blocks.
+
+        A pure predicate used for preemption and final block release. Producers
+        retain advertised blocks until their send claim is retired.
+        """
+        ...
+
+    @abstractmethod
+    def send_finished(self, req_id: Any) -> None:
+        """Retire a P/D send claim; explicit no-op for backends without sends."""
+        ...
+
+    @abstractmethod
     def source_blocks_released(self, seq: Any) -> None:
         """The scheduler has returned this request's source blocks to the pool.
 
@@ -113,6 +132,7 @@ class KVConnectorSchedulerBase(ABC):
 
         Deliberately not `request_finished` called a second time: that one also
         takes the P/D send claim, and re-invoking it would re-arm the very claim
-        the release just cleared. Default no-op -- only connectors that own
-        block-lifetime state (the offload schedulers) implement it.
+        the release just cleared. Backends without block-lifetime cleanup
+        implement an explicit no-op.
         """
+        ...

@@ -1013,8 +1013,8 @@ class Scheduler:
         The terminal half of `request_finished` for a connector that deferred
         the free. Not `request_finished` a second time: that one also takes the
         P/D send claim, so re-invoking it would re-arm the claim this release
-        just cleared. Guarded -- the base declares a no-op default, but a
-        connector stub need not have it.
+        just cleared. The base requires an explicit implementation; the guard
+        also supports an absent connector and minimal scheduler test doubles.
         """
         callback = getattr(self.kv_connector, "source_blocks_released", None)
         if callable(callback):

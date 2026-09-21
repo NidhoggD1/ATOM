@@ -474,6 +474,9 @@ class OffloadSchedulerMixin(ABC):
     @abstractmethod
     def cancel_pending_load(self, seq) -> None: ...
 
+    def send_finished(self, req_id) -> None:
+        """Offload backends own saves and loads, but no P/D send claims."""
+
     def _init_offload_statistics(self) -> None:
         """Initialize layout-independent scheduler counters."""
 

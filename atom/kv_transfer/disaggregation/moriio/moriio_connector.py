@@ -1024,6 +1024,9 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
     def send_finished(self, req_id) -> None:
         self._awaiting_send.discard(str(req_id))
 
+    def source_blocks_released(self, seq: Sequence) -> None:
+        """No block-lifetime state remains after the send claim is retired."""
+
 
 def _zmq_ctx(socket_type: int, addr: str):
     """Context manager for a ZMQ socket with role-appropriate bind semantics.

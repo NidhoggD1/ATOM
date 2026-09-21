@@ -6318,14 +6318,11 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
     # listed here. Anything ELSE the composite fails to expose is NOT routed and
     # lands as a failure below, forcing a deliberate decision rather than a
     # silent default; add it here only with the routing that covers it.
-    # `send_finished` is the mirror-image exception on the other shell: offload
-    # has no send to retire, so its absence is the right answer rather than a
-    # silent default (`_connector_send_finished` guards on `callable`). The
-    # composite does expose it, so only the plain offload shell is excused.
+    # Retention hooks are mandatory on both shells. Offload's send_finished
+    # explicitly does nothing, since it has no P/D send claim to retire.
     multi_routes_via_sub: set[str] = {"max_pending_saves"}
-    pd_only: set[str] = {"send_finished"}
     for shell in (LMCacheOffloadConnectorScheduler, MultiConnectorScheduler):
-        allow = multi_routes_via_sub if shell is MultiConnectorScheduler else pd_only
+        allow = multi_routes_via_sub if shell is MultiConnectorScheduler else set()
         missing = sorted(
             n for n in probed if n not in allow and not _shell_exposes(shell, n)
         )
