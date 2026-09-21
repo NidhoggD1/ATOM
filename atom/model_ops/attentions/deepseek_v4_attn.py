@@ -129,6 +129,9 @@ from atom.utils.forward_context import (
     get_forward_context,
 )
 
+_FP4_OPUS_DECODE_Q1_VARIANT = "qlen1_kv64"
+_FP4_OPUS_DECODE_Q4_VARIANT = "qlen4_kv64"
+
 logger = logging.getLogger("atom")
 
 
@@ -547,18 +550,24 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             getattr(model_runner.config, "index_cache_dtype", None), warn=True
         )
         self.indexer_layout = (
-            fp4_indexer_layout_for_arch(get_gfx())
-            if self._indexer_fp4
-            else "fp8"
+            fp4_indexer_layout_for_arch(get_gfx()) if self._indexer_fp4 else "fp8"
         )
         if self.indexer_layout == FP4_GFX1250_NATURAL:
             if self.max_bs > 2048:
                 raise ValueError(
                     f"gfx1250 OPUS FP4 MQA supports batch <= 2048, got max_bs={self.max_bs}"
                 )
-            # gfx1250 indexes fixed 128-compressed-token KV tiles. Each tile
-            # spans two 64-row cache pages, hence two block-table columns.
-            opus_cols = math.ceil(self.max_model_len_idx / 128) * 2
+            from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
+                pa_mqa_logits_mxfp4_block_table_width,
+            )
+
+            # Size for every compiled gfx1250 kernel instance. The qlen=1 and
+            # qlen=4 variants currently share a 64-token KV tile, but the AITER
+            # helper is the ABI authority if a future instance changes it.
+            opus_cols = pa_mqa_logits_mxfp4_block_table_width(
+                self.max_model_len_idx,
+                kv_block_size=self.csa_rows_per_block,
+            )
             if opus_cols > self.block_table_cols:
                 self.block_table_cols = opus_cols
                 # CommonAttentionBuilder allocated this buffer before the
@@ -2102,15 +2111,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         from aiter.ops.opus.pa_mqa_logits_mxfp4 import pa_mqa_logits_mxfp4_plan
 
         total_q = int(positions_gpu.shape[0])
-        var = self.model_runner.forward_vars
+        variant = (
+            _FP4_OPUS_DECODE_Q1_VARIANT
+            if attn_metadata.max_seqlen_q == 1
+            else _FP4_OPUS_DECODE_Q4_VARIANT
+        )
         meta["fp4_opus_plan"] = pa_mqa_logits_mxfp4_plan(
             attn_metadata.cu_seqlens_q,
             attn_metadata.csa_n_committed_per_token[:total_q],
+            buffers=self._v4_fp4_opus_plan_buffers[buf_prefix_ubatch][variant],
             total_q=total_q,
             row_to_batch=attn_metadata.batch_id_per_q_token[:total_q],
-            num_ctas=self._v4_fp4_opus_num_ctas[buf_prefix_ubatch],
-            cta_info=var[f"{buf_prefix_ubatch}v4_fp4_opus_cta_info"],
-            cu_tiles=var[f"{buf_prefix_ubatch}v4_fp4_opus_cu_tiles"],
         )
 
     def _build_fp4_opus_prefill_plans(
@@ -3028,9 +3039,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             scheduled_tokens,
             positions_gpu=positions,
             cu_seqlens_q_cpu=(
-                cu_seqlens_q_np
-                if self.indexer_layout == FP4_GFX1250_NATURAL
-                else None
+                cu_seqlens_q_np if self.indexer_layout == FP4_GFX1250_NATURAL else None
             ),
         )
         # Two-source paged_prefill index buffers (extend + per-ratio prefix).
@@ -3160,8 +3169,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             cu = np.asarray(cu_seqlens_q_cpu, dtype=np.int64)
             owned_np = owned_q_cpu.numpy()
             lengths = np.asarray(
-                [np.count_nonzero((owned_np >= cu[i]) & (owned_np < cu[i + 1]))
-                 for i in range(scheduled_bs)],
+                [
+                    np.count_nonzero((owned_np >= cu[i]) & (owned_np < cu[i + 1]))
+                    for i in range(scheduled_bs)
+                ],
                 dtype=np.int32,
             )
             dummy_rows = int(np.count_nonzero(owned_np >= total_tokens))
@@ -4547,27 +4558,30 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # for cu_seq_lens. Also reused as cu_starts/cu_ends for fp8_mqa_logits
         # (which accepts both int32 and int64).
         bufs["v4_indexer_cu_committed"] = CpuGpuBuffer(bs + 1, **i32)
-        # FP4 indexer decode: fixed-address cta_info schedule buffer for the
-        # `pa_mqa_logits_fp4_prefill` kernel. `compute_prefill_schedule` is pure
-        # on-device torch (no host sync) and emits a CONSTANT-shape tensor with
-        # total_ctas == P fixed — so building it eagerly in
-        # `_build_v4_indexer_meta` (pre-replay) into this fixed address makes
-        # the captured kernel CUDAGraph-safe (grid = P is baked; only the buffer
-        # CONTENTS change per fwd, refreshed before each replay). Plain GPU
-        # tensor (not CpuGpuBuffer): no CPU mirror, written by a device kernel.
-        # P / block_k MUST match the values the scorer passes.
+        # FP4 indexer decode plans use caller-held buffers: CUDAGraph captures
+        # both their addresses and the launch grid. Keep one set per kernel
+        # instance because qlen=1 decode uses a one-wave CTA while speculative
+        # decode keeps the general four-row CTA.
         if self._indexer_fp4:
             if self.indexer_layout == FP4_GFX1250_NATURAL:
                 from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
                     pa_mqa_logits_mxfp4_plan_buffers,
                 )
 
-                cta_info, cu_tiles, num_ctas = pa_mqa_logits_mxfp4_plan_buffers(
-                    self.device, T_dec, bs
-                )
-                bufs["v4_fp4_opus_cta_info"] = cta_info
-                bufs["v4_fp4_opus_cu_tiles"] = cu_tiles
-                self._v4_fp4_opus_num_ctas = {"": num_ctas}
+                self._v4_fp4_opus_plan_buffers = {
+                    "": {
+                        variant: pa_mqa_logits_mxfp4_plan_buffers(
+                            self.device,
+                            T_dec,
+                            bs,
+                            variant=variant,
+                        )
+                        for variant in (
+                            _FP4_OPUS_DECODE_Q1_VARIANT,
+                            _FP4_OPUS_DECODE_Q4_VARIANT,
+                        )
+                    }
+                }
             else:
                 # P = persistent-grid CTA-count CAP, bounding two axes (see the
                 # prefill build for the full note):
@@ -4690,12 +4704,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                         pa_mqa_logits_mxfp4_plan_buffers,
                     )
 
-                    cta_info, cu_tiles, num_ctas = (
-                        pa_mqa_logits_mxfp4_plan_buffers(self.device, T_dec, bs)
-                    )
-                    bufs[f"{p}v4_fp4_opus_cta_info"] = cta_info
-                    bufs[f"{p}v4_fp4_opus_cu_tiles"] = cu_tiles
-                    self._v4_fp4_opus_num_ctas[p] = num_ctas
+                    self._v4_fp4_opus_plan_buffers[p] = {
+                        variant: pa_mqa_logits_mxfp4_plan_buffers(
+                            self.device,
+                            T_dec,
+                            bs,
+                            variant=variant,
+                        )
+                        for variant in (
+                            _FP4_OPUS_DECODE_Q1_VARIANT,
+                            _FP4_OPUS_DECODE_Q4_VARIANT,
+                        )
+                    }
                 else:
                     bufs[f"{p}v4_fp4_cta_info"] = torch.zeros(
                         (self._fp4_parallel_unit_num, 6), **i32
