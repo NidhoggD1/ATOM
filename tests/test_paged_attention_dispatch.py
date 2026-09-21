@@ -339,3 +339,216 @@ class TestDecodeRouting:
             _route(monkeypatch, 4, block_size=256, unified=True)
             == "paged_attention_persistent_asm"
         )
+
+
+class _FakePlan:
+    """Just the fields the op and the scratch helper read off a real plan."""
+
+    def __init__(self, capacity=512, max_partitions=256, num_kv_heads=1):
+        self.capacity = capacity
+        self.max_partitions = max_partitions
+        self.num_kv_heads = num_kv_heads
+
+
+class TestWorkPlanWiring:
+    """How aiter #5546's planner is wired in, not what it computes.
+
+    The numerics are aiter's own op_tests' job. What nothing else watches is the
+    wiring, and every case below is one this tree got wrong once: the ceiling
+    taken from the static split count, which switched the planner off in all but
+    name while still paying for it; and the planner reaching the sparse call
+    sites, where the context is a fixed topk window and there is no unevenness
+    to rebalance.
+    """
+
+    def test_ceiling_is_left_at_the_aiter_default(self, monkeypatch):
+        """`max_partitions` must not be passed at all.
+
+        Red the moment anyone routes the static split count -- or any other
+        value -- into the plan's ceiling. `get_recommended_splits` hands every
+        request the same count and documents itself as "not a variable-work
+        scheduler"; the plan's ceiling is an upper bound the planner divides
+        under a workgroup budget. Feeding one into the other clamps the long
+        request to the short requests' share.
+        """
+        from atom.model_ops.attentions import aiter_attention as aa
+
+        seen = {}
+
+        def fake_plan(context_lens, num_kv_heads, **kwargs):
+            seen.update(kwargs)
+            return _FakePlan()
+
+        monkeypatch.setattr(
+            "aiter.ops.flydsl.pa_decode.plan_pa_decode", fake_plan, raising=False
+        )
+        builder = aa.AiterAttentionMetadataBuilder.__new__(
+            aa.AiterAttentionMetadataBuilder
+        )
+        builder._flydsl_kv_heads = 1
+        builder._flydsl_plans = {}
+        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
+
+        ctx = SimpleNamespace(shape=(8,), device=SimpleNamespace(index=0))
+        assert builder.refresh_flydsl_plan(ctx) is not None
+        assert "max_partitions" not in seen, f"ceiling was set: {seen}"
+
+    def test_planner_off_returns_no_plan(self, monkeypatch):
+        """With the env off the op must see None, not a stale plan."""
+        from atom.model_ops.attentions import aiter_attention as aa
+
+        builder = aa.AiterAttentionMetadataBuilder.__new__(
+            aa.AiterAttentionMetadataBuilder
+        )
+        builder._flydsl_kv_heads = 1
+        builder._flydsl_plans = {}
+        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", False)
+        ctx = SimpleNamespace(shape=(8,), device=SimpleNamespace(index=0))
+        assert builder.refresh_flydsl_plan(ctx) is None
+
+    def test_batch_past_the_planner_limit_falls_back(self, monkeypatch):
+        """M3's sparse prefill-as-decode folds query tokens into num_seqs.
+
+        It reaches 32768, past what plan_pa_decode accepts. Letting that raise
+        killed a worker 90 s into a run while the server kept answering
+        /metrics, so the client sat in warmup until it timed out.
+        """
+        from atom.model_ops.attentions import aiter_attention as aa
+        from atom.model_ops.base_attention import _FLYDSL_PLAN_MAX_BATCH
+
+        builder = aa.AiterAttentionMetadataBuilder.__new__(
+            aa.AiterAttentionMetadataBuilder
+        )
+        builder._flydsl_kv_heads = 1
+        builder._flydsl_plans = {}
+        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
+        ctx = SimpleNamespace(
+            shape=(_FLYDSL_PLAN_MAX_BATCH + 1,), device=SimpleNamespace(index=0)
+        )
+        assert builder.refresh_flydsl_plan(ctx) is None
+
+    def test_only_the_dense_call_site_opts_in(self):
+        """The planner is per call site, the way the split count already is.
+
+        Red if the default flips, if a sparse site starts asking, or if the
+        dense one stops. On uniform lengths the planner is a measured loss
+        (0.56x at B8/257) that a larger ceiling does not rescue, and the two
+        sparse sites are 57 of the 63 pa_decode calls in a step.
+        """
+        import inspect
+
+        from atom.model_ops import attention_mha
+        from atom.model_ops.base_attention import run_pa_decode_gluon
+        from atom.model_ops.minimax_m3 import sparse_attn
+
+        param = inspect.signature(run_pa_decode_gluon).parameters["allow_work_plan"]
+        assert param.default is False
+        assert "allow_work_plan=True" in inspect.getsource(attention_mha)
+        assert "allow_work_plan" not in inspect.getsource(sparse_attn)
+
+    def test_every_draft_pass_refreshes_the_plan(self):
+        """Weak on purpose, and the weakness is the point.
+
+        Each draft pass advances context_lens by a token, so reusing the
+        target's plan points the kernel at KV ranges that no longer match --
+        wrong output, not merely slower. Driving prepare_mtp_decode for real
+        needs a model runner, so this only pins that the call is there; if it
+        ever needs to be stronger, that is the cost.
+        """
+        import inspect
+
+        from atom.model_ops.attentions import aiter_attention as aa
+
+        src = inspect.getsource(
+            aa.AiterAttentionMetadataBuilder.prepare_mtp_decode
+        )
+        assert "refresh_flydsl_plan" in src
+
+    def test_scratch_is_keyed_by_capacity(self):
+        """A refresh that grows the plan must not reuse the old buffers.
+
+        Red if capacity leaves the key: the second call would hand back buffers
+        sized for 512 while the kernel writes 1024 rows.
+        """
+        import torch
+
+        from atom.model_ops.base_attention import _flydsl_plan_scratch
+
+        dev = torch.device("cuda", 0)
+        small = _flydsl_plan_scratch(_FakePlan(capacity=512), 4, 16, 128,
+                                     torch.bfloat16, dev)
+        again = _flydsl_plan_scratch(_FakePlan(capacity=512), 4, 16, 128,
+                                     torch.bfloat16, dev)
+        big = _flydsl_plan_scratch(_FakePlan(capacity=1024), 4, 16, 128,
+                                   torch.bfloat16, dev)
+        assert small[0] is again[0], "same shape should reuse"
+        assert big[0] is not small[0], "a grown capacity must not reuse"
+        assert big[0].shape[1] == 1024
+
+    def test_one_plan_per_batch_and_never_replaced(self, monkeypatch):
+        """Decode replays captured graphs, one per capture-ladder size.
+
+        A single plan slot would be rebuilt every time the batch moved to
+        another rung, leaving the graph captured for the previous rung pointing
+        at freed tensors. Red if the dict goes back to one slot: `first` would
+        come back a different object after the batch changed and returned.
+        """
+        from atom.model_ops.attentions import aiter_attention as aa
+
+        def fake_plan(context_lens, num_kv_heads, **kw):
+            return kw.get("plan") or _FakePlan()
+
+        monkeypatch.setattr(
+            "aiter.ops.flydsl.pa_decode.plan_pa_decode", fake_plan, raising=False
+        )
+        builder = aa.AiterAttentionMetadataBuilder.__new__(
+            aa.AiterAttentionMetadataBuilder
+        )
+        builder._flydsl_kv_heads = 1
+        builder._flydsl_plans = {}
+        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
+
+        def ctx(n):
+            return SimpleNamespace(shape=(n,), device=SimpleNamespace(index=0))
+
+        first = builder.refresh_flydsl_plan(ctx(8))
+        assert builder.refresh_flydsl_plan(ctx(8)) is first, "same rung must reuse"
+        other = builder.refresh_flydsl_plan(ctx(16))
+        assert other is not first, "a different rung needs its own plan"
+        assert builder.refresh_flydsl_plan(ctx(8)) is first, (
+            "returning to a rung must hand back the plan its graph captured"
+        )
+
+    def test_a_plan_built_for_another_batch_is_refused(self):
+        """The guard that keeps a shape mismatch from killing the worker.
+
+        aiter validates `reduce_info.shape == (num_seqs, 2)` and raises. The
+        plan is built by the metadata builder for the batch it saw, which is
+        not necessarily the one this call runs, so the op checks first and
+        falls back to the static path. Red if the guard goes away.
+        """
+        from atom.model_ops.base_attention import flydsl_plan_matches
+
+        plan = _FakePlan()
+        plan.reduce_info = SimpleNamespace(shape=(32, 2))
+        assert flydsl_plan_matches(plan, 32, 1)
+        assert not flydsl_plan_matches(plan, 20, 1), "batch mismatch must refuse"
+        assert not flydsl_plan_matches(plan, 32, 2), "kv-head mismatch must refuse"
+
+    def test_capture_builder_attaches_a_plan(self):
+        """Weak on purpose: a source check, and the reason it is here.
+
+        Decode runs from captured graphs. If the plan is absent when the graph
+        is captured, the static path is what gets recorded and every later
+        refresh is work on a graph that never reads it -- silently, with no
+        error and a plausible-looking benchmark. Driving the real capture needs
+        a model runner, so this only pins that the attach is present.
+        """
+        import inspect
+
+        from atom.model_ops.attentions import aiter_attention as aa
+
+        src = inspect.getsource(
+            aa.AiterAttentionMetadataBuilder.build_for_cudagraph_capture
+        )
+        assert "flydsl_work_plan" in src

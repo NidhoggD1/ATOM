@@ -241,6 +241,19 @@ _FLYDSL_PLAN_MAX_BATCH = 4096
 _FLYDSL_PLAN_SCRATCH: dict[tuple, tuple] = {}
 
 
+def flydsl_plan_matches(plan, num_seqs: int, num_kv_heads: int) -> bool:
+    """Whether a plan built elsewhere fits the call about to be made.
+
+    The plan is built by the metadata builder for the batch it saw; a mismatch
+    is aiter's `validate` raising, i.e. a dead worker. Checked here so the call
+    can fall back to the static path instead.
+    """
+    return (
+        int(plan.reduce_info.shape[0]) == int(num_seqs)
+        and int(plan.num_kv_heads) == int(num_kv_heads)
+    )
+
+
 def _flydsl_plan_scratch(plan, query_length, query_group_size, head_dim,
                          out_dtype, device):
     """Partial-output buffers for a planned call, allocated once per shape.
@@ -342,6 +355,10 @@ def run_pa_decode_gluon(
 
             md = get_forward_context().attn_metadata
             work_plan = getattr(md, "flydsl_work_plan", None) if md else None
+            if work_plan is not None and not flydsl_plan_matches(
+                work_plan, flydsl_seqs, k_cache.shape[1]
+            ):
+                work_plan = None  # static path: slower, not fatal
         if work_plan is not None:
             nkv = k_cache.shape[1]
             ml, es, tmp = _flydsl_plan_scratch(
