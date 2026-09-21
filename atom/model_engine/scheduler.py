@@ -2052,11 +2052,12 @@ class Scheduler:
         seq.leave_reason = "aborted"
         seq.multimodal_data = None
         self._rejected.append(seq)
-        if not has_inflight_load and self._connector_flag("is_offload"):
-            # A lookup can pin CPU KV before HBM allocation succeeds. No load
-            # is in flight yet, but the connector still owns cleanup work.
+        if not has_inflight_load and self.kv_connector is not None:
+            # This path bypasses postprocess: producers must discard queued
+            # saves, and offload may own CPU pins before HBM allocation.
             # Already-dispatched loads retain the completion-driven path below.
-            self.kv_connector.cancel_pending_load(seq)
+            if self._connector_flag("is_offload"):
+                self.kv_connector.cancel_pending_load(seq)
             self.kv_connector.request_finished(seq)
             # No send will ever be issued for an abort, so nothing would
             # otherwise retire a claim taken above. See `postprocess`.
