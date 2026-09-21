@@ -489,7 +489,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
     def request_finished(self, seq: Sequence) -> None:
         if self.is_producer and getattr(seq, "leave_reason", None) == "aborted":
             # No send claim protects an abort's blocks from reuse. Never
-            # advertise their addresses, including any previous metadata.
+            # advertise their addresses or dispatch a queued producer save.
+            self._reqs_need_save.pop(seq.id, None)
             seq.kv_transfer_params_output = None
             return
 

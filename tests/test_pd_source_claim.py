@@ -133,6 +133,7 @@ def test_aborted_producer_neither_claims_nor_advertises_blocks(build):
         sched.should_defer_free(seq) is False
     ), "an abort never sends, so nothing would retire the claim"
     assert seq.kv_transfer_params_output is None
+    assert not sched.build_connector_meta().reqs_to_save
 
 
 @pytest.mark.parametrize("build", BACKENDS)
