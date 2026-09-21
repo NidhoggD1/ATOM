@@ -376,7 +376,7 @@ models:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
               VLLM_PP_LAYER_PARTITION: "20,20,20,18"
               LMCACHE_LOCAL_CPU: "True"
-              LMCACHE_MAX_LOCAL_CPU_SIZE: "240"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "200"
               LMCACHE_CHUNK_SIZE: "256"
               # Disk/NVMe (L3) tier is disabled by default. To enable it, uncomment
               # both variables below; LMCACHE_MAX_LOCAL_CPU_SIZE must stay > 0
@@ -431,7 +431,7 @@ models:
               PYTHONHASHSEED: "0"
             prefill:
               LMCACHE_LOCAL_CPU: "True"
-              LMCACHE_MAX_LOCAL_CPU_SIZE: "240"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "200"
               LMCACHE_CHUNK_SIZE: "256"
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
