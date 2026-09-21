@@ -2023,11 +2023,10 @@ class TestPostprocess:
         pending_send: set[str] = set()
         sched.kv_connector = SimpleNamespace(
             is_producer=True,
-            update_state_after_alloc=lambda s: pending_send.add(str(s.id)),
+            request_finished=lambda s: pending_send.add(str(s.id)),
             should_defer_free=lambda s: str(s.id) in pending_send,
             send_finished=lambda rid: pending_send.discard(str(rid)),
         )
-        sched.kv_connector.update_state_after_alloc(seq)
         sched.postprocess([seq], self._output(seq.id, [2]))
 
         assert seq.block_table
@@ -2041,13 +2040,13 @@ class TestPostprocess:
     @pytest.mark.parametrize("pp_size", [1, 4])
     @pytest.mark.parametrize("streaming", [False, True])
     @pytest.mark.parametrize(
-        "tokens,max_tokens,stop_sequences,retained",
+        "tokens,max_tokens,stop_sequences",
         [
-            ([7], 100, [], [7]),
-            ([2, 7], 100, [], [2]),
-            ([7, 8], 1, [], [7]),
-            ([7, 8], 100, [[7]], [7]),
-            ([9, 8], 100, [], [9]),
+            ([7], 100, []),
+            ([2, 7], 100, []),
+            ([7, 8], 1, []),
+            ([7, 8], 100, [[7]]),
+            ([9, 8], 100, []),
         ],
         ids=["abort", "eos", "max_tokens", "stop_sequence", "stop_token"],
     )
@@ -2059,7 +2058,6 @@ class TestPostprocess:
         tokens,
         max_tokens,
         stop_sequences,
-        retained,
     ):
         """The claim is conditional on `leave_reason`, so it must be set first.
 
@@ -2097,18 +2095,19 @@ class TestPostprocess:
         seq.status = SequenceStatus.ABORTED
 
         stream = mock.Mock() if streaming else None
-        sched.postprocess([seq], self._output(seq.id, tokens), stream)
+        finished = sched.postprocess([seq], self._output(seq.id, tokens), stream)
 
+        assert finished == [seq]
         assert seen_reasons == ["aborted"], "exactly once, with the reason settled"
         assert not pending_send
         assert not seq.block_table
         assert not sched.deferred_free_blocks
         assert sched.is_finished()
-        assert seq.num_tokens == seq.num_prompt_tokens + len(retained)
+        # Cancellation now finishes before consuming sampled output; the
+        # engine delivers the terminal sequence through its output queue.
+        assert seq.num_tokens == seq.num_prompt_tokens
         if streaming:
-            output = stream.put_nowait.call_args.args[0][0][1]
-            assert output.finish_reason == "aborted"
-            assert output.output_tokens == retained
+            stream.put_nowait.assert_not_called()
 
     def test_an_abort_retires_a_claim_the_backend_took_anyway(self, seq_factory):
         """The scheduler does not depend on every backend re-deriving the guard.
@@ -2957,3 +2956,49 @@ class TestTheTierSplitPartitionsServedReuse:
         with caplog.at_level(logging.INFO, logger="atom"):
             s._log_pools()
         assert not any("[Cache Tiers]" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("partial", [True, False])
+def test_cancel_without_sampled_output_releases_state_and_pages(partial):
+    from atom.model_engine.kv_block import STATE_SLOT_CLASS
+
+    config = MockConfig(
+        max_num_seqs=2,
+        max_model_len=64,
+        max_num_batched_tokens=4,
+        kv_cache_block_size=4,
+        num_kvcache_blocks=32,
+        pool_entries={STATE_SLOT_CLASS: 2},
+    )
+    scheduler = Scheduler(config)
+    seq = Sequence(list(range(1, 13 if partial else 5)), 4, has_per_req_cache=True)
+    scheduler.add(seq)
+    batch, seqs = scheduler.schedule()
+    empty = ScheduledBatchOutput(
+        req_ids=[],
+        token_ids=[],
+        num_rejected=None,
+        num_bonus=None,
+        draft_token_ids=None,
+        is_deferred_out=True,
+    )
+    scheduler.postprocess(list(seqs.values()), empty, batch=batch)
+    assert seq.is_partial_prefill == partial
+    assert seq.state_slot >= 0 and seq.block_table
+    scheduler.kv_connector = SimpleNamespace(
+        request_finished=mock.Mock(),
+        send_finished=mock.Mock(),
+        should_defer_free=lambda seq: False,
+    )
+    seq.status = SequenceStatus.ABORTED
+    # A completed middle chunk or deferred first decode carries no sampled
+    # token for this request. It must still drive the normal finish/free path.
+    finished = scheduler.postprocess([], empty)
+    assert finished == [seq]
+    assert seq.leave_reason == "aborted" and seq.status == SequenceStatus.FINISHED
+    assert seq.state_slot == -1 and not seq.block_table
+    assert scheduler._partial_prefill_count == 0
+    assert not scheduler.running
+    assert scheduler.total_finished_requests == 1
+    scheduler.kv_connector.request_finished.assert_called_once_with(seq)
+    scheduler.kv_connector.send_finished.assert_called_once_with(seq.id)

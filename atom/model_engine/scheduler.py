@@ -34,6 +34,7 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.engine_stats import EngineStats
+from atom.model_engine.multimodal_runtime import prefill_media_payload
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
     Sequence,
@@ -373,12 +374,19 @@ class ScheduledBatch:
         # Key into ModelRunner's stream pool for CU-masked disagg streams.
         # None means full-CU fallback (no mask).
         self.cu_stream_fraction = cu_stream_fraction
-        # Collect multimodal data from prefill sequences
+        # Explicit spans support arbitrary chunks. Retain the CPU payload on
+        # the request for retry, and omit pixels after workers acknowledge it.
         self.multimodal_data = {}
         for seq in seqs.values():
-            if getattr(seq, "multimodal_data", None) is not None:
-                self.multimodal_data[seq.id] = seq.multimodal_data
-                # Clear after first use to avoid re-sending on decode steps
+            data = getattr(seq, "multimodal_data", None)
+            if data is None or seq.type != SequenceType.PREFILL:
+                continue
+            if "embedding_spans" in data:
+                self.multimodal_data[seq.id] = prefill_media_payload(
+                    data, seq.cache_seed, cache_ready=seq.multimodal_cache_ready
+                )
+            else:
+                self.multimodal_data[seq.id] = data
                 seq.multimodal_data = None
         self.external_request_ids = [seq.external_request_id for seq in seqs.values()]
 
@@ -1174,6 +1182,11 @@ class Scheduler:
             )
         return released + lease_reclaims
 
+    @staticmethod
+    def _requires_atomic_prefill(seq):
+        data = getattr(seq, "multimodal_data", None)
+        return data is not None and "embedding_spans" not in data
+
     def _unschedulable_reason(self, seq: Sequence) -> str | None:
         """Return a human-readable reason if `seq` is permanently unschedulable.
 
@@ -1211,10 +1224,8 @@ class Scheduler:
                 f"input tokens={num_tokens} > max_model_len={self.max_model_len}. "
                 f"Increase --max-model-len or shorten the prompt."
             )
-        # Multimodal prefills are never chunked (the vision embeddings cover the
-        # whole prompt), so for them the batched-token budget is a hard cap even
-        # when chunked prefill is on.
-        is_multimodal = getattr(seq, "multimodal_data", None) is not None
+        # Only processors with explicit spans and request leases can chunk.
+        is_multimodal = self._requires_atomic_prefill(seq)
         if (
             not self.enable_chunked_prefill or is_multimodal
         ) and num_tokens > self.max_num_batched_tokens:
@@ -1438,6 +1449,7 @@ class Scheduler:
             if unschedulable is not None:
                 seq.status = SequenceStatus.FINISHED
                 seq.leave_reason = f"unschedulable: {unschedulable}"
+                seq.multimodal_data = None
                 self._rejected.append(seq)
                 continue
 
@@ -1552,22 +1564,7 @@ class Scheduler:
             num_new_tokens = (
                 seq.num_tokens - num_cached_blocks * self.block_manager.hash_block_size
             )
-            # Vision embeddings are computed for the whole prompt in one shot
-            # and scattered onto the placeholder positions of the tokens in the
-            # batch, so a multimodal prefill must not be split: a partial chunk
-            # would either miss the placeholders entirely or land them at the
-            # wrong offsets. Take the prompt whole or wait for a step with
-            # enough budget.
-            #
-            # TODO: support chunked multimodal prefill. Needs the vision
-            # embeddings computed once and cached per request, then sliced by
-            # the chunk's token offset at scatter time (see the merge site in
-            # ModelRunner.run_model). Today the scheduler also clears
-            # `seq.multimodal_data` after the first batch, so later chunks would
-            # silently embed raw `<|media_pad|>` tokens into the KV cache. Until
-            # that lands, `max_num_batched_tokens` caps multimodal prompt length
-            # even with chunked prefill enabled.
-            atomic_prefill = getattr(seq, "multimodal_data", None) is not None
+            atomic_prefill = self._requires_atomic_prefill(seq)
             if (
                 not atomic_prefill
                 and self.enable_chunked_prefill
@@ -2053,6 +2050,7 @@ class Scheduler:
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
         seq.status = SequenceStatus.FINISHED
         seq.leave_reason = "aborted"
+        seq.multimodal_data = None
         self._rejected.append(seq)
         if not has_inflight_load and self._connector_flag("is_offload"):
             # A lookup can pin CPU KV before HBM allocation succeeds. No load
@@ -2280,19 +2278,7 @@ class Scheduler:
         than one checkpoint interval.
         """
         bm = self.block_manager
-        # A multimodal prompt is prefilled whole -- chunked multimodal prefill is
-        # unsupported (see the `atomic_prefill` guard in `_schedule_prefills`), so
-        # it is either admitted entire or requeued entire. Landing it on a state
-        # checkpoint rung shortens it deterministically, and the post-alloc atomic
-        # re-assert then requeues it whole; the very next pass produces the same
-        # shortened chunk and requeues again -- a livelock with idle GPUs and
-        # head-of-line blocking. Skip the rung cut here: the checkpoint machinery
-        # keeps a checkpoint only where a forward ends exactly on a rung, so a
-        # whole prompt that ends off-grid simply keeps no mid-prompt checkpoint,
-        # which is correct for a single-shot prefill (there is no later chunk to
-        # resume from anyway). Forks do not arise on a fresh multimodal prompt
-        # (`state_fork_src < 0`), so the fork-vetting below is likewise moot.
-        if getattr(seq, "multimodal_data", None) is not None:
+        if self._requires_atomic_prefill(seq):
             return chunk
         target = bm.checkpoint_cut(seq, start, start + chunk)
         if target:
@@ -2782,7 +2768,13 @@ class Scheduler:
         # live seq.is_partial_prefill while this batch was in flight).
         pp_middle_chunk_ids: set[int] = set()
         running_by_id = {seq.id: seq for seq in self.running} if batch else {}
+        if batch is not None:
+            for request_id, data in getattr(batch, "multimodal_data", {}).items():
+                seq = running_by_id.get(request_id)
+                if seq is not None and "embedding_spans" in data:
+                    seq.multimodal_cache_ready = True
         num_prefill = int(getattr(batch, "total_seqs_num_prefill", 0))
+        prefill_ids = set(batch.req_ids[:num_prefill]) if num_prefill else set()
         if self._connector_flag("is_offload") and num_prefill:
             for req_id in batch.req_ids[:num_prefill]:
                 seq = running_by_id.get(req_id)
@@ -2859,9 +2851,23 @@ class Scheduler:
             num_placeholder += 1
 
         for seq in self.running:
+            # Cancellation does not require sampled output. Middle prefill
+            # chunks and the first deferred step may have none; waiting for
+            # one keeps an aborted request alive without advancing its tokens.
+            if seq.status == SequenceStatus.ABORTED:
+                self._mark_finished(
+                    seq, "aborted", seq.num_tokens - seq.num_placeholder_tokens
+                )
+                finished_seqs.append(seq)
+                continue
             # Update the running status
             idx = fwd_output.get_idx(seq.id)
             if idx is None:
+                continue
+            # An immediate preempt/resume can retain the same request ID in
+            # the runner's deferred output. That result belongs to execution
+            # before this prefill and must not advance the replayed request.
+            if is_deferred_out and seq.id in prefill_ids:
                 continue
             # Partial prefill: KV written but prefill not complete — discard
             # the sampled token. Prefix hashes are also deferred since
@@ -3076,12 +3082,6 @@ class Scheduler:
                     stop_at_idx = max_stop_at_idx
                     leave_reason = "max_tokens"
 
-            # Natural stops still determine token truncation, but must not
-            # hide an abort: no peer will send the completion that retires a
-            # producer's source-block claim for a cancelled request.
-            if seq.status == SequenceStatus.ABORTED:
-                leave_reason = "aborted"
-
             # Drop accepted-draft tokens past the stop position (MTP only —
             # for non-spec the sampler emits exactly 1 token so this is a
             # no-op).
@@ -3109,6 +3109,7 @@ class Scheduler:
             # Record TTFT from the finalized retained length, after rejected
             # speculative tokens and cap/stop overflow have been removed. A
             # terminal response with no completion tokens must keep TTFT zero.
+            seq.num_finalized_tokens = num_tokens
             if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
 
@@ -3133,28 +3134,9 @@ class Scheduler:
             )
 
             if leave_reason is not None:
-                # Before `request_finished`, not after: a connector's claim on
-                # this request's source blocks is conditional on it (mooncake
-                # and moriio decline to claim an abort, since an abort never
-                # sends and the claim would never clear). Assigned here rather
-                # than in the finish block below, which runs after the one call
-                # that reads it.
-                seq.leave_reason = leave_reason
-                if self.kv_connector is not None:
-                    # Exactly once per finished request. Side-effecting since
-                    # the source claim moved into it, and it has to run whether
-                    # or not there is a stream queue, so it cannot live inside
-                    # the output block below.
-                    callback = getattr(self.kv_connector, "request_finished", None)
-                    if callable(callback):
-                        callback(seq)
-                    if leave_reason == "aborted":
-                        # The scheduler knows no send will ever be issued for
-                        # this request, so it retires the claim itself rather
-                        # than relying on every backend to re-derive that from
-                        # `leave_reason`. Nothing else would: `send_finished`
-                        # is driven by a completion report that is not coming.
-                        self._connector_send_finished(seq.id)
+                # Publish transfer metadata before constructing the terminal
+                # output. Aborts without sampled output use the same helper.
+                self._mark_finished(seq, leave_reason, num_tokens)
 
             # Prepare stream output
             # A terminal event is required even when truncation leaves no
@@ -3192,15 +3174,6 @@ class Scheduler:
                 # logger.info(
                 #     f"Sequence {seq.id} finished with reason: {leave_reason}, {seq.token_ids[-8:]=}"
                 # )
-                seq.num_tokens = num_tokens
-                # `seq.leave_reason` was already assigned above, before
-                # `request_finished` read it.
-                seq.status = SequenceStatus.FINISHED
-                self.total_finished_requests += 1
-                self.total_prompt_tokens += int(seq.num_prompt_tokens)
-                self.total_generation_tokens += max(
-                    0, int(num_tokens) - int(seq.num_prompt_tokens)
-                )
                 finished_seqs.append(seq)
 
         if stream_output_queue is not None and stream_outputs:
@@ -3283,6 +3256,27 @@ class Scheduler:
             num_generation_tokens=num_new_generation_tokens
         )
         return finished_seqs
+
+    def _mark_finished(self, seq, reason, num_tokens):
+        # Set the reason before the connector decides whether to claim the
+        # source blocks. This runs exactly once, including early cancellation
+        # without sampled output and requests without a stream queue.
+        seq.leave_reason = reason
+        if self.kv_connector is not None:
+            callback = getattr(self.kv_connector, "request_finished", None)
+            if callable(callback):
+                callback(seq)
+            if reason == "aborted":
+                # No peer will report a send for a cancelled request.
+                self._connector_send_finished(seq.id)
+        seq.num_tokens = num_tokens
+        seq.multimodal_data = None
+        seq.status = SequenceStatus.FINISHED
+        self.total_finished_requests += 1
+        self.total_prompt_tokens += int(seq.num_prompt_tokens)
+        self.total_generation_tokens += max(
+            0, int(num_tokens) - int(seq.num_prompt_tokens)
+        )
 
     def compute_detailed_aggregates(
         self,

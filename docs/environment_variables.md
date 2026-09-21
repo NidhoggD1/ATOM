@@ -154,11 +154,11 @@ size, so the per-shape JIT — aiter's flydsl builds an hgemm per tile config,
 in-process — is paid at startup instead of stalling a serving step. At serve
 time a pass runs at the batch the target just ran, which `ForwardMode.decide`
 picks out of those same `capture_sizes` — that is what makes a warmed shape and a
-reachable shape one set rather than two lists that drift. The switch below decides whether that warm also *records*.
+reachable shape one set rather than two lists that drift. A pass must support capture; the switch below then decides whether its warmup also records. V4.1 DSpark currently warms and drafts eagerly because its request windows and expert dispatch are outside the whole-block capture contract. Its target supports PIECEWISE tensor-stage graphs.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_DRAFT_CUDAGRAPH** | bool | 1 (true) | Capture each declared draft pass into a per-`capture_sizes` CUDAGraph as it is warmed, so a draft pass replays instead of relaunching every kernel. `0` keeps the warmup (and therefore the JIT saving) but drafts eagerly. Only passes that declare a graph are captured; every drafter ATOM ships declares at least one, including the separate-draft Kimi-K3 path, whose block pass builds its paged metadata at warmup so nothing host-side is left inside the recording. EPLB no longer declines the padding: the target pads on every cudagraph decode step and its rows reach the same expert-load recorder, so declining on the draft protected nothing. A DP-sync dummy DOES replay, in lockstep with the ranks holding work — `is_dummy_run` is per-rank, so gating on it splits one DP group across two collectives. Measured on V4-Flash-DSpark tp1: GSM8K 0.9527 / acceptance 65.25% captured against 0.9497 / 65.21% eager, i.e. indistinguishable; on tp4 with the LM head inside the capture, draft kernel launches went 30 → 0 per pass and draft wall time 915.8 → 118.9 µs. Read per pass at warmup time, so set it before the server starts. Grep a trace for a trailing ` graph` in a `propose_*` label to confirm which passes replayed. |
+| **ATOM_DRAFT_CUDAGRAPH** | bool | 1 (true) | Capture each declared draft pass into a per-`capture_sizes` CUDAGraph as it is warmed, so a draft pass replays instead of relaunching every kernel. `0` keeps the warmup (and therefore the JIT saving) but drafts eagerly. Only declared passes with capture support are recorded; every drafter ATOM ships declares at least one pass, including the separate-draft Kimi-K3 path, whose block pass builds its paged metadata at warmup so nothing host-side is left inside the recording. EPLB no longer declines the padding: the target pads on every cudagraph decode step and its rows reach the same expert-load recorder, so declining on the draft protected nothing. A DP-sync dummy DOES replay, in lockstep with the ranks holding work — `is_dummy_run` is per-rank, so gating on it splits one DP group across two collectives. Measured on V4-Flash-DSpark tp1: GSM8K 0.9527 / acceptance 65.25% captured against 0.9497 / 65.21% eager, i.e. indistinguishable; on tp4 with the LM head inside the capture, draft kernel launches went 30 → 0 per pass and draft wall time 915.8 → 118.9 µs. Read per pass at warmup time, so set it before the server starts. Grep a trace for a trailing ` graph` in a `propose_*` label to confirm which passes replayed. |
 
 ### DSpark drafting
 
@@ -170,6 +170,25 @@ that ever changes, so a fusion left inert by an unrecognised layout says so.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_DSPARK_FUSED_CTX_KV** | bool | 1 (true) | Write the context rows with one Triton kernel (RMSNorm + RoPE + concat + paged store) instead of four launches plus a throwaway `empty_like` for the RoPE's query side. Falls back per call when the cache layout or the RoPE is not the plain one the kernel understands (seg / shuffled-KV layouts keep their own write kernels), and until the RoPE's cos/sin cache has reached the device. Measured on Kimi-K3 (MI355X, TP8, fp8 KV): one 4.65 µs kernel replaces a 14 µs three-kernel chain, saving ~39 µs per drafting step at B=1 and ~36 µs at B=64. Set to `0` to force the per-op chain; that chain is the fallback above rather than debug code, so it stays reachable either way (it runs the first write of every layer). |
+| **ATOM_DSPARK_DISABLE_COMPILE** | bool | 0 (false) | Run the DSpark draft eager while the target stays compiled. Prefer it over `--level 0`, which drops compilation for both models; `--enforce-eager` does not reach it, because `support_torch_compile` keys off `compilation_config.level` alone. Flips the decorator's own bypass rather than handing the draft a cloned config, so the shared `static_forward_context` registry stays one object. |
+
+### Speculative acceptance
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_ENABLE_RELAXED_MTP** | bool | 0 (false) | Accept a draft token when it lands in the target's top 10 within 0.6 of the top logit, instead of requiring the argmax. Intended for quantized MTP heads, whose drafts are right about the region and wrong about the exact winner often enough that strict acceptance throws away usable tokens. Read once at `rejection_sampler` import, so it must be set before the server starts. |
+
+## Engram (DeepSeek-V4.1)
+
+The n-gram tables are per-layer and large enough that where they live, and
+whether they are rebuilt, both show up at startup. Both switches below are
+all-or-nothing on purpose: a half-registered set would keep the host path for
+some layers and the device path for others, which is the confusing state.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_ENGRAM_UVA** | bool | 1 (true) | Page-lock this rank's shard of the hash tables in place and let a device kernel read the rows it needs across the bus, dequantizing there. No copy and no HBM for the table. `0` falls back to gathering the rows on the host, which returns the same rows but costs ~50 ms of CPU per decode step with the GPU idle behind it. Anything that would make the device path unsafe — no CUDA, more TP ranks than hash heads, a registration that will not fit — falls back on its own, so the switch is for taking the host path deliberately. The fallback is the whole TP group's: the lookup ends in an all-gather, so one rank that cannot register turns every rank around rather than leaving the others in a collective it never enters. |
+| **ATOM_ENGRAM_CACHE_DIR** | path | `~/.cache/atom/engram` | Where the compressed-vocab table is cached between runs. The table is reproducible from the tokenizer, so this only trades startup time for disk; point it at shared storage to let several servers build it once. A truncated or stale cache is rebuilt rather than raised. |
 
 ## V4 attention backend (Migration)
 

@@ -22,6 +22,7 @@ import logging
 import math
 import os
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("atom")
@@ -774,6 +775,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
     # link traffic by tp_size. Default on; set "0" for full-tensor sends.
     "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
+    # Engram: read the n-gram tables with a device kernel over UVA instead of
+    # gathering them on the host. The tables stay in host memory (page-locked in
+    # place, not copied to HBM); the GPU pulls only the rows a step names and
+    # dequantizes them there. On by default: the host gather gives the same rows
+    # but costs ~50 ms of CPU per decode step with the GPU idle behind it. Set
+    # to 0 to fall back. Anything that would make it unsafe -- no CUDA, more TP
+    # ranks than hash heads, a registration that will not fit -- falls back on
+    # its own, so the switch is for taking the host path deliberately.
+    "ATOM_ENGRAM_UVA": lambda: os.getenv("ATOM_ENGRAM_UVA", "1") == "1",
+    # Where the compressed-vocab table is cached between runs. The table is
+    # reproducible from the tokenizer, so this only trades startup time for
+    # disk; point it at shared storage to let several servers build it once.
+    "ATOM_ENGRAM_CACHE_DIR": lambda: os.getenv(
+        "ATOM_ENGRAM_CACHE_DIR", str(Path.home() / ".cache" / "atom" / "engram")
+    ),
+    # Overlap hash/UVA lookup and TP reassembly with early layers, using private
+    # IPC state where supported. Requires UVA; set 0 to disable.
+    "ATOM_ENGRAM_OVERLAP": lambda: os.getenv("ATOM_ENGRAM_OVERLAP", "1") == "1",
+    # Fuse FP32 post-wkv gating and residual addition; 0 selects the torch reference.
+    "ATOM_ENGRAM_FUSED_GATE": lambda: os.getenv("ATOM_ENGRAM_FUSED_GATE", "1") == "1",
 }
 
 
