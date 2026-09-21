@@ -7,8 +7,12 @@ from aiter_stub import stubbed_aiter
 with stubbed_aiter():
     from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
     from atom.kv_transfer.disaggregation.types import (
+        ConnectorCompletion,
         KVConnectorOutput,
+        LoadOperationId,
         SaveOperationId,
+        SaveSourceGroupId,
+        StateStoreOperationId,
     )
     from atom.model_engine.pp_engine_core import PPEngineCoreProc
 
@@ -245,7 +249,7 @@ def test_an_abandoned_save_releases_its_partial_quorum():
     agg = PPKVAggregator(2)
     op = SaveOperationId(req_id="7", generation=1)
     assert agg.ingest(0, KVConnectorOutput(finished_saving={op})).is_empty()
-    assert agg.ingest(0, KVConnectorOutput(finished_loading={"8"})).is_empty()
+    assert agg.ingest(0, KVConnectorOutput(finished_saving={"8"})).is_empty()
     assert agg.has_pending() is True
 
     agg.forget(7)  # the scheduler counts in ints; the connector in strings
@@ -257,6 +261,135 @@ def test_an_abandoned_save_releases_its_partial_quorum():
     # The late report from the missing stage cannot resurrect the tally into a
     # quorum of one.
     assert agg.ingest(1, KVConnectorOutput(finished_saving={op})).is_empty()
+    assert agg.has_pending() is False
+
+
+@pytest.mark.parametrize("seen_before_abandon", [False, True])
+@pytest.mark.parametrize("succeeded", [False, True])
+def test_abandoned_save_drops_late_store_and_source_reports(
+    seen_before_abandon, succeeded
+):
+    agg = PPKVAggregator(2)
+    operation = SaveOperationId("7", 1)
+    source = SaveSourceGroupId(operation, ((0, 8),))
+    report = KVConnectorOutput(
+        finished_saving={operation},
+        connector_completions={
+            ConnectorCompletion("store", operation, succeeded),
+            ConnectorCompletion("source_safe", source, True),
+        },
+    )
+    if seen_before_abandon:
+        assert agg.ingest(0, report).is_empty()
+
+    agg.forget(7)
+
+    # Save reports/channels need not have appeared before abandonment.
+    for rank in (1, 0):
+        assert agg.ingest(rank, report).is_empty()
+        assert not agg.has_pending()
+
+
+@pytest.mark.parametrize("failed_load", [False, True])
+def test_abandoning_save_preserves_same_request_load_quorum(failed_load):
+    agg = PPKVAggregator(2)
+    save = SaveOperationId("7", 1)
+    load = LoadOperationId("7", 2)
+    disposition = ConnectorCompletion("load_disposition", load, True)
+    state = ConnectorCompletion("state_store", StateStoreOperationId(7, 3), True)
+    agg.ingest(
+        0,
+        KVConnectorOutput(
+            finished_saving={save},
+            finished_loading=set() if failed_load else {load},
+            failed_loading={load} if failed_load else set(),
+            connector_completions={disposition, state},
+        ),
+    )
+
+    agg.forget(7)
+
+    assert agg.has_pending()
+    output = agg.ingest(
+        1,
+        KVConnectorOutput(
+            finished_loading={load},
+            connector_completions={disposition, state},
+        ),
+    )
+    assert output.finished_loading == (set() if failed_load else {load})
+    assert output.failed_loading == ({load} if failed_load else set())
+    assert output.connector_completions == {disposition, state}
+    assert not output.finished_saving
+    assert not agg.has_pending()
+
+
+def test_abandoning_save_preserves_untyped_connector_events():
+    # A raw channel identity does not say it is a request's save. In
+    # particular an independent state hash may equal a native request ID.
+    agg = PPKVAggregator(2)
+    event = ConnectorCompletion("custom_state", 7, True)
+    agg.ingest(0, KVConnectorOutput(connector_completions={event}))
+    agg.forget(7)
+    output = agg.ingest(1, KVConnectorOutput(connector_completions={event}))
+    assert output.connector_completions == {event}
+    assert not agg.has_pending()
+
+
+def test_save_tombstones_are_bounded_and_do_not_block_unrelated_requests():
+    agg = PPKVAggregator(2, terminal_tombstone_limit=2)
+    for request_id in range(3):
+        agg.forget(request_id)
+    assert len(agg._abandoned_saves) == 2
+    assert agg.ingest(1, KVConnectorOutput(finished_saving={"1", 2})).is_empty()
+    assert not agg.has_pending()
+
+    other = SaveOperationId(3, 0)
+    assert agg.ingest(0, KVConnectorOutput(finished_saving={other})).is_empty()
+    assert agg.ingest(
+        1, KVConnectorOutput(finished_saving={other})
+    ).finished_saving == {other}
+    assert not agg.has_pending()
+
+
+def test_reset_clears_abandoned_save_tombstones():
+    agg = PPKVAggregator(2)
+    operation = SaveOperationId(7, 1)
+    agg.forget(7)
+    assert agg.ingest(0, KVConnectorOutput(finished_saving={operation})).is_empty()
+    assert not agg.has_pending()
+    agg.reset()
+    assert agg.ingest(0, KVConnectorOutput(finished_saving={operation})).is_empty()
+    assert agg.ingest(
+        1, KVConnectorOutput(finished_saving={operation})
+    ).finished_saving == {operation}
+    assert not agg.has_pending()
+
+
+def test_aggregator_rejects_nonpositive_tombstone_limit():
+    with pytest.raises(ValueError, match="terminal_tombstone_limit"):
+        PPKVAggregator(2, terminal_tombstone_limit=0)
+
+
+@pytest.mark.parametrize("local_report", [False, True])
+def test_pp_head_remembers_abandonment_before_first_stage_report(local_report):
+    operation = SaveOperationId("7", 1)
+    report = KVConnectorOutput(finished_saving={operation})
+    proc = _head(
+        pp_size=2,
+        local_outputs=[report] if local_report else [],
+        downstream_messages=[] if local_report else [[(1, report)]],
+    )
+    proc.scheduler.deferred_free_blocks = {}
+    proc.scheduler.kv_connector = None
+    proc.scheduler.on_save_abandoned = proc._forget_pp_save_quorum
+
+    proc.scheduler.on_save_abandoned(7)
+    assert not proc.has_pending_kv_work()
+    proc._poll_kv_transfer_progress()
+
+    assert not proc.scheduler.outputs
+    assert not proc.has_pending_kv_work()
 
 
 def test_the_pp_head_gives_the_aggregator_the_scheduler_s_verdict():

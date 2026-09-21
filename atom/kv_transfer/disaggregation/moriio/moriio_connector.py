@@ -978,11 +978,16 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         to the decode instance.  On the consumer side this cleans up
         the transfer_id mapping.
         """
+        if self.is_producer and getattr(seq, "leave_reason", None) == "aborted":
+            # No send claim protects an abort's blocks from reuse. Never
+            # advertise their addresses, including any previous metadata.
+            seq.kv_transfer_params_output = None
+            return
+
         # Claim the source blocks -- the metadata below hands the peer their
         # addresses. Gated on `is_producer` alone: unlike mooncake this backend
-        # never reads `do_remote_decode` and sends everything it prefills. An
-        # abort never sends, so a claim would never clear.
-        if self.is_producer and getattr(seq, "leave_reason", None) != "aborted":
+        # never reads `do_remote_decode` and sends everything it prefills.
+        if self.is_producer:
             self._awaiting_send.add(str(seq.id))
 
         # Attach output metadata for the proxy to relay

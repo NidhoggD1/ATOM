@@ -336,6 +336,13 @@ blocks stay put and `finished_sending` remains their only releaser. The abandon
 happens once (`seq._save_abandoned`); the release attempt repeats every
 interval, so a late report still collects the blocks.
 
+Abandonment also retires the PP aggregator's save tallies. It remembers the
+most recent 4096 abandoned native request IDs (the TP aggregator uses the same
+default bound for its terminal history), so late save, store-terminal and
+source-safe reports cannot recreate those tallies. The terminal is recorded
+even if no stage has reported yet. Load tallies and independent state-store
+events keep their own quorum; abandoning a save does not cancel a load.
+
 ### The other half of `request_finished`
 
 `request_finished` runs while `should_defer_free` is still true — that is the

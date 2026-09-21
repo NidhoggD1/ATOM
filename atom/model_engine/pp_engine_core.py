@@ -206,8 +206,11 @@ class PPEngineCoreProc(EngineCore):
         aggregator gives up on exactly the requests the scheduler already has,
         and the two cannot drift.
         """
-        if self._pp_kv_aggregator is not None:
-            self._pp_kv_aggregator.forget(req_id)
+        # A save can time out before any stage reports. Its first late report
+        # must encounter the terminal record too, not create a fresh tally.
+        if self._pp_kv_aggregator is None:
+            self._pp_kv_aggregator = PPKVAggregator(self.pp_size)
+        self._pp_kv_aggregator.forget(req_id)
 
     def has_pending_kv_work(self) -> bool:
         """Keep polling while an offload operation lacks stage completions.

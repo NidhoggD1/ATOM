@@ -487,12 +487,16 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             )
 
     def request_finished(self, seq: Sequence) -> None:
+        if self.is_producer and getattr(seq, "leave_reason", None) == "aborted":
+            # No send claim protects an abort's blocks from reuse. Never
+            # advertise their addresses, including any previous metadata.
+            seq.kv_transfer_params_output = None
+            return
+
         # Claim iff we will send: the same `do_remote_decode` gate that fills
-        # `_reqs_need_save`. An abort never sends, so a claim would never clear.
-        if (
-            self.is_producer
-            and (getattr(seq, "kv_transfer_params", None) or {}).get("do_remote_decode")
-            and getattr(seq, "leave_reason", None) != "aborted"
+        # `_reqs_need_save`.
+        if self.is_producer and (getattr(seq, "kv_transfer_params", None) or {}).get(
+            "do_remote_decode"
         ):
             self._awaiting_send.add(str(seq.id))
 

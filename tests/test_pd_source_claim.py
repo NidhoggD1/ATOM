@@ -114,13 +114,14 @@ def test_claim_is_taken_at_publication_and_dropped_on_send(build, as_str):
         sched.should_defer_free(seq) is True
     ), "the peer now has these addresses and the read outlives the call"
     assert seq.kv_transfer_params_output["do_remote_prefill"] is True
+    assert seq.kv_transfer_params_output["remote_block_ids"] == seq.block_table
 
     sched.send_finished(str(seq.id) if as_str else seq.id)
     assert sched.should_defer_free(seq) is False
 
 
 @pytest.mark.parametrize("build", BACKENDS)
-def test_an_aborted_request_is_never_claimed(build):
+def test_aborted_producer_neither_claims_nor_advertises_blocks(build):
     sched = build()
     seq = _seq(do_remote_decode=True)
     sched.update_state_after_alloc(seq)
@@ -131,6 +132,7 @@ def test_an_aborted_request_is_never_claimed(build):
     assert (
         sched.should_defer_free(seq) is False
     ), "an abort never sends, so nothing would retire the claim"
+    assert seq.kv_transfer_params_output is None
 
 
 @pytest.mark.parametrize("build", BACKENDS)
