@@ -11,7 +11,7 @@ import triton.language as tl
 from torch import nn
 
 from atom.config import get_current_atom_config
-from atom.utils import envs, mark_spliting_op
+from atom.utils import mark_spliting_op
 from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules, _mla_output_width
@@ -60,11 +60,13 @@ PA_ASM_MAX_QUERY_GROUP_SIZE = 16
 # reference at 64 than at 8; and 64 is where the C++ PS reduce stops being built
 # at all, with no working fallback under it (see the test that pins this).
 PA_DENSE_SPLIT_TARGET_WG = 128
-# Overridable only to A/B the cap against aiter's FlyDSL decode (PR #4332),
-# which has both the fixed PS reduce and a kernel that keeps improving past 32
-# where gluon flattens. 32 remains the default and the shipping value: on
-# production aiter neither half of the bound above has moved.
-PA_DENSE_SPLIT_MAX = envs.ATOM_PA_DENSE_SPLIT_MAX
+# Not a knob. With the work planner on, a planned dense call is told
+# `plan.max_partitions` instead of this, so the cap no longer sets the
+# production partition count -- it survives for the gluon fallback, where both
+# halves of the bound above still hold. Raising it would only enlarge the
+# static scratch that `attention_mha` sizes from it and that a planned call
+# never reads.
+PA_DENSE_SPLIT_MAX = 32
 
 
 def dense_decode_splits(num_seqs: int, num_kv_heads: int) -> int:
@@ -239,106 +241,38 @@ def _flydsl_pa_decode_num_seqs(
 
 
 _FLYDSL_PLAN_MAX_BATCH = 4096
-_FLYDSL_PLANS: dict[tuple, object] = {}
 _FLYDSL_PLAN_SCRATCH: dict[tuple, tuple] = {}
 
 
-def _flydsl_work_plan(context_lens, num_kv_heads, plan_max_partitions,
-                      query_length, query_group_size, head_dim, out_dtype):
-    """aiter #5546's GPU work plan plus its scratch, cached per shape.
+def _flydsl_plan_scratch(plan, query_length, query_group_size, head_dim,
+                         out_dtype, device):
+    """Partial-output buffers for a planned call, allocated once per shape.
 
-    `plan_max_partitions` is the planner's per-request CEILING, not the static
-    split count, and 0 means "keep aiter's default" (MAX_CONTEXT_PARTITIONS,
-    from the `plan_pa_decode` signature). They are separate quantities:
-    `get_recommended_splits` hands every request the same count and says so
-    ("not a variable-work scheduler"), while the plan divides a workgroup budget
-    between requests up to this bound. Passing the static count here clamps the
-    long request to the same share as the short ones, which is the planner's
-    entire mechanism.
-
-    Do not take the ceiling from aiter's unit test: it is the only caller of
-    `plan_pa_decode` in the tree and it deliberately binds the two, building the
-    plan from the same count it hands `pa_decode` so that the two paths must
-    agree numerically. That makes it a correctness test that cannot see the
-    conflation. The split is what #5546's author asked for in review on
-    2026-09-21, and it is what the signature already defaults to.
-
-    Two things must be allocated once and then only refreshed. The plan, because
-    allocation is illegal inside graph capture and a captured graph bakes in the
-    pointers -- rebuilding it per step would leave replay reading freed memory
-    (the hazard #2227 hit with `n_valid_column_per_row`). And the scratch,
-    because a planned call does NOT use the caller's static buffers: planned
-    output is packed as [kv_heads, plan.capacity, query_rows(, D)] whereas the
-    static API wants [num_seqs, kv_heads, partitions, query_rows(, D)]. Handing
-    over the static ones raises
+    A planned call does NOT use the caller's static buffers: planned output is
+    packed as [kv_heads, plan.capacity, query_rows(, D)] whereas the static API
+    wants [num_seqs, kv_heads, partitions, query_rows(, D)]. Handing over the
+    static ones raises
 
         ValueError: max_logits shape (2, 1, 64, 64) != (1, 128, 64)
 
-    which is what this function existed in a broken form long enough to cause.
-
-    Refreshing the plan is a GPU kernel with no device-to-host readback, so it
-    is safe to capture -- that property is what makes the planner usable here.
+    Sized from the CURRENT capacity and keyed by it, so a refresh that changed
+    the plan's shape gets its own buffers rather than silently overflowing the
+    old ones. Allocation stays here, not in the builder, because the shapes come
+    from the query tensor the op is holding; only the per-step planner kernel
+    moved out.
     """
-    from aiter.ops.flydsl.pa_decode import plan_pa_decode
-
-    key = (
-        int(context_lens.shape[0]),
-        int(num_kv_heads),
-        int(plan_max_partitions),
-        int(query_length),
-        int(query_group_size),
-        context_lens.device.index,
-    )
-    # This path always asks for a dense plan (the call site pins
-    # sliding_window=0), and both the API docstring and the unit test treat a
-    # dense plan as query-length independent: the test passes query_length only
-    # when a window is enabled. The scratch below still uses the real query
-    # length -- that one does depend on it.
-    # Omitted rather than resolved: passing nothing is what takes the signature
-    # default, and the reuse branch then compares that same default against the
-    # cached plan, so a refresh cannot trip "max_partitions must match". The key
-    # carries the raw 0 -- safe because the env is read once per process, and a
-    # changed value lands on a different key rather than on a mismatched plan.
-    kwargs = {} if plan_max_partitions <= 0 else {
-        "max_partitions": int(plan_max_partitions)
-    }
-    cached = _FLYDSL_PLANS.get(key)
-    plan = plan_pa_decode(
-        context_lens,
-        num_kv_heads,
-        query_length=1,
-        plan=cached,
-        **kwargs,
-    )
-    _FLYDSL_PLANS[key] = plan
-    if cached is None:
-        # Once per shape, so the volume is bounded by the cache. This is the
-        # only evidence that the planner went where it was meant to: num_seqs
-        # here should stay at batch scale. A sparse call site folds query
-        # tokens in and would show up as thousands, which is what this line
-        # exists to make visible rather than assumed.
-        logger.info(
-            "flydsl work plan built: num_seqs=%d kv_heads=%d max_partitions=%d "
-            "capacity=%d query_group_size=%d",
-            int(context_lens.shape[0]),
-            int(num_kv_heads),
-            int(plan.max_partitions),
-            int(plan.capacity),
-            int(query_group_size),
-        )
-
-    scratch = _FLYDSL_PLAN_SCRATCH.get(key)
     rows = query_length * query_group_size
-    want = (num_kv_heads, int(plan.capacity), rows)
-    if scratch is None or tuple(scratch[0].shape) != want:
-        dev = context_lens.device
-        scratch = (
-            torch.empty(want, dtype=torch.float32, device=dev),
-            torch.empty(want, dtype=torch.float32, device=dev),
-            torch.empty(*want, head_dim, dtype=out_dtype, device=dev),
+    want = (int(plan.num_kv_heads), int(plan.capacity), rows)
+    key = (*want, head_dim, out_dtype, device.index)
+    hit = _FLYDSL_PLAN_SCRATCH.get(key)
+    if hit is None:
+        hit = (
+            torch.empty(want, dtype=torch.float32, device=device),
+            torch.empty(want, dtype=torch.float32, device=device),
+            torch.empty(*want, head_dim, dtype=out_dtype, device=device),
         )
-        _FLYDSL_PLAN_SCRATCH[key] = scratch
-    return plan, scratch
+        _FLYDSL_PLAN_SCRATCH[key] = hit
+    return hit
 
 
 def run_pa_decode_gluon(
@@ -368,17 +302,19 @@ def run_pa_decode_gluon(
 ):
     """Run the AITER paged-attention decode kernel.
 
-    ATOM_PA_FLYDSL=1 routes to aiter's FlyDSL implementation (aiter PR #4332)
-    instead of the gluon one where FlyDSL's domain covers the call. MEASUREMENT
+    Routed to aiter's FlyDSL implementation (aiter PR #4332) wherever FlyDSL's
+    domain covers the call, and to gluon otherwise. MEASUREMENT
     SWITCH, not a shipping default: the two take the same arguments and compute
-    the same thing, and the env exists to A/B them without two ATOM trees.
+    the same thing, and FlyDSL (aiter PR #4332) is the path.
 
     The two are not interchangeable everywhere, and the split is structural
-    rather than incidental -- see ``_flydsl_pa_decode_num_seqs``. Callers get
-    gluon for anything outside FlyDSL's domain, so enabling the env never turns
-    a working configuration into an exception.
+    rather than incidental -- see ``_flydsl_pa_decode_num_seqs``, which mirrors
+    the kernel's own validation. Anything outside FlyDSL's domain falls to
+    gluon there rather than raising from inside aiter, so this is a capability
+    check and not a switch: there is no configuration it turns into an
+    exception.
     """
-    flydsl_seqs = envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs(
+    flydsl_seqs = _flydsl_pa_decode_num_seqs(
         q=q,
         k_cache=k_cache,
         context_lens=context_lens,
@@ -392,62 +328,44 @@ def run_pa_decode_gluon(
         sliding_window=sliding_window,
         ps=ps,
     )
-    if envs.ATOM_PA_FLYDSL:
-        # Report both routes, once per shape signature. A run where the env is
-        # set but every call still lands on gluon is otherwise indistinguishable
-        # from one where FlyDSL simply did not help.
-        sig = (bool(flydsl_seqs), max_seqlen_q, q.shape[0], context_lens.shape[0])
-        if sig not in _flydsl_pa_routed:
-            _flydsl_pa_routed.add(sig)
-            logger.info(
-                "pa_decode -> %s (rows=%d max_seqlen_q=%d padded_seqs=%d "
-                "head_dim=%d %s)",
-                f"flydsl[{flydsl_seqs} seqs]" if flydsl_seqs else "gluon",
-                q.shape[0],
-                max_seqlen_q,
-                context_lens.shape[0],
-                q.shape[-1],
-                compute_type,
-            )
+    # Report both routes, once per shape signature. A run where every call
+    # quietly lands on gluon is otherwise indistinguishable from one where
+    # FlyDSL simply did not help.
+    sig = (bool(flydsl_seqs), max_seqlen_q, q.shape[0], context_lens.shape[0])
+    if sig not in _flydsl_pa_routed:
+        _flydsl_pa_routed.add(sig)
+        logger.info(
+            "pa_decode -> %s (rows=%d max_seqlen_q=%d padded_seqs=%d "
+            "head_dim=%d %s)",
+            f"flydsl[{flydsl_seqs} seqs]" if flydsl_seqs else "gluon",
+            q.shape[0],
+            max_seqlen_q,
+            context_lens.shape[0],
+            q.shape[-1],
+            compute_type,
+        )
 
     if flydsl_seqs:
         from aiter.ops.flydsl.pa_decode import pa_decode as _flydsl_pa_decode
 
         work_plan = None
         es, ml, tmp = exp_sums, max_logits, temporary_output
-        # #5546's planner refuses batches past 4096. Now that only the dense
-        # site opts in, num_seqs is the real batch and stays far below that, so
-        # this is a net rather than a live path -- it was reached when the
-        # planner still ran on M3's sparse sites, which fold query tokens into
-        # num_seqs (`total_q * Hkv`) and hit 32768 on a prefill-as-decode step.
-        # Keep it: the cap is aiter's, not ours. Falling back to the static path
-        # keeps those steps running; letting the planner raise killed a worker
-        # ~90 s into the run while the server kept answering /metrics, so the
-        # client sat in warmup for 66 minutes waiting on a reply that could
-        # never come.
-        # `allow_work_plan` is the caller's, the same way the split count is:
-        # each call site already picks its own (`dense_decode_splits` here,
-        # aiter's stock `get_recommended_splits` for the two MiniMax-M3 sparse
-        # sites and for the vLLM/SGLang bridges). The planner belongs on the
-        # same axis -- it rebalances partitions across UNEVEN context lengths,
-        # and a sparse call's lengths are a fixed topk window, so there is
-        # nothing to rebalance and the refresh plus task packing are pure cost.
-        # Measured on uniform batches: 0.56x at B8/257 and 0.84x at B200/200000,
-        # flat from Pmax 4 to 256 -- raising the ceiling does not rescue it.
-        if (
-            envs.ATOM_PA_FLYDSL_PLAN
-            and allow_work_plan
-            and flydsl_seqs <= _FLYDSL_PLAN_MAX_BATCH
-        ):
+        # The plan is built once per forward in the metadata builder
+        # (`refresh_flydsl_plan`), not here: it is a function of context_lens
+        # alone, so building it per layer re-ran the planner kernel for each of
+        # M3's three dense layers. `allow_work_plan` keeps the choice with the
+        # caller, the same way the split count already is -- the two sparse call
+        # sites and the vLLM/SGLang bridges never opt in and never look.
+        if allow_work_plan:
+            from atom.utils.forward_context import get_forward_context
+
+            md = get_forward_context().attn_metadata
+            work_plan = getattr(md, "flydsl_work_plan", None) if md else None
+        if work_plan is not None:
             nkv = k_cache.shape[1]
-            work_plan, (ml, es, tmp) = _flydsl_work_plan(
-                context_lens[:flydsl_seqs],
-                nkv,
-                envs.ATOM_PA_FLYDSL_PLAN_MAX,
-                max_seqlen_q,
-                q.shape[-2] // nkv,
-                q.shape[-1],
-                output.dtype,
+            ml, es, tmp = _flydsl_plan_scratch(
+                work_plan, max_seqlen_q, q.shape[-2] // nkv, q.shape[-1],
+                output.dtype, context_lens.device,
             )
 
         # Slice off ATOM's sequence-axis padding so the rectangle FlyDSL

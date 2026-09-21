@@ -506,43 +506,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_V4_PREFILL_ASM_FOR_DECODE": lambda: (
         os.getenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "0") == "1"
     ),
-    # Route the paged decode to aiter's FlyDSL kernel (aiter PR #4332) rather
-    # than the gluon one. A measurement switch: the two take the same arguments,
-    # and this exists to A/B them without maintaining two ATOM trees.
-    "ATOM_PA_FLYDSL": lambda: (os.getenv("ATOM_PA_FLYDSL", "0") == "1"),
-    # Opt into aiter #5546's GPU work planner on the FlyDSL decode. Needs
-    # ATOM_PA_FLYDSL=1; the planner is refreshed in place each forward.
+    # Opt into aiter #5546's GPU work planner on the FlyDSL decode. The plan is
+    # built once per forward in the metadata builder and refreshed in place, so
+    # it stays capturable.
     #
-    # Default 0 pending an end-to-end A/B on the corrected wiring below. The
-    # earlier end-to-end loss (7.2% at conc 10, 11.3% at conc 20) was measured
-    # with the planner's ceiling overwritten by the static split count, which
-    # is the one setting that removes its whole mechanism. Micro-benchmarked on
-    # the measured operating points with the ceiling left at the API default,
-    # best static vs best planned is 1.21-3.47x in the planner's favour at the
-    # real context lengths, and 0.91-0.97x at n=5 with short context.
+    # Default on. It rebalances partitions across a batch whose KV lengths
+    # differ, which is where this workload's slow requests live: measured on the
+    # agentic trace, SA-convention interactivity (1/itl_p90) is +24.6% at conc
+    # 20 and +8.4% at conc 10, and the gain runs monotonically from the slow
+    # tail to the fast one (p10 +24.6%, p50 +19.3%, p90 +5.0%). Kernel-level it
+    # is a wash at small batch -- the tile kernel gets 11-38% faster but the
+    # planned partial packing makes the PS reduce 14-15% dearer -- so the
+    # end-to-end gain comes from the uneven-length batches, not from more
+    # partitions per se.
+    #
+    # The ceiling is deliberately NOT exposed: `plan_pa_decode`'s own default
+    # (MAX_CONTEXT_PARTITIONS) is what its unit test and bench use, the
+    # workgroup budget binds before it does, and the one time this tree set the
+    # ceiling itself it set it to the static split count and switched the
+    # planner off in all but name.
     "ATOM_PA_FLYDSL_PLAN": lambda: (
-        os.getenv("ATOM_PA_FLYDSL_PLAN", "0") == "1"
-    ),
-    # Per-request partition ceiling handed to `plan_pa_decode`. 0 means "leave
-    # the aiter default alone" (MAX_CONTEXT_PARTITIONS), which is what its unit
-    # test and bench do.
-    #
-    # This is NOT the static split count. `get_recommended_splits` documents
-    # itself as "not a variable-work scheduler" and its result must be passed
-    # verbatim to `pa_decode`; the plan's `max_partitions` is an upper bound the
-    # planner then divides under a workgroup budget. Feeding the former into the
-    # latter clamps every request to the static count, so the planner can no
-    # longer give a long request more partitions than a short one.
-    "ATOM_PA_FLYDSL_PLAN_MAX": lambda: int(
-        os.getenv("ATOM_PA_FLYDSL_PLAN_MAX") or 0
-    ),
-    # Cap on dense paged-decode KV splits. 32 is the shipping value and the
-    # only one production aiter supports; raising it is meaningful only
-    # alongside ATOM_PA_FLYDSL=1 on an aiter that carries PR #4332.
-    # `or` not a getenv default: an exported-but-empty var would otherwise
-    # raise int('') at import and take the engine down before it starts.
-    "ATOM_PA_DENSE_SPLIT_MAX": lambda: int(
-        os.getenv("ATOM_PA_DENSE_SPLIT_MAX") or 32
+        os.getenv("ATOM_PA_FLYDSL_PLAN", "1") == "1"
     ),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
