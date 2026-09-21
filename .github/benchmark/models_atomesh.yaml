@@ -311,6 +311,7 @@ models:
           server:
             common_args: &glm52_agentic_mtp_args
               <<: *glm52_agentic_args
+              gpu_memory_utilization: 0.85
               extra_args: "--method mtp --num-speculative-tokens 4 --spec-decode-acceptance-rate 0.5825"
 
         - <<: *glm52_agentic_tp4_tp4
