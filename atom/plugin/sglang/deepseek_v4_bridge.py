@@ -1213,6 +1213,9 @@ class _V4SGLangDecodeGraphBuffers:
         self.indptr_hca = i32(t + 1)
         self.qo_indptr = i32(t + 1)
         self.kv_last_page_lens = i32(t)
+        # Immutable empty extend CSR. Native stages this for the optional
+        # H=128 prefill-ASM decode route; the model always reads the attribute.
+        self.empty_kv_indptr = i32(t + 1)
         self.idx_swa = i32(t * max(1, win))
         self.idx_csa = i32(t * max(1, win + topk))
         self.idx_hca = i32(t * max(1, win + hca))
@@ -1345,6 +1348,24 @@ def _make_decode_graph_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
         running_bs=bufs.decode_running_bs,
         max_q_len=bufs.decode_q_len,
     )
+
+
+def _publish_empty_kv_indptr(md, padded_total: int, *, bufs=None) -> None:
+    """Publish the all-zero extend CSR the V4 decode path always reads.
+
+    Native ATOM stores this on ``AttentionMetaData_DSV4``. The SGLang bridge
+    builds the base ``AttentionMetaData``, which does not declare the field, so
+    ``attn_md.empty_kv_indptr`` raises during CUDA graph capture unless it is
+    attached here. The tensor is unused unless
+    ``ATOM_USE_V4_PREFILL_ASM_FOR_DECODE`` is on.
+    """
+    n = max(0, int(padded_total)) + 1
+    zeros = np.zeros(n, dtype=np.int32)
+    if bufs is not None:
+        md.empty_kv_indptr = bufs.stage(bufs.empty_kv_indptr, zeros, n)
+        return
+    device = md.cu_seqlens_q.device
+    md.empty_kv_indptr = torch.zeros(n, dtype=torch.int32, device=device)
 
 
 def _stage_decode_fp8_page_metadata(md, total: int, padded_total: int, *, bufs=None):
@@ -1754,6 +1775,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.kv_indptr_hca = hca_indptr
     if proxy_pool.use_fp8_kv:
         _stage_decode_fp8_page_metadata(md, total, t_pad, bufs=bufs)
+    _publish_empty_kv_indptr(md, t_pad, bufs=bufs)
     cu_committed_cpu = np.concatenate(
         [
             np.zeros(1, dtype=np.int32),
@@ -2211,6 +2233,7 @@ def build_atom_v4_attention_metadata_from_sglang(
         _populate_decode_indices(md, block_tables, batch_np, pos_np, device)
         if proxy_pool.use_fp8_kv:
             _stage_decode_fp8_page_metadata(md, total, total)
+        _publish_empty_kv_indptr(md, total)
     else:
         _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device)
     _populate_indexer(md, batch_np, positions[:total], device)

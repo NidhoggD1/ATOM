@@ -256,6 +256,7 @@ def _slice_v4_graph_metadata_for_capture(
         "kv_indptr_prefix_swa",
         "kv_indptr_prefix_csa",
         "kv_indptr_prefix_hca",
+        "empty_kv_indptr",
     ):
         _slice_attr(name, num_tokens + 1)
 
