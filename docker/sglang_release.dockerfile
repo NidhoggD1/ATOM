@@ -88,8 +88,17 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
     rm -f /tmp/sglang-runtime-common.txt && \
     TORCH_HIP="$("${VENV_PYTHON}" -c "import torch; print(torch.version.hip or '')")" && \
     test -n "${TORCH_HIP}" && \
-    "${VENV_PYTHON}" -m pip install --no-cache-dir "transformers==5.16.1" && \
-    "${VENV_PYTHON}" -c "import torch, transformers; from transformers import AutoConfig; assert torch.version.hip is not None, 'pip replaced ROCm torch while installing transformers'; assert transformers.__version__ == '5.16.1', transformers.__version__; AutoConfig.for_model('qwen4_exp_text')" && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps "transformers==5.16.1" && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir \
+      "huggingface-hub>=1.5.0,<2.0" \
+      "tokenizers>=0.23.1,<0.24.0" \
+      "safetensors>=0.8.0" \
+      "regex>=2025.10.22" \
+      "typer" \
+      "packaging>=20.0" \
+      "pyyaml>=5.1" \
+      "tqdm>=4.60" && \
+    "${VENV_PYTHON}" -c "import torch, transformers; from transformers import AutoConfig; assert torch.version.hip is not None, 'pip replaced ROCm torch while installing transformers'; assert transformers.__version__ == '5.16.1', transformers.__version__; cfg = AutoConfig.for_model('qwen4_exp_text'); assert cfg.model_type == 'qwen4_exp_text', cfg.model_type" && \
     "${VENV_PYTHON}" -m pip show sglang torch triton transformers IPython orjson pybase64 petit-kernel wave-lang xgrammar outlines apache-tvm-ffi || true
 
 # Keep SGLang aligned with the Triton that the ATOM base image ships.  SGLang
