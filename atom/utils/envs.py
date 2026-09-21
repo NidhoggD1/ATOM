@@ -513,17 +513,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt into aiter #5546's GPU work planner on the FlyDSL decode. Needs
     # ATOM_PA_FLYDSL=1; the planner is refreshed in place each forward.
     #
-    # Default 0 and expected to stay there for this workload. The planner
-    # rebalances partitions across a batch whose KV lengths differ widely, and
-    # bills a refresh every step for it; #5546's own table is 2.15-8.64x on
-    # "one 200003-token request among 257-token ones" but 0.76-0.94x on uniform
-    # batches, and it concludes the data "support using dynamic plans for uneven
-    # KV work, not enabling them universally". An agentic M3 trace is not uneven
-    # enough: end-to-end against the same tree with the planner off, it costs
-    # 3.86% at conc 1, 11.50% at conc 10 and 18.28% at conc 20 -- monotonically
-    # worse with batch, which is the wrong direction for a rebalancer.
+    # Default 0 pending an end-to-end A/B on the corrected wiring below. The
+    # earlier end-to-end loss (7.2% at conc 10, 11.3% at conc 20) was measured
+    # with the planner's ceiling overwritten by the static split count, which
+    # is the one setting that removes its whole mechanism. Micro-benchmarked on
+    # the measured operating points with the ceiling left at the API default,
+    # best static vs best planned is 1.21-3.47x in the planner's favour at the
+    # real context lengths, and 0.91-0.97x at n=5 with short context.
     "ATOM_PA_FLYDSL_PLAN": lambda: (
         os.getenv("ATOM_PA_FLYDSL_PLAN", "0") == "1"
+    ),
+    # Per-request partition ceiling handed to `plan_pa_decode`. 0 means "leave
+    # the aiter default alone" (MAX_CONTEXT_PARTITIONS), which is what its unit
+    # test and bench do.
+    #
+    # This is NOT the static split count. `get_recommended_splits` documents
+    # itself as "not a variable-work scheduler" and its result must be passed
+    # verbatim to `pa_decode`; the plan's `max_partitions` is an upper bound the
+    # planner then divides under a workgroup budget. Feeding the former into the
+    # latter clamps every request to the static count, so the planner can no
+    # longer give a long request more partitions than a short one.
+    "ATOM_PA_FLYDSL_PLAN_MAX": lambda: int(
+        os.getenv("ATOM_PA_FLYDSL_PLAN_MAX") or 0
     ),
     # Cap on dense paged-decode KV splits. 32 is the shipping value and the
     # only one production aiter supports; raising it is meaningful only

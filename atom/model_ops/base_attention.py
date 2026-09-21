@@ -243,9 +243,25 @@ _FLYDSL_PLANS: dict[tuple, object] = {}
 _FLYDSL_PLAN_SCRATCH: dict[tuple, tuple] = {}
 
 
-def _flydsl_work_plan(context_lens, num_kv_heads, max_partitions, query_length,
-                      query_group_size, head_dim, out_dtype):
+def _flydsl_work_plan(context_lens, num_kv_heads, plan_max_partitions,
+                      query_length, query_group_size, head_dim, out_dtype):
     """aiter #5546's GPU work plan plus its scratch, cached per shape.
+
+    `plan_max_partitions` is the planner's per-request CEILING, not the static
+    split count, and 0 means "keep aiter's default" (MAX_CONTEXT_PARTITIONS,
+    from the `plan_pa_decode` signature). They are separate quantities:
+    `get_recommended_splits` hands every request the same count and says so
+    ("not a variable-work scheduler"), while the plan divides a workgroup budget
+    between requests up to this bound. Passing the static count here clamps the
+    long request to the same share as the short ones, which is the planner's
+    entire mechanism.
+
+    Do not take the ceiling from aiter's unit test: it is the only caller of
+    `plan_pa_decode` in the tree and it deliberately binds the two, building the
+    plan from the same count it hands `pa_decode` so that the two paths must
+    agree numerically. That makes it a correctness test that cannot see the
+    conflation. The split is what #5546's author asked for in review on
+    2026-09-21, and it is what the signature already defaults to.
 
     Two things must be allocated once and then only refreshed. The plan, because
     allocation is illegal inside graph capture and a captured graph bakes in the
@@ -268,19 +284,48 @@ def _flydsl_work_plan(context_lens, num_kv_heads, max_partitions, query_length,
     key = (
         int(context_lens.shape[0]),
         int(num_kv_heads),
-        int(max_partitions),
+        int(plan_max_partitions),
         int(query_length),
         int(query_group_size),
         context_lens.device.index,
     )
+    # This path always asks for a dense plan (the call site pins
+    # sliding_window=0), and both the API docstring and the unit test treat a
+    # dense plan as query-length independent: the test passes query_length only
+    # when a window is enabled. The scratch below still uses the real query
+    # length -- that one does depend on it.
+    # Omitted rather than resolved: passing nothing is what takes the signature
+    # default, and the reuse branch then compares that same default against the
+    # cached plan, so a refresh cannot trip "max_partitions must match". The key
+    # carries the raw 0 -- safe because the env is read once per process, and a
+    # changed value lands on a different key rather than on a mismatched plan.
+    kwargs = {} if plan_max_partitions <= 0 else {
+        "max_partitions": int(plan_max_partitions)
+    }
+    cached = _FLYDSL_PLANS.get(key)
     plan = plan_pa_decode(
         context_lens,
         num_kv_heads,
-        max_partitions=max_partitions,
-        query_length=query_length,
-        plan=_FLYDSL_PLANS.get(key),
+        query_length=1,
+        plan=cached,
+        **kwargs,
     )
     _FLYDSL_PLANS[key] = plan
+    if cached is None:
+        # Once per shape, so the volume is bounded by the cache. This is the
+        # only evidence that the planner went where it was meant to: num_seqs
+        # here should stay at batch scale. A sparse call site folds query
+        # tokens in and would show up as thousands, which is what this line
+        # exists to make visible rather than assumed.
+        logger.info(
+            "flydsl work plan built: num_seqs=%d kv_heads=%d max_partitions=%d "
+            "capacity=%d query_group_size=%d",
+            int(context_lens.shape[0]),
+            int(num_kv_heads),
+            int(plan.max_partitions),
+            int(plan.capacity),
+            int(query_group_size),
+        )
 
     scratch = _FLYDSL_PLAN_SCRATCH.get(key)
     rows = query_length * query_group_size
@@ -319,6 +364,7 @@ def run_pa_decode_gluon(
     sinks: torch.Tensor | None = None,
     sliding_window: int = -1,
     ps: bool = True,
+    allow_work_plan: bool = False,
 ):
     """Run the AITER paged-attention decode kernel.
 
@@ -369,19 +415,35 @@ def run_pa_decode_gluon(
 
         work_plan = None
         es, ml, tmp = exp_sums, max_logits, temporary_output
-        # #5546's planner refuses batches past 4096, and M3's sparse call site
-        # folds query tokens into num_seqs (`total_q * Hkv`), which reaches
-        # 32768 on a prefill-as-decode step. Falling back to the static path
+        # #5546's planner refuses batches past 4096. Now that only the dense
+        # site opts in, num_seqs is the real batch and stays far below that, so
+        # this is a net rather than a live path -- it was reached when the
+        # planner still ran on M3's sparse sites, which fold query tokens into
+        # num_seqs (`total_q * Hkv`) and hit 32768 on a prefill-as-decode step.
+        # Keep it: the cap is aiter's, not ours. Falling back to the static path
         # keeps those steps running; letting the planner raise killed a worker
         # ~90 s into the run while the server kept answering /metrics, so the
         # client sat in warmup for 66 minutes waiting on a reply that could
         # never come.
-        if envs.ATOM_PA_FLYDSL_PLAN and flydsl_seqs <= _FLYDSL_PLAN_MAX_BATCH:
+        # `allow_work_plan` is the caller's, the same way the split count is:
+        # each call site already picks its own (`dense_decode_splits` here,
+        # aiter's stock `get_recommended_splits` for the two MiniMax-M3 sparse
+        # sites and for the vLLM/SGLang bridges). The planner belongs on the
+        # same axis -- it rebalances partitions across UNEVEN context lengths,
+        # and a sparse call's lengths are a fixed topk window, so there is
+        # nothing to rebalance and the refresh plus task packing are pure cost.
+        # Measured on uniform batches: 0.56x at B8/257 and 0.84x at B200/200000,
+        # flat from Pmax 4 to 256 -- raising the ceiling does not rescue it.
+        if (
+            envs.ATOM_PA_FLYDSL_PLAN
+            and allow_work_plan
+            and flydsl_seqs <= _FLYDSL_PLAN_MAX_BATCH
+        ):
             nkv = k_cache.shape[1]
             work_plan, (ml, es, tmp) = _flydsl_work_plan(
                 context_lens[:flydsl_seqs],
                 nkv,
-                max_context_partition_num,
+                envs.ATOM_PA_FLYDSL_PLAN_MAX,
                 max_seqlen_q,
                 q.shape[-2] // nkv,
                 q.shape[-1],
@@ -400,7 +462,13 @@ def run_pa_decode_gluon(
             block_tables[:n],
             softmax_scale,
             max_seqlen_q,
-            max_context_partition_num,
+            # A planned call is told the plan's own ceiling -- the only value
+            # `pa_decode` accepts, since it asserts the two are equal. The
+            # static one gets the count `get_recommended_splits` sized the
+            # scratch for.
+            max_context_partition_num
+            if work_plan is None
+            else int(work_plan.max_partitions),
             context_partition_size,
             compute_type,
             q_scale,
