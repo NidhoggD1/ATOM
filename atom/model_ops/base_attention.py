@@ -60,12 +60,9 @@ PA_ASM_MAX_QUERY_GROUP_SIZE = 16
 # reference at 64 than at 8; and 64 is where the C++ PS reduce stops being built
 # at all, with no working fallback under it (see the test that pins this).
 PA_DENSE_SPLIT_TARGET_WG = 128
-# Not a knob. With the work planner on, a planned dense call is told
-# `plan.max_partitions` instead of this, so the cap no longer sets the
-# production partition count -- it survives for the gluon fallback, where both
-# halves of the bound above still hold. Raising it would only enlarge the
-# static scratch that `attention_mha` sizes from it and that a planned call
-# never reads.
+# Not a knob. A planned call is told `plan.max_partitions` instead, so this
+# only bounds the gluon fallback; raising it would just enlarge static scratch
+# a planned call never reads.
 PA_DENSE_SPLIT_MAX = 32
 
 
@@ -248,18 +245,11 @@ def _flydsl_plan_scratch(plan, query_length, query_group_size, head_dim,
                          out_dtype, device):
     """Partial-output buffers for a planned call, allocated once per shape.
 
-    A planned call does NOT use the caller's static buffers: planned output is
-    packed as [kv_heads, plan.capacity, query_rows(, D)] whereas the static API
-    wants [num_seqs, kv_heads, partitions, query_rows(, D)]. Handing over the
-    static ones raises
-
-        ValueError: max_logits shape (2, 1, 64, 64) != (1, 128, 64)
-
-    Sized from the CURRENT capacity and keyed by it, so a refresh that changed
-    the plan's shape gets its own buffers rather than silently overflowing the
-    old ones. Allocation stays here, not in the builder, because the shapes come
-    from the query tensor the op is holding; only the per-step planner kernel
-    moved out.
+    Planned output is packed [kv_heads, capacity, rows(, D)] where the static
+    API wants [num_seqs, kv_heads, partitions, rows(, D)]; passing the static
+    ones raises a shape error. Keyed by capacity so a refresh that resized the
+    plan gets its own buffers. Allocation stays here because the shapes come
+    from the query tensor; only the per-step planner kernel moved out.
     """
     rows = query_length * query_group_size
     want = (int(plan.num_kv_heads), int(plan.capacity), rows)
@@ -302,17 +292,10 @@ def run_pa_decode_gluon(
 ):
     """Run the AITER paged-attention decode kernel.
 
-    Routed to aiter's FlyDSL implementation (aiter PR #4332) wherever FlyDSL's
-    domain covers the call, and to gluon otherwise. MEASUREMENT
-    SWITCH, not a shipping default: the two take the same arguments and compute
-    the same thing, and FlyDSL (aiter PR #4332) is the path.
-
-    The two are not interchangeable everywhere, and the split is structural
-    rather than incidental -- see ``_flydsl_pa_decode_num_seqs``, which mirrors
-    the kernel's own validation. Anything outside FlyDSL's domain falls to
-    gluon there rather than raising from inside aiter, so this is a capability
-    check and not a switch: there is no configuration it turns into an
-    exception.
+    FlyDSL (aiter PR #4332) where its domain covers the call, gluon otherwise.
+    The split is a capability check, not a switch: ``_flydsl_pa_decode_num_seqs``
+    mirrors the kernel's own validation so an unsupported shape falls back here
+    instead of raising from inside aiter.
     """
     flydsl_seqs = _flydsl_pa_decode_num_seqs(
         q=q,
@@ -328,9 +311,9 @@ def run_pa_decode_gluon(
         sliding_window=sliding_window,
         ps=ps,
     )
-    # Report both routes, once per shape signature. A run where every call
-    # quietly lands on gluon is otherwise indistinguishable from one where
-    # FlyDSL simply did not help.
+    # Once per shape signature: a run that quietly fell back to gluon
+    # everywhere is otherwise indistinguishable from one where FlyDSL did not
+    # help.
     sig = (bool(flydsl_seqs), max_seqlen_q, q.shape[0], context_lens.shape[0])
     if sig not in _flydsl_pa_routed:
         _flydsl_pa_routed.add(sig)
@@ -350,12 +333,10 @@ def run_pa_decode_gluon(
 
         work_plan = None
         es, ml, tmp = exp_sums, max_logits, temporary_output
-        # The plan is built once per forward in the metadata builder
-        # (`refresh_flydsl_plan`), not here: it is a function of context_lens
-        # alone, so building it per layer re-ran the planner kernel for each of
-        # M3's three dense layers. `allow_work_plan` keeps the choice with the
-        # caller, the same way the split count already is -- the two sparse call
-        # sites and the vLLM/SGLang bridges never opt in and never look.
+        # Built once per forward by the metadata builder, not here: it is a
+        # function of context_lens alone. `allow_work_plan` keeps the choice
+        # with the caller, as the split count already is -- the sparse sites and
+        # the vLLM/SGLang bridges never opt in.
         if allow_work_plan:
             from atom.utils.forward_context import get_forward_context
 

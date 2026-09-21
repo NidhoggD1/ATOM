@@ -506,25 +506,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_V4_PREFILL_ASM_FOR_DECODE": lambda: (
         os.getenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "0") == "1"
     ),
-    # Opt into aiter #5546's GPU work planner on the FlyDSL decode. The plan is
-    # built once per forward in the metadata builder and refreshed in place, so
-    # it stays capturable.
-    #
-    # Default on. It rebalances partitions across a batch whose KV lengths
-    # differ, which is where this workload's slow requests live: measured on the
-    # agentic trace, SA-convention interactivity (1/itl_p90) is +24.6% at conc
-    # 20 and +8.4% at conc 10, and the gain runs monotonically from the slow
-    # tail to the fast one (p10 +24.6%, p50 +19.3%, p90 +5.0%). Kernel-level it
-    # is a wash at small batch -- the tile kernel gets 11-38% faster but the
-    # planned partial packing makes the PS reduce 14-15% dearer -- so the
-    # end-to-end gain comes from the uneven-length batches, not from more
-    # partitions per se.
-    #
-    # The ceiling is deliberately NOT exposed: `plan_pa_decode`'s own default
-    # (MAX_CONTEXT_PARTITIONS) is what its unit test and bench use, the
-    # workgroup budget binds before it does, and the one time this tree set the
-    # ceiling itself it set it to the static split count and switched the
-    # planner off in all but name.
+    # aiter #5546's GPU work planner, built once per forward in the metadata
+    # builder. On by default: it rebalances partitions across a batch whose KV
+    # lengths differ, worth +24.6% interactivity (1/itl_p90) at conc 20 and
+    # +8.4% at conc 10 on the agentic trace. The ceiling is not exposed -- the
+    # one time this tree set it, it set it to the static split count, which
+    # clamps every request alike and removes the mechanism.
     "ATOM_PA_FLYDSL_PLAN": lambda: (
         os.getenv("ATOM_PA_FLYDSL_PLAN", "1") == "1"
     ),
