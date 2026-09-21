@@ -1,10 +1,14 @@
 import numpy as np
+import pytest
 import torch
 
-from atom.model_ops.attentions.deepseek_v4_attn import (
-    DeepseekV4AttentionMetadataBuilder,
-    _chunk_cu_seqlens,
+attn = pytest.importorskip(
+    "atom.model_ops.attentions.deepseek_v4_attn",
+    reason="the V4 builder's module imports aiter at load",
+    exc_type=ImportError,
 )
+DeepseekV4AttentionMetadataBuilder = attn.DeepseekV4AttentionMetadataBuilder
+_chunk_cu_seqlens = attn._chunk_cu_seqlens
 
 
 def test_chunk_cu_seqlens_cuts_sequences_and_drops_empty_segments():
@@ -14,7 +18,11 @@ def test_chunk_cu_seqlens_cuts_sequences_and_drops_empty_segments():
 
 
 def test_decode_plan_selects_qlen_variant_and_reuses_its_buffers(monkeypatch):
-    from aiter.ops.opus import pa_mqa_logits_mxfp4 as opus
+    opus = pytest.importorskip(
+        "aiter.ops.opus.pa_mqa_logits_mxfp4",
+        reason="the OPUS FP4 MQA extension is not installed",
+        exc_type=ImportError,
+    )
 
     calls = []
 
