@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import nullcontext
+from functools import partial
 
 import torch
 
@@ -211,9 +212,11 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     self._save_executor.submit(
                         self._guard,
                         "save",
-                        self._do_save_req,
+                        partial(
+                            self._do_save_req,
+                            producer_event=save_ready_event,
+                        ),
                         req,
-                        save_ready_event,
                     ),
                 )
 
@@ -336,7 +339,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 total_ms,
             )
 
-    def _do_save_req(self, req: LMCacheReqMeta, producer_event=None) -> None:
+    def _do_save_req(self, req: LMCacheReqMeta, *, producer_event=None) -> None:
         ss = req.save_spec
         assert ss is not None
         toks = req.token_ids
