@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -335,7 +336,7 @@ def test_dense_worker_exact_save_generations_do_not_form_cross_tp_quorum():
             worker._load_executor.shutdown(wait=True)
 
 
-def test_dense_save_waits_for_one_step_producer_event(monkeypatch):
+def test_dense_save_passes_one_step_producer_event_to_every_store(monkeypatch):
     trace = []
     rpc_stream = object()
 
@@ -348,17 +349,12 @@ def test_dense_save_waits_for_one_step_producer_event(monkeypatch):
     monkeypatch.setattr(torch.cuda, "Event", lambda: event)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: rpc_stream)
 
-    class GPUConnector:
-        def wait_for_save_source(self, producer_event):
-            assert producer_event is event
-            trace.append(("wait", producer_event))
-
     class Engine:
-        gpu_connector = GPUConnector()
+        gpu_connector = object()
 
         @staticmethod
-        def store(_tokens, **_kwargs):
-            trace.append(("store", None))
+        def store(_tokens, **kwargs):
+            trace.append(("store", kwargs["producer_event"]))
 
     worker = DenseOffloadConnector(_config("kv_producer"))
     worker.chunk_size = 8
@@ -382,16 +378,64 @@ def test_dense_save_waits_for_one_step_producer_event(monkeypatch):
 
         assert trace[0] == ("record", event)
         assert trace[1:] == [
-            ("wait", event),
-            ("store", None),
-            ("wait", event),
-            ("store", None),
+            ("store", event),
+            ("store", event),
         ]
     finally:
         worker.close()
 
 
-def test_block_gpu_connector_waits_on_pack_stream_without_host_sync():
+def test_dense_save_fence_failure_does_not_drop_the_step_load(monkeypatch):
+    load_operation = LoadOperationId(req_id=33, generation=1)
+    save_operation = SaveOperationId(req_id=33, generation=1)
+
+    class Event:
+        @staticmethod
+        def record(_stream):
+            raise RuntimeError("sticky HIP error")
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", object)
+
+    worker = DenseOffloadConnector(_config("kv_both"))
+    worker.chunk_size = 8
+    worker._engine = SimpleNamespace(
+        gpu_connector=object(),
+        lookup_unpin=lambda _req_id: None,
+        store=lambda *_args, **_kwargs: pytest.fail(
+            "an unfenced save must not be submitted"
+        ),
+    )
+    metadata = LMCacheOffloadMetadata()
+    metadata.add_request(
+        LMCacheReqMeta(
+            req_id=33,
+            token_ids=list(range(8)),
+            block_ids=[3],
+            load_spec=LoadSpec(
+                hbm_cached_tokens=0,
+                lmcache_cached_tokens=0,
+                can_load=True,
+            ),
+            save_spec=SaveSpec(skip_leading_tokens=0),
+            load_operation=load_operation,
+            save_operation=save_operation,
+        )
+    )
+
+    try:
+        worker.start_load_kv(metadata)
+        worker.close()
+        output = worker.get_finished()
+
+        assert output.finished_loading == {load_operation}
+        assert output.failed_loading == set()
+        assert output.finished_saving == {save_operation}
+    finally:
+        worker.close()
+
+
+def test_block_gpu_connector_waits_on_actual_pack_stream_without_host_sync():
     trace = []
     producer_event = SimpleNamespace(
         synchronize=lambda: pytest.fail("producer event must not host-synchronize")
@@ -399,12 +443,24 @@ def test_block_gpu_connector_waits_on_pack_stream_without_host_sync():
     pack_stream = SimpleNamespace(
         wait_event=lambda event: trace.append(("wait", event))
     )
+    state = SimpleNamespace(pack_stream=pack_stream, copy_stream=object())
     connector = BlockGPUConnector.__new__(BlockGPUConnector)
-    connector._thread_state = lambda: SimpleNamespace(pack_stream=pack_stream)
+    connector._capture_transfer_stats = lambda: nullcontext({})
+    connector._prepare_transfer = lambda *_args, **_kwargs: (state, [object()])
+    connector._record_transfer_shape = lambda *_args: None
+    connector._prepare_block_id_stage = lambda *_args: (object(), None, False)
+    connector._run_staged_pipeline = lambda *_args, **_kwargs: trace.append(
+        ("pipeline", None)
+    )
 
-    connector.wait_for_save_source(producer_event)
+    connector.batched_from_gpu(
+        [object()],
+        [0],
+        [8],
+        producer_event=producer_event,
+    )
 
-    assert trace == [("wait", producer_event)]
+    assert trace == [("wait", producer_event), ("pipeline", None)]
 
 
 @pytest.mark.parametrize("outcome", ["exception", "miss"])

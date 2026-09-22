@@ -434,17 +434,10 @@ class BlockGPUConnector:
             states[key] = state
         return state
 
-    def wait_for_save_source(self, producer_event) -> None:
-        """Order this thread's pack stream after the KV producer stream.
+    @staticmethod
+    def _wait_for_save_source(state, producer_event) -> None:
+        """Order the actual pack stream after the KV producer stream."""
 
-        Dense saves run on a background executor while the KV writes they read
-        were issued on the model/RPC stream. Enqueueing the event dependency on
-        the thread-local pack stream preserves that ordering without blocking
-        the CPU save worker. The following ``batched_from_gpu`` call runs on
-        the same thread and therefore reuses this stream state.
-        """
-
-        state = self._thread_state()
         if state.pack_stream is None:
             producer_event.synchronize()
             return
@@ -901,6 +894,7 @@ class BlockGPUConnector:
         memory_objs: list[Any],
         starts: list[int],
         ends: list[int],
+        producer_event=None,
         **kwargs,
     ) -> None:
         """Pack ATOM KV blocks tail-to-head into LMCache MemoryObjs."""
@@ -918,6 +912,8 @@ class BlockGPUConnector:
                     state, groups, "gpu_to_chunk_major_device_buffer"
                 )
             )
+            if producer_event is not None:
+                self._wait_for_save_source(state, producer_event)
             copy_stream = state.pack_stream if _SINGLE_STREAM else state.copy_stream
             self._run_staged_pipeline(
                 state,

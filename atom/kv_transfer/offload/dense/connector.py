@@ -188,14 +188,6 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             if str(lookup_id) not in loading_lookup_ids:
                 self._lookup_unpin(lookup_id)
         save_ready_event = None
-        if self._do_save and any(
-            req.save_spec is not None for req in metadata.requests
-        ):
-            # Save metadata is dispatched after the producing forward. Record
-            # that stream here so the background pack stream cannot read KV
-            # blocks before their writes are complete.
-            save_ready_event = torch.cuda.Event()
-            save_ready_event.record(torch.cuda.current_stream())
         for req in metadata.requests:
             # The futures are tracked, not discarded: `wait_for_requests` fences
             # them when vLLM preempts a request and reuses its blocks.
@@ -207,6 +199,22 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     ),
                 )
             if req.save_spec is not None and self._do_save:
+                if save_ready_event is None:
+                    # Save metadata is dispatched after the producing forward.
+                    # Create the shared step fence lazily so a HIP error here
+                    # rejects only this save; loads from the step must still be
+                    # submitted and report a terminal result.
+                    try:
+                        candidate_event = torch.cuda.Event()
+                        candidate_event.record(torch.cuda.current_stream())
+                        save_ready_event = candidate_event
+                    except Exception:
+                        logger.exception(
+                            "LMCache offload: dense save fence creation failed req=%s",
+                            req.req_id,
+                        )
+                        self._record_save_failure(req)
+                        continue
                 self._track_job(
                     req.req_id,
                     self._save_executor.submit(
@@ -358,21 +366,24 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         t_store0 = time.perf_counter()
         self._reset_gpu_connector_transfer_stats()
         gpu_connector = self._engine.gpu_connector
-        if producer_event is not None:
-            gpu_connector.wait_for_save_source(producer_event)
         track_source = getattr(gpu_connector, "track_save_source", None)
         source_context = (
             track_source(req.save_operation)
             if getattr(self, "_early_release", False) and callable(track_source)
             else nullcontext()
         )
+        store_kwargs = {
+            "mask": mask,
+            "block_ids": req.block_ids,
+            "req_id": str(req.req_id),
+        }
+        if producer_event is not None:
+            # LMCache forwards extra store kwargs to batched_from_gpu(). The
+            # connector can therefore fence the pack stream on the thread that
+            # actually reads KV, even if LMCache changes its dispatch model.
+            store_kwargs["producer_event"] = producer_event
         with source_context:
-            self._engine.store(
-                tok_tensor,
-                mask=mask,
-                block_ids=req.block_ids,
-                req_id=str(req.req_id),
-            )
+            self._engine.store(tok_tensor, **store_kwargs)
         store_ms = (time.perf_counter() - t_store0) * 1000
         transfer_stats = self._last_gpu_connector_transfer_stats()
         total_ms = (time.perf_counter() - t_total0) * 1000
