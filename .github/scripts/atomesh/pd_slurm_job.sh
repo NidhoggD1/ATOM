@@ -320,10 +320,21 @@ EOF
   )
 
   local docker_rc
+  # Spur returns worker stdout/stderr in a size-limited RPC response. Keep
+  # unbounded container output on shared NFS, not in the scheduler response.
+  echo "[logs] rank=${rank} phase=${execution_phase} full log: ${rank_dir}/${container_log}"
   set +e
-  docker "${docker_args[@]}" 2>&1 | tee "${rank_dir}/${container_log}"
-  docker_rc="${PIPESTATUS[0]}"
+  docker "${docker_args[@]}" > "${rank_dir}/${container_log}" 2>&1
+  docker_rc=$?
   set -e
+  echo "[logs] rank=${rank} phase=${execution_phase} exited rc=${docker_rc}"
+  if [[ "${docker_rc}" -ne 0 ]]; then
+    echo "[logs] last 16384 bytes of ${rank_dir}/${container_log}:" >&2
+    # Bound bytes rather than lines: benchmark progress and JSON can produce
+    # arbitrarily long lines. Diagnostics must not replace the Docker status.
+    tail -c 16384 -- "${rank_dir}/${container_log}" >&2 || true
+    printf '\n' >&2
+  fi
   return "${docker_rc}"
 }
 
