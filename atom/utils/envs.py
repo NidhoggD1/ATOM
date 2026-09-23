@@ -519,6 +519,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_V4_PREFILL_ASM_FOR_DECODE": lambda: (
         os.getenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "0") == "1"
     ),
+    # Route the paged decode to aiter's FlyDSL kernel (#4332) instead of gluon.
+    "ATOM_PA_FLYDSL": lambda: (os.getenv("ATOM_PA_FLYDSL", "0") == "1"),
+    # FlyDSL GPU work planner, built once per forward in the metadata
+    # builder. Needs ATOM_PA_FLYDSL=1. On by default so enabling FlyDSL gets the
+    # measured configuration (+20.5% interactivity at conc 20).
+    "ATOM_PA_FLYDSL_PLAN": lambda: (os.getenv("ATOM_PA_FLYDSL_PLAN", "1") == "1"),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
