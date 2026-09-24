@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -340,14 +341,21 @@ def test_dense_worker_exact_save_generations_do_not_form_cross_tp_quorum():
 def test_dense_save_passes_one_step_producer_event_to_every_store(monkeypatch):
     trace = []
     rpc_stream = object()
+    rpc_thread = threading.get_ident()
+    events = []
 
     class Event:
+        def __init__(self):
+            events.append(self)
+
         def record(self, stream):
+            # The fence is recorded once, on the dispatching RPC thread, so a
+            # save thread never records its own (unordered) event.
+            assert threading.get_ident() == rpc_thread
             assert stream is rpc_stream
             trace.append(("record", self))
 
-    event = Event()
-    monkeypatch.setattr(torch.cuda, "Event", lambda: event)
+    monkeypatch.setattr(torch.cuda, "Event", Event)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: rpc_stream)
 
     class Engine:
@@ -377,11 +385,38 @@ def test_dense_save_passes_one_step_producer_event_to_every_store(monkeypatch):
         worker.start_load_kv(metadata)
         worker.close()
 
+        assert len(events) == 1
+        event = events[0]
         assert trace[0] == ("record", event)
         assert trace[1:] == [
             ("store", event),
             ("store", event),
         ]
+    finally:
+        worker.close()
+
+
+def test_guard_forwards_keyword_arguments_and_logs_function_name(caplog):
+    worker = DenseOffloadConnector(_config("kv_producer"))
+    seen = []
+
+    def fail_save(req, *, producer_event):
+        seen.append((req.req_id, producer_event))
+        raise RuntimeError("boom")
+
+    request = LMCacheReqMeta(
+        req_id=41,
+        token_ids=list(range(8)),
+        block_ids=[1],
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        save_operation=SaveOperationId(req_id=41, generation=0),
+    )
+    try:
+        with caplog.at_level("ERROR", logger="atom"):
+            worker._guard("save", fail_save, request, producer_event="fence")
+        assert seen == [(41, "fence")]
+        assert "fail_save failed for 41" in caplog.text
+        assert worker.get_finished().finished_saving == {request.save_operation}
     finally:
         worker.close()
 
@@ -465,6 +500,7 @@ def test_dense_save_fence_failure_does_not_drop_the_step_load(monkeypatch):
 
 def test_block_gpu_connector_waits_on_actual_pack_stream_without_host_sync():
     trace = []
+    stats = {}
     producer_event = SimpleNamespace(
         synchronize=lambda: pytest.fail("producer event must not host-synchronize")
     )
@@ -473,10 +509,17 @@ def test_block_gpu_connector_waits_on_actual_pack_stream_without_host_sync():
     )
     state = SimpleNamespace(pack_stream=pack_stream, copy_stream=object())
     connector = BlockGPUConnector.__new__(BlockGPUConnector)
-    connector._capture_transfer_stats = lambda: nullcontext({})
+    connector._capture_transfer_stats = lambda: nullcontext(stats)
     connector._prepare_transfer = lambda *_args, **_kwargs: (state, [object()])
     connector._record_transfer_shape = lambda *_args: None
-    connector._prepare_block_id_stage = lambda *_args: (object(), None, False)
+
+    def prepare_block_id_stage(*_args):
+        # The block-ID upload is the first pack-stream work of a transfer; it
+        # must already be ordered behind the producer.
+        trace.append(("block_ids", None))
+        return object(), None, False
+
+    connector._prepare_block_id_stage = prepare_block_id_stage
     connector._run_staged_pipeline = lambda *_args, **_kwargs: trace.append(
         ("pipeline", None)
     )
@@ -488,7 +531,27 @@ def test_block_gpu_connector_waits_on_actual_pack_stream_without_host_sync():
         producer_event=producer_event,
     )
 
-    assert trace == [("wait", producer_event), ("pipeline", None)]
+    assert trace == [
+        ("wait", producer_event),
+        ("block_ids", None),
+        ("pipeline", None),
+    ]
+    assert stats["producer_fenced"] == 1
+
+
+def test_block_gpu_connector_producer_event_is_keyword_only():
+    connector = BlockGPUConnector.__new__(BlockGPUConnector)
+    with pytest.raises(TypeError):
+        connector.batched_from_gpu([object()], [0], [8], object())
+
+
+def test_block_gpu_connector_refuses_producer_fence_without_pack_stream():
+    producer_event = SimpleNamespace(
+        synchronize=lambda: pytest.fail("must not fall back to host sync")
+    )
+    state = SimpleNamespace(pack_stream=None, copy_stream=None)
+    with pytest.raises(RuntimeError, match="pack stream"):
+        BlockGPUConnector._wait_for_save_source(state, producer_event)
 
 
 @pytest.mark.parametrize("outcome", ["exception", "miss"])

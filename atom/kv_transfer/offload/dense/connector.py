@@ -13,11 +13,19 @@ Design:
   (``K=(nb,H,D//x,bs,x)``). We pass an ATOM ``GPUConnectorInterface``
   implementation that moves opaque per-block bytes with
   :class:`DenseKVByteCodec`.
-* **Daemon-after-forward copies** — ``start_load_kv`` only ``submit``s to a single
-  serial copy daemon (ThreadPoolExecutor max_workers=1) and returns immediately, so
-  the worker RPC thread is free for ``forward``; completions are polled in
-  ``get_finished`` (called post-forward by ``async_proc_aggregation``). This is the
-  fix for 005's "load blocks/starves prefill" (corr(TTFT, prefill-conc)=0.773).
+* **Daemon-after-forward copies** — ``start_load_kv`` records at most one CUDA
+  event per save-bearing step and otherwise only ``submit``s to a single serial
+  copy daemon (ThreadPoolExecutor max_workers=1) and returns immediately, so the
+  worker RPC thread is free for ``forward``; completions are polled in
+  ``get_finished`` (called post-forward by ``async_proc_aggregation``). This is
+  the fix for 005's "load blocks/starves prefill" (corr(TTFT, prefill-conc)=0.773).
+* **Producer fence for saves** — the scheduler emits a save only for chunks
+  whose forward has already run, but a non-final prefill chunk yields no token,
+  so nothing host-synchronizes on that forward before the next step dispatches
+  metadata. The event recorded here on the dispatching stream is therefore the
+  only ordering between the producing kernels and the save thread's pack
+  stream; it travels through ``engine.store(**kwargs)`` to
+  ``BlockGPUConnector.batched_from_gpu``.
 * **Cross-process hit lookup** — scheduler (EngineCore process) queries worker hits
   via LMCache's ZMQ ``LookupClient``/``LookupServer`` (no homegrown mirror).
 """
@@ -27,7 +35,6 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import nullcontext
-from functools import partial
 
 import torch
 
@@ -205,7 +212,11 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     self._record_save_failure(req, source_quiescent=True)
                     continue
                 if save_ready_event is None:
-                    # Save metadata is dispatched after the producing forward.
+                    # Metadata is dispatched before this step's forward, but the
+                    # scheduler's save frontier (`build_connector_meta`) covers
+                    # only chunks whose forward already ran, so an event
+                    # recorded on the current stream now is ordered after the
+                    # kernels that produced every token in this step's saves.
                     # Create the shared step fence lazily so a HIP error here
                     # rejects this step's saves; loads must still be submitted
                     # and report a terminal result.
@@ -229,11 +240,9 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     self._save_executor.submit(
                         self._guard,
                         "save",
-                        partial(
-                            self._do_save_req,
-                            producer_event=save_ready_event,
-                        ),
+                        self._do_save_req,
                         req,
+                        producer_event=save_ready_event,
                     ),
                 )
 
@@ -406,9 +415,11 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             "req_id": str(req.req_id),
         }
         if producer_event is not None:
-            # LMCache forwards extra store kwargs to batched_from_gpu(). The
-            # connector can therefore fence the pack stream on the thread that
-            # actually reads KV, even if LMCache changes its dispatch model.
+            # LMCache forwards extra store kwargs to batched_from_gpu(), which
+            # enqueues the wait on the pack stream of whichever thread reads
+            # KV. This is the one cross-repo assumption of the fence:
+            # `producer_fenced` in the transfer stats reports whether the
+            # connector actually saw the event.
             store_kwargs["producer_event"] = producer_event
         with source_context:
             self._engine.store(tok_tensor, **store_kwargs)
@@ -421,8 +432,8 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 "chunks=%d groups=%d max_chunk_bytes=%d max_group_bytes=%d "
                 "gpu_staging_chunk_bytes=%d "
                 "gpu_staging_buffer_chunks=%d gpu_staging_buffer_bytes=%d "
-                "total_bytes=%d pack_ms=%.2f copy_ms=%.2f sync_ms=%.2f "
-                "transfer_ms=%.2f effective_gbps=%.2f "
+                "total_bytes=%d producer_fenced=%d pack_ms=%.2f copy_ms=%.2f "
+                "sync_ms=%.2f transfer_ms=%.2f effective_gbps=%.2f "
                 "store_ms=%.2f total_ms=%.2f",
                 getattr(self, "_rank", "?"),
                 req.req_id,
@@ -436,6 +447,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 int(transfer_stats.get("gpu_staging_buffer_chunks", 0)),
                 int(transfer_stats.get("gpu_staging_buffer_bytes", 0)),
                 int(transfer_stats.get("total_bytes", 0)),
+                int(transfer_stats.get("producer_fenced", 0)),
                 float(transfer_stats.get("pack_ms", 0.0)),
                 float(transfer_stats.get("copy_ms", 0.0)),
                 float(transfer_stats.get("sync_ms", 0.0)),
