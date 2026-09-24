@@ -47,6 +47,7 @@ from atom.kv_transfer.offload._offload_common import (
     validated_kv_role,
 )
 from atom.kv_transfer.offload.chunked_scheduler import (
+    DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL,
     DENSE_PAGE_SOURCE_SAFE_CHANNEL,
     DENSE_PAGE_STORE_CHANNEL,
     ChunkedOffloadSchedulerBase,
@@ -188,6 +189,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             if str(lookup_id) not in loading_lookup_ids:
                 self._lookup_unpin(lookup_id)
         save_ready_event = None
+        save_fence_failed = False
         for req in metadata.requests:
             # The futures are tracked, not discarded: `wait_for_requests` fences
             # them when vLLM preempts a request and reuses its blocks.
@@ -199,21 +201,28 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     ),
                 )
             if req.save_spec is not None and self._do_save:
+                if save_fence_failed:
+                    self._record_save_failure(req, source_quiescent=True)
+                    continue
                 if save_ready_event is None:
                     # Save metadata is dispatched after the producing forward.
                     # Create the shared step fence lazily so a HIP error here
-                    # rejects only this save; loads from the step must still be
-                    # submitted and report a terminal result.
+                    # rejects this step's saves; loads must still be submitted
+                    # and report a terminal result.
                     try:
                         candidate_event = torch.cuda.Event()
                         candidate_event.record(torch.cuda.current_stream())
                         save_ready_event = candidate_event
+                        self._save_fence_failure_logged = False
                     except Exception:
-                        logger.exception(
-                            "LMCache offload: dense save fence creation failed req=%s",
-                            req.req_id,
-                        )
-                        self._record_save_failure(req)
+                        save_fence_failed = True
+                        if not getattr(self, "_save_fence_failure_logged", False):
+                            logger.exception(
+                                "LMCache offload: dense save fence creation failed req=%s",
+                                req.req_id,
+                            )
+                            self._save_fence_failure_logged = True
+                        self._record_save_failure(req, source_quiescent=True)
                         continue
                 self._track_job(
                     req.req_id,
@@ -258,11 +267,30 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                         succeeded,
                     )
                 )
+                if succeeded:
+                    self._connector_completions.add(
+                        ConnectorCompletion(
+                            DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL, operation, True
+                        )
+                    )
             return
         with self._lock:
             self._done_save.add(self._save_completion_id(req))
 
-    def _record_save_failure(self, req) -> None:
+    def _record_save_failure(self, req, *, source_quiescent=False) -> None:
+        if (
+            source_quiescent
+            and getattr(self, "_early_release", False)
+            and isinstance(req.save_operation, SaveOperationId)
+        ):
+            with self._lock:
+                self._connector_completions.add(
+                    ConnectorCompletion(
+                        DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL,
+                        req.save_operation,
+                        True,
+                    )
+                )
         self._record_store_terminal(req, False)
 
     def _do_load_req(self, req: LMCacheReqMeta) -> None:

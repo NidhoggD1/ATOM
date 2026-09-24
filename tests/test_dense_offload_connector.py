@@ -12,6 +12,7 @@ from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnectorScheduler,
 )
 from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
     KVConnectorOutput,
     LoadOperationId,
     SaveOperationId,
@@ -388,10 +389,13 @@ def test_dense_save_passes_one_step_producer_event_to_every_store(monkeypatch):
 def test_dense_save_fence_failure_does_not_drop_the_step_load(monkeypatch):
     load_operation = LoadOperationId(req_id=33, generation=1)
     save_operation = SaveOperationId(req_id=33, generation=1)
+    second_save_operation = SaveOperationId(req_id=34, generation=2)
+    record_calls = []
 
     class Event:
         @staticmethod
         def record(_stream):
+            record_calls.append(1)
             raise RuntimeError("sticky HIP error")
 
     monkeypatch.setattr(torch.cuda, "Event", Event)
@@ -422,6 +426,15 @@ def test_dense_save_fence_failure_does_not_drop_the_step_load(monkeypatch):
             save_operation=save_operation,
         )
     )
+    metadata.add_request(
+        LMCacheReqMeta(
+            req_id=34,
+            token_ids=list(range(8)),
+            block_ids=[4],
+            save_spec=SaveSpec(skip_leading_tokens=0),
+            save_operation=second_save_operation,
+        )
+    )
 
     try:
         worker.start_load_kv(metadata)
@@ -430,7 +443,22 @@ def test_dense_save_fence_failure_does_not_drop_the_step_load(monkeypatch):
 
         assert output.finished_loading == {load_operation}
         assert output.failed_loading == set()
-        assert output.finished_saving == {save_operation}
+        assert record_calls == [1]
+        assert output.finished_saving == {save_operation, second_save_operation}
+        assert (
+            ConnectorCompletion("dense.page.store", save_operation, False)
+            in output.connector_completions
+        )
+        assert (
+            ConnectorCompletion("dense.page.source_quiescent", save_operation, True)
+            in output.connector_completions
+        )
+        assert (
+            ConnectorCompletion(
+                "dense.page.source_quiescent", second_save_operation, True
+            )
+            in output.connector_completions
+        )
     finally:
         worker.close()
 
