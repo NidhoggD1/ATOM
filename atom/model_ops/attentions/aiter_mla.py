@@ -55,11 +55,13 @@ from atom.model_ops.sparse_indexer_fp4 import (
     FP4_MQA_PARALLEL_UNIT_NUM,
     fp4_decode_parallel_units,
     fp4_decode_schedule,
+    fp4_index_scale_rows,
     fp4_prefill_schedule,
     sparse_indexer_fp4_enabled,
 )
 from atom.utils import CpuGpuBuffer, envs, upload_numpy
 from atom.utils.block_convert import (
+    decompose_slots_triton,
     kv_indices_generate_triton,
     mtp_prepare_decode_mla_kernel,
 )
@@ -405,6 +407,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.dcp_rank = get_dcp_rank()
         self._publishes_dcp_local_lens = self.is_sparse and self.dcp_world_size > 1
         self._tbo_full_running_bs = 0
+        # e8m0 row-swizzle table for decompose_slots_triton. Compile the kernel
+        # now: warmup never reaches a long DCP prefill.
+        self._fp4_scale_row_lut = None
+        if self._indexer_fp4 and self.dcp_world_size > 1:
+            block = model_runner.block_size
+            rows = torch.arange(block, dtype=torch.int32, device=self.device)
+            self._fp4_scale_row_lut = fp4_index_scale_rows(rows, block)
+            decompose_slots_triton(rows[:1], 1, block, self._fp4_scale_row_lut)
 
         # DCP decode all-gathers Q on the head dim, so the head count reaching
         # mla_decode_fwd (and thus the persistent decode metadata) is the padded
@@ -1709,6 +1719,28 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.dcp_indexer_fp4_local_slots = torch.from_numpy(
             slots.astype(np.int32)
         ).to(dev, non_blocking=True)
+
+        # Page / row / e8m0 row for the DCP FP4 staging gather. They depend only
+        # on `slots` and `total_kv`, so build them once per forward, not per layer.
+        read, stage = "dcp_indexer_fp4_read", "dcp_indexer_fp4_stage"
+        slots_dev = attn_metadata.dcp_indexer_fp4_local_slots
+        lut = getattr(self, "_fp4_scale_row_lut", None)
+        if lut is not None:
+            idx = decompose_slots_triton(slots_dev, total_kv, block, lut)
+        else:
+            # Torch fallback (CPU / test builders); also the kernel's reference.
+            token = torch.arange(total_kv, dtype=torch.int32, device=dev)
+            idx = []
+            for src in (slots_dev, token):
+                page, row = src // block, src % block
+                idx += [page, row, fp4_index_scale_rows(row, block)]
+        names = [
+            f"{side}_{part}"
+            for side in (read, stage)
+            for part in ("page", "row", "scale_row")
+        ]
+        for name, tensor in zip(names, idx):
+            setattr(attn_metadata, name, tensor)
 
         # Fixed width, not `pages`: the scorer specializes on this table's
         # stride, so a per-batch width recompiles it. Sized at a whole batch's
