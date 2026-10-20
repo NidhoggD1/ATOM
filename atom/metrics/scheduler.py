@@ -14,6 +14,7 @@ import numpy as np
 from prometheus_client import Gauge, Histogram
 
 from atom.metrics.histogram import LATENCY_BUCKETS
+from atom.observability import tracing
 
 BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024)
 TOKEN_BUCKETS = (
@@ -123,6 +124,7 @@ class SchedulerMetrics:
 
     @staticmethod
     def enqueue(seq, *, received_at: float | None = None) -> None:
+        tracing.enqueue(seq, received_at=received_at)
         # The input thread stamps receipt before buffering the request. Keep
         # that timestamp when the scheduler drains the input queue later.
         # Direct scheduler users fall back to their admission time.
@@ -175,6 +177,7 @@ class SchedulerMetrics:
         context_lens = getattr(batch, "context_lens", None)
         for i, req_id in enumerate(batch.req_ids):
             seq = seqs[req_id]
+            tracing.forward(seq, is_decode=i < batch.total_seqs_num_decode)
             timing = getattr(seq, "queue_timing", None)
             if timing is None:
                 continue

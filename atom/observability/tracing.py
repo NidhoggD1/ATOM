@@ -1,0 +1,437 @@
+"""Opt-in, bounded request tracing for the standalone aggregate engine.
+
+Only primitives cross the request socket. The scheduler records monotonic
+boundaries and exports completed spans once per sequence, never per token.
+No GPU operations, prompt text, generated text, or exception messages are read.
+"""
+
+from __future__ import annotations
+
+import atexit
+import logging
+import os
+import threading
+import time
+from contextvars import ContextVar
+from dataclasses import dataclass
+
+logger = logging.getLogger("atom")
+_ENABLED = os.getenv("ATOM_ENABLE_OTEL_TRACE", "0").lower() in {"1", "true"}
+_provider = None
+_provider_pid = None
+_init_failed_pid = None
+_lock = threading.Lock()
+_warned = False
+_request: ContextVar = ContextVar("atom_otel_request", default=None)
+
+
+def _after_fork():
+    global _provider, _provider_pid, _lock, _init_failed_pid
+    _provider = None
+    _provider_pid = None
+    _init_failed_pid = None
+    _lock = threading.Lock()
+    _request.set(None)
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork)
+
+
+def _warn_once():
+    global _warned
+    if not _warned:
+        _warned = True
+        # Do not log exception text: exporter URLs can contain credentials.
+        logger.warning("ATOM trace operation failed; inference continues")
+
+
+def _tracer():
+    global _provider, _provider_pid, _init_failed_pid
+    pid = os.getpid()
+    if not _ENABLED or _init_failed_pid == pid:
+        return None
+    if _provider_pid != pid:
+        with _lock:
+            if _provider_pid != pid:
+                try:
+                    from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+                        OTLPSpanExporter,
+                    )
+                    from opentelemetry.sdk.resources import Resource
+                    from opentelemetry.sdk.trace import TracerProvider
+                    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+                    from opentelemetry.sdk.trace.sampling import ALWAYS_ON
+
+                    endpoint = os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+                    if not endpoint:
+                        raise ValueError("Explicit HTTP trace endpoint required")
+                    provider = TracerProvider(
+                        # Full engine spans feed spanmetrics BEFORE collector
+                        # tail sampling, including upstream sampled=0 requests.
+                        sampler=ALWAYS_ON,
+                        resource=Resource.create(
+                            {
+                                "service.name": os.getenv("OTEL_SERVICE_NAME", "atom"),
+                                "service.instance.id": f"{os.uname().nodename}:{pid}",
+                                "atom.version": os.getenv(
+                                    "ATOM_TRACE_VERSION", "unknown"
+                                ),
+                            }
+                        ),
+                        shutdown_on_exit=False,
+                    )
+                    provider.add_span_processor(
+                        BatchSpanProcessor(
+                            OTLPSpanExporter(endpoint=endpoint, timeout=1),
+                            max_queue_size=8192,
+                            max_export_batch_size=512,
+                            schedule_delay_millis=1000,
+                        )
+                    )
+                    _provider = provider
+                    _provider_pid = pid
+                    atexit.register(shutdown)
+                except Exception:  # noqa: BLE001 - telemetry must not fail inference
+                    _init_failed_pid = pid
+                    _warn_once()
+                    return None
+    return _provider.get_tracer("atom.standalone")
+
+
+def shutdown():
+    """Flush only this process's provider, off any inference request path."""
+    if _provider is not None and _provider_pid == os.getpid():
+        try:
+            _provider.force_flush(timeout_millis=2000)
+            _provider.shutdown()
+        except Exception:  # noqa: BLE001 - best-effort shutdown
+            _warn_once()
+
+
+@dataclass
+class SequenceTiming:
+    # Pure values: safe to pickle. Never an SDK span, tracer, lock or context.
+    epoch_ns: int
+    monotonic_ns: int
+    forward_ns: int | None = None
+    prefill_end_ns: int | None = None
+    first_token_ns: int | None = None
+    decode_ns: int | None = None
+    done: bool = False
+
+    def now(self):
+        return self.epoch_ns + (time.perf_counter_ns() - self.monotonic_ns)
+
+
+def bind_sequences(seqs):
+    """Runs on the API event-loop thread, before CoreManager serializes ADD."""
+    if not _ENABLED:
+        return
+    request = _request.get()
+    if request is None:
+        return
+    for seq in seqs:
+        # This PoC does not claim distributed P/D timing. Its two schedulers
+        # need distinct span identities and a transfer boundary first.
+        if (getattr(seq, "kv_transfer_params", None) or {}).get(
+            "do_remote_prefill"
+        ) or (getattr(seq, "kv_transfer_params", None) or {}).get("do_remote_decode"):
+            request["span"].set_attribute("atom.trace.unsupported", "pd")
+            continue
+        seq._atom_trace_carrier = dict(request["carrier"])
+        seq._atom_trace_model = request["model"]
+        seq._atom_trace_request_id = request.get("request_id")
+        seq._atom_trace_timing = None
+
+
+def set_request_id(request_id):
+    if not _ENABLED:
+        return
+    request = _request.get()
+    if request is not None:
+        request["request_id"] = str(request_id)
+        try:
+            request["span"].set_attribute("gen_ai.request.id", str(request_id))
+        except Exception:  # noqa: BLE001 - request metadata is best effort
+            _warn_once()
+
+
+def enqueue(seq, *, received_at=None):
+    if not _ENABLED or not getattr(seq, "_atom_trace_carrier", None):
+        return
+    if getattr(seq, "_atom_trace_timing", None) is not None:
+        return
+    mono = time.perf_counter_ns()
+    epoch = time.time_ns()
+    received = mono if received_at is None else int(received_at * 1e9)
+    seq._atom_trace_timing = SequenceTiming(epoch - (mono - received), received)
+
+
+def forward(seq, *, is_decode):
+    if not _ENABLED:
+        return
+    timing = getattr(seq, "_atom_trace_timing", None)
+    if timing is None or timing.done:
+        return
+    if timing.forward_ns is None:
+        timing.forward_ns = timing.now()
+        if is_decode:
+            timing.decode_ns = timing.forward_ns
+
+
+def prefill_complete(seq):
+    if not _ENABLED:
+        return
+    timing = getattr(seq, "_atom_trace_timing", None)
+    if (
+        timing is not None
+        and timing.forward_ns is not None
+        and timing.prefill_end_ns is None
+    ):
+        timing.prefill_end_ns = timing.now()
+
+
+def first_token(seq):
+    if not _ENABLED:
+        return
+    timing = getattr(seq, "_atom_trace_timing", None)
+    if timing is not None and timing.first_token_ns is None:
+        timing.first_token_ns = timing.now()
+
+
+def _completed(tracer, name, parent, start, end, attributes, failed):
+    from opentelemetry.trace import Status, StatusCode
+
+    span = tracer.start_span(
+        name, context=parent, start_time=start, attributes=attributes
+    )
+    if failed:
+        span.set_status(Status(StatusCode.ERROR))
+    span.end(end_time=max(start, end))
+    return span
+
+
+def finish(seq, *, reason, num_tokens=None):
+    if not _ENABLED:
+        return
+    timing = getattr(seq, "_atom_trace_timing", None)
+    if timing is None or timing.done:
+        return
+    timing.done = True
+    end = timing.now()
+    try:
+        tracer = _tracer()
+        if tracer is None:
+            return
+        from opentelemetry.propagators.textmap import DefaultGetter
+        from opentelemetry.trace import set_span_in_context
+        from opentelemetry.trace.propagation.tracecontext import (
+            TraceContextTextMapPropagator,
+        )
+
+        context = TraceContextTextMapPropagator().extract(
+            seq._atom_trace_carrier, getter=DefaultGetter()
+        )
+        prompt_tokens = int(seq.num_prompt_tokens)
+        finalized = (
+            num_tokens
+            if num_tokens is not None
+            else getattr(seq, "num_finalized_tokens", prompt_tokens)
+        )
+        request_id = (
+            getattr(seq, "_atom_trace_request_id", None)
+            or getattr(seq, "external_request_id", None)
+            or getattr(seq, "parent_request_id", None)
+            or str(seq.id)
+        )
+        failed = reason not in {
+            "stop",
+            "length",
+            "eos",
+            "max_tokens",
+        } and not reason.startswith("stop_")
+        normalized_reason = (
+            "stop" if reason.startswith("stop_") else reason.split(":", 1)[0]
+        )
+        attributes = {
+            "gen_ai.request.id": str(request_id),
+            "atom.sequence.id": str(seq.id),
+            "gen_ai.response.model": getattr(seq, "_atom_trace_model", "unknown"),
+            "gen_ai.response.finish_reasons": [normalized_reason],
+            "gen_ai.usage.prompt_tokens": prompt_tokens,
+            "gen_ai.usage.completion_tokens": max(0, int(finalized) - prompt_tokens),
+            "gen_ai.usage.cached_tokens": int(
+                getattr(seq, "prefix_cache_hit_tokens", 0)
+            ),
+            "gen_ai.latency.e2e": (end - timing.epoch_ns) / 1e9,
+        }
+        if failed:
+            attributes["error.type"] = reason.split(":", 1)[0]
+        queue_end = timing.forward_ns or end
+        attributes["gen_ai.latency.time_in_queue"] = (queue_end - timing.epoch_ns) / 1e9
+        if timing.first_token_ns is not None:
+            attributes["gen_ai.latency.time_to_first_token"] = (
+                timing.first_token_ns - timing.epoch_ns
+            ) / 1e9
+        if timing.forward_ns is not None and timing.decode_ns is None:
+            attributes["gen_ai.latency.time_in_model_prefill"] = (
+                (timing.prefill_end_ns or end) - timing.forward_ns
+            ) / 1e9
+        decode_start = timing.decode_ns or timing.prefill_end_ns
+        if decode_start is not None and int(finalized) - prompt_tokens > 1:
+            attributes["gen_ai.latency.time_in_model_decode"] = (
+                end - decode_start
+            ) / 1e9
+        # Completed spans preserve the actual boundaries while avoiding live
+        # spans across scheduler iterations, preemption, and request pickling.
+        root = tracer.start_span(
+            "engine.request",
+            context=context,
+            start_time=timing.epoch_ns,
+            attributes=attributes,
+        )
+        parent = set_span_in_context(root)
+        _completed(
+            tracer,
+            "prefill_waiting",
+            parent,
+            timing.epoch_ns,
+            queue_end,
+            attributes,
+            failed,
+        )
+        if timing.forward_ns is not None and timing.decode_ns is None:
+            prefill_end = timing.prefill_end_ns or end
+            _completed(
+                tracer,
+                "prefill_forward",
+                parent,
+                timing.forward_ns,
+                prefill_end,
+                attributes,
+                failed,
+            )
+        else:
+            prefill_end = None
+        decode_start = timing.decode_ns or prefill_end
+        if (
+            decode_start is not None
+            and decode_start < end
+            and int(finalized) - prompt_tokens > 1
+        ):
+            _completed(
+                tracer, "decode_forward", parent, decode_start, end, attributes, failed
+            )
+        if failed:
+            from opentelemetry.trace import Status, StatusCode
+
+            root.set_status(Status(StatusCode.ERROR))
+        root.end(end_time=end)
+    except Exception:  # noqa: BLE001 - telemetry must not fail inference
+        _warn_once()
+
+
+class TraceMiddleware:
+    """Request lifetime includes SSE body delivery and disconnect teardown."""
+
+    def __init__(self, app, model=lambda: "unknown"):
+        self.app = app
+        self.model = model
+
+    async def __call__(self, scope, receive, send):
+        if (
+            not _ENABLED
+            or scope["type"] != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path")
+            not in {
+                "/v1/chat/completions",
+                "/v1/completions",
+                "/v1/messages",
+                "/v1/responses",
+            }
+        ):
+            await self.app(scope, receive, send)
+            return
+        span = None
+        token = None
+        response_complete = False
+        try:
+            tracer = _tracer()
+            if tracer is not None:
+                from opentelemetry.trace import SpanKind, set_span_in_context
+                from opentelemetry.trace.propagation.tracecontext import (
+                    TraceContextTextMapPropagator,
+                )
+
+                propagator = TraceContextTextMapPropagator()
+                headers = {
+                    k.decode("latin1").lower(): v.decode("latin1")
+                    for k, v in scope.get("headers", [])
+                    if k.lower() in {b"traceparent", b"tracestate"}
+                }
+                model = str(self.model() or "unknown")
+                span = tracer.start_span(
+                    "atom.request",
+                    context=propagator.extract(headers),
+                    kind=SpanKind.SERVER,
+                    attributes={
+                        "http.request.method": "POST",
+                        "http.route": scope["path"],
+                        "gen_ai.response.model": model,
+                    },
+                )
+                carrier = {}
+                propagator.inject(carrier, context=set_span_in_context(span))
+                token = _request.set({"span": span, "carrier": carrier, "model": model})
+        except Exception:  # noqa: BLE001 - telemetry must not fail HTTP handling
+            _warn_once()
+
+        async def traced_send(message):
+            nonlocal response_complete
+            if span is not None and message["type"] == "http.response.start":
+                try:
+                    span.set_attribute("http.response.status_code", message["status"])
+                    if message["status"] >= 400:
+                        from opentelemetry.trace import Status, StatusCode
+
+                        span.set_status(Status(StatusCode.ERROR))
+                except Exception:  # noqa: BLE001 - preserve response delivery
+                    _warn_once()
+            # Starlette can notify its receive listener of disconnect after
+            # the final body. That is normal completion, not a client abort.
+            # Set this before send: a disconnect may race with its await.
+            if message["type"] == "http.response.body" and not message.get(
+                "more_body", False
+            ):
+                response_complete = True
+            await send(message)
+
+        async def traced_receive():
+            message = await receive()
+            if (
+                span is not None
+                and message["type"] == "http.disconnect"
+                and not response_complete
+            ):
+                from opentelemetry.trace import Status, StatusCode
+
+                span.set_attribute("error.type", "client_disconnect")
+                span.set_status(Status(StatusCode.ERROR))
+            return message
+
+        try:
+            await self.app(scope, traced_receive, traced_send)
+        except BaseException as exc:
+            if span is not None:
+                from opentelemetry.trace import Status, StatusCode
+
+                span.set_attribute("error.type", type(exc).__name__)
+                span.set_status(Status(StatusCode.ERROR))
+            raise
+        finally:
+            if token is not None:
+                _request.reset(token)
+            if span is not None:
+                span.end()

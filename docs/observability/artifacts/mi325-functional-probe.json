@@ -1,0 +1,47 @@
+{
+  "valid": true,
+  "cases": [
+    {
+      "case": "cache-cold",
+      "trace_id": "4d271f3202514ff2536bdfd63668f3e9",
+      "response_id": "cmpl-31c15310d6e244beab5c8b075c3a5df3",
+      "usage": {
+        "prompt_tokens": 1024,
+        "completion_tokens": 4,
+        "total_tokens": 1028,
+        "ttft_s": 0.0494,
+        "tpot_s": 0.0076,
+        "latency_s": 0.0723
+      },
+      "output_sha256": "b4d3d2fe0626d1b07b1b9c3774ae82083a8862f78e773e90ef5f4ab5cb0d168e",
+      "trace_cached_tokens": 0,
+      "response_cached_tokens": null
+    },
+    {
+      "case": "cache-hot-sampled-zero",
+      "trace_id": "df372cf419dcfac59cc0652ea8144df3",
+      "response_id": "cmpl-4ffaf8da59e146bb9379f171d1109b4f",
+      "usage": {
+        "prompt_tokens": 1024,
+        "completion_tokens": 4,
+        "total_tokens": 1028,
+        "ttft_s": 0.0269,
+        "tpot_s": 0.0075,
+        "latency_s": 0.0495
+      },
+      "output_sha256": "b4d3d2fe0626d1b07b1b9c3774ae82083a8862f78e773e90ef5f4ab5cb0d168e",
+      "trace_cached_tokens": 1008,
+      "response_cached_tokens": null
+    },
+    {
+      "case": "invalid-model",
+      "trace_id": "bc0a5db54096a05a3f41be65538aa6ba",
+      "status": 400
+    },
+    {
+      "case": "stream-abort",
+      "trace_id": "27927328798e87fda55315b7dee6a872"
+    }
+  ],
+  "scope": "GPU inference functional probes after timed measurements"
+}

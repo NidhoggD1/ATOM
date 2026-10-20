@@ -1,0 +1,163 @@
+[
+  {
+    "attributes": {
+      "gen_ai.request.id": "cmpl-8dc4b15832534609b7b992d659a76817",
+      "gen_ai.response.model": "atom-otel-poc",
+      "http.request.method": "POST",
+      "http.response.status_code": 200,
+      "http.route": "/v1/completions"
+    },
+    "end_ns": 1792436914518932826,
+    "name": "atom.request",
+    "parent_span_id": "00f067aa0ba902b7",
+    "resource": {
+      "atom.version": "53e4fb52+otel-poc",
+      "service.instance.id": "sample-api",
+      "service.name": "atom",
+      "telemetry.sdk.language": "python",
+      "telemetry.sdk.name": "opentelemetry",
+      "telemetry.sdk.version": "1.40.0"
+    },
+    "span_id": "f7afd64b8b82be8a",
+    "start_ns": 1792436904990752519,
+    "status_code": 0,
+    "trace_id": "fbdf8c550002644aa90b0cbffd12b6df",
+    "trace_state": "nsdye=1"
+  },
+  {
+    "attributes": {
+      "atom.sequence.id": "455",
+      "gen_ai.latency.e2e": 9.510405473,
+      "gen_ai.latency.time_in_model_decode": 2.169768431,
+      "gen_ai.latency.time_in_model_prefill": 0.236115994,
+      "gen_ai.latency.time_in_queue": 7.104521048,
+      "gen_ai.latency.time_to_first_token": 7.561720019,
+      "gen_ai.request.id": "cmpl-8dc4b15832534609b7b992d659a76817",
+      "gen_ai.response.finish_reasons": [
+        "max_tokens"
+      ],
+      "gen_ai.response.model": "atom-otel-poc",
+      "gen_ai.usage.cached_tokens": 0,
+      "gen_ai.usage.completion_tokens": 128,
+      "gen_ai.usage.prompt_tokens": 8192
+    },
+    "end_ns": 1792436914507044900,
+    "name": "engine.request",
+    "parent_span_id": "f7afd64b8b82be8a",
+    "resource": {
+      "atom.version": "53e4fb52+otel-poc",
+      "service.instance.id": "sample-engine",
+      "service.name": "atom",
+      "telemetry.sdk.language": "python",
+      "telemetry.sdk.name": "opentelemetry",
+      "telemetry.sdk.version": "1.40.0"
+    },
+    "span_id": "135dbc898b096fd9",
+    "start_ns": 1792436904996639427,
+    "status_code": 0,
+    "trace_id": "fbdf8c550002644aa90b0cbffd12b6df",
+    "trace_state": "nsdye=1"
+  },
+  {
+    "attributes": {
+      "atom.sequence.id": "455",
+      "gen_ai.latency.e2e": 9.510405473,
+      "gen_ai.latency.time_in_model_decode": 2.169768431,
+      "gen_ai.latency.time_in_model_prefill": 0.236115994,
+      "gen_ai.latency.time_in_queue": 7.104521048,
+      "gen_ai.latency.time_to_first_token": 7.561720019,
+      "gen_ai.request.id": "cmpl-8dc4b15832534609b7b992d659a76817",
+      "gen_ai.response.finish_reasons": [
+        "max_tokens"
+      ],
+      "gen_ai.response.model": "atom-otel-poc",
+      "gen_ai.usage.cached_tokens": 0,
+      "gen_ai.usage.completion_tokens": 128,
+      "gen_ai.usage.prompt_tokens": 8192
+    },
+    "end_ns": 1792436912101160475,
+    "name": "prefill_waiting",
+    "parent_span_id": "135dbc898b096fd9",
+    "resource": {
+      "atom.version": "53e4fb52+otel-poc",
+      "service.instance.id": "sample-engine",
+      "service.name": "atom",
+      "telemetry.sdk.language": "python",
+      "telemetry.sdk.name": "opentelemetry",
+      "telemetry.sdk.version": "1.40.0"
+    },
+    "span_id": "db4e7db0b9ee7648",
+    "start_ns": 1792436904996639427,
+    "status_code": 0,
+    "trace_id": "fbdf8c550002644aa90b0cbffd12b6df",
+    "trace_state": "nsdye=1"
+  },
+  {
+    "attributes": {
+      "atom.sequence.id": "455",
+      "gen_ai.latency.e2e": 9.510405473,
+      "gen_ai.latency.time_in_model_decode": 2.169768431,
+      "gen_ai.latency.time_in_model_prefill": 0.236115994,
+      "gen_ai.latency.time_in_queue": 7.104521048,
+      "gen_ai.latency.time_to_first_token": 7.561720019,
+      "gen_ai.request.id": "cmpl-8dc4b15832534609b7b992d659a76817",
+      "gen_ai.response.finish_reasons": [
+        "max_tokens"
+      ],
+      "gen_ai.response.model": "atom-otel-poc",
+      "gen_ai.usage.cached_tokens": 0,
+      "gen_ai.usage.completion_tokens": 128,
+      "gen_ai.usage.prompt_tokens": 8192
+    },
+    "end_ns": 1792436912337276469,
+    "name": "prefill_forward",
+    "parent_span_id": "135dbc898b096fd9",
+    "resource": {
+      "atom.version": "53e4fb52+otel-poc",
+      "service.instance.id": "sample-engine",
+      "service.name": "atom",
+      "telemetry.sdk.language": "python",
+      "telemetry.sdk.name": "opentelemetry",
+      "telemetry.sdk.version": "1.40.0"
+    },
+    "span_id": "3d6af0415d5cab5f",
+    "start_ns": 1792436912101160475,
+    "status_code": 0,
+    "trace_id": "fbdf8c550002644aa90b0cbffd12b6df",
+    "trace_state": "nsdye=1"
+  },
+  {
+    "attributes": {
+      "atom.sequence.id": "455",
+      "gen_ai.latency.e2e": 9.510405473,
+      "gen_ai.latency.time_in_model_decode": 2.169768431,
+      "gen_ai.latency.time_in_model_prefill": 0.236115994,
+      "gen_ai.latency.time_in_queue": 7.104521048,
+      "gen_ai.latency.time_to_first_token": 7.561720019,
+      "gen_ai.request.id": "cmpl-8dc4b15832534609b7b992d659a76817",
+      "gen_ai.response.finish_reasons": [
+        "max_tokens"
+      ],
+      "gen_ai.response.model": "atom-otel-poc",
+      "gen_ai.usage.cached_tokens": 0,
+      "gen_ai.usage.completion_tokens": 128,
+      "gen_ai.usage.prompt_tokens": 8192
+    },
+    "end_ns": 1792436914507044900,
+    "name": "decode_forward",
+    "parent_span_id": "135dbc898b096fd9",
+    "resource": {
+      "atom.version": "53e4fb52+otel-poc",
+      "service.instance.id": "sample-engine",
+      "service.name": "atom",
+      "telemetry.sdk.language": "python",
+      "telemetry.sdk.name": "opentelemetry",
+      "telemetry.sdk.version": "1.40.0"
+    },
+    "span_id": "2af7071c76d9d965",
+    "start_ns": 1792436912337276469,
+    "status_code": 0,
+    "trace_id": "fbdf8c550002644aa90b0cbffd12b6df",
+    "trace_state": "nsdye=1"
+  }
+]

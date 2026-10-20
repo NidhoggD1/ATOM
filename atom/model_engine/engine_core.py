@@ -31,6 +31,7 @@ from atom.model_engine.sequence import (
     new_block_table,
 )
 from atom.model_engine.state_runtime import StateRuntime
+from atom.observability import tracing
 from atom.utils import (
     engine_process_name,
     envs,
@@ -443,6 +444,8 @@ class EngineCore:
             except Exception:
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
+
+            tracing.shutdown()
 
     def _process_engine_step(self):
         try:
@@ -935,6 +938,8 @@ class DPEngineCoreProc(EngineCore):
             except Exception:
                 logger.exception("KV event publish during DP shutdown failed")
             self.scheduler.shutdown_kv_events()
+
+            tracing.shutdown()
 
     def _execute_dummy_batch(self):
         return self.runner_mgr.call_func("dummy_execution", wait_out=True)

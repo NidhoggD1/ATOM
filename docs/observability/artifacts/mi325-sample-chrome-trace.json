@@ -1,0 +1,121 @@
+{
+  "traceEvents": [
+    {
+      "name": "atom.request",
+      "cat": "ATOM",
+      "ph": "X",
+      "ts": 0.0,
+      "dur": 9528180.307,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "gen_ai.request.id": "cmpl-8dc4b15832534609b7b992d659a76817",
+        "gen_ai.response.model": "atom-otel-poc",
+        "http.request.method": "POST",
+        "http.response.status_code": 200,
+        "http.route": "/v1/completions"
+      }
+    },
+    {
+      "name": "engine.request",
+      "cat": "ATOM",
+      "ph": "X",
+      "ts": 5886.908,
+      "dur": 9510405.473,
+      "pid": 1,
+      "tid": 2,
+      "args": {
+        "atom.sequence.id": "455",
+        "gen_ai.latency.e2e": 9.510405473,
+        "gen_ai.latency.time_in_model_decode": 2.169768431,
+        "gen_ai.latency.time_in_model_prefill": 0.236115994,
+        "gen_ai.latency.time_in_queue": 7.104521048,
+        "gen_ai.latency.time_to_first_token": 7.561720019,
+        "gen_ai.request.id": "cmpl-8dc4b15832534609b7b992d659a76817",
+        "gen_ai.response.finish_reasons": [
+          "max_tokens"
+        ],
+        "gen_ai.response.model": "atom-otel-poc",
+        "gen_ai.usage.cached_tokens": 0,
+        "gen_ai.usage.completion_tokens": 128,
+        "gen_ai.usage.prompt_tokens": 8192
+      }
+    },
+    {
+      "name": "prefill_waiting",
+      "cat": "ATOM",
+      "ph": "X",
+      "ts": 5886.908,
+      "dur": 7104521.048,
+      "pid": 1,
+      "tid": 3,
+      "args": {
+        "atom.sequence.id": "455",
+        "gen_ai.latency.e2e": 9.510405473,
+        "gen_ai.latency.time_in_model_decode": 2.169768431,
+        "gen_ai.latency.time_in_model_prefill": 0.236115994,
+        "gen_ai.latency.time_in_queue": 7.104521048,
+        "gen_ai.latency.time_to_first_token": 7.561720019,
+        "gen_ai.request.id": "cmpl-8dc4b15832534609b7b992d659a76817",
+        "gen_ai.response.finish_reasons": [
+          "max_tokens"
+        ],
+        "gen_ai.response.model": "atom-otel-poc",
+        "gen_ai.usage.cached_tokens": 0,
+        "gen_ai.usage.completion_tokens": 128,
+        "gen_ai.usage.prompt_tokens": 8192
+      }
+    },
+    {
+      "name": "prefill_forward",
+      "cat": "ATOM",
+      "ph": "X",
+      "ts": 7110407.956,
+      "dur": 236115.994,
+      "pid": 1,
+      "tid": 4,
+      "args": {
+        "atom.sequence.id": "455",
+        "gen_ai.latency.e2e": 9.510405473,
+        "gen_ai.latency.time_in_model_decode": 2.169768431,
+        "gen_ai.latency.time_in_model_prefill": 0.236115994,
+        "gen_ai.latency.time_in_queue": 7.104521048,
+        "gen_ai.latency.time_to_first_token": 7.561720019,
+        "gen_ai.request.id": "cmpl-8dc4b15832534609b7b992d659a76817",
+        "gen_ai.response.finish_reasons": [
+          "max_tokens"
+        ],
+        "gen_ai.response.model": "atom-otel-poc",
+        "gen_ai.usage.cached_tokens": 0,
+        "gen_ai.usage.completion_tokens": 128,
+        "gen_ai.usage.prompt_tokens": 8192
+      }
+    },
+    {
+      "name": "decode_forward",
+      "cat": "ATOM",
+      "ph": "X",
+      "ts": 7346523.95,
+      "dur": 2169768.431,
+      "pid": 1,
+      "tid": 5,
+      "args": {
+        "atom.sequence.id": "455",
+        "gen_ai.latency.e2e": 9.510405473,
+        "gen_ai.latency.time_in_model_decode": 2.169768431,
+        "gen_ai.latency.time_in_model_prefill": 0.236115994,
+        "gen_ai.latency.time_in_queue": 7.104521048,
+        "gen_ai.latency.time_to_first_token": 7.561720019,
+        "gen_ai.request.id": "cmpl-8dc4b15832534609b7b992d659a76817",
+        "gen_ai.response.finish_reasons": [
+          "max_tokens"
+        ],
+        "gen_ai.response.model": "atom-otel-poc",
+        "gen_ai.usage.cached_tokens": 0,
+        "gen_ai.usage.completion_tokens": 128,
+        "gen_ai.usage.prompt_tokens": 8192
+      }
+    }
+  ],
+  "displayTimeUnit": "ms"
+}

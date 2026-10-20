@@ -38,6 +38,7 @@ from atom.model_engine.engine_utility import (
 from atom.model_engine.prefix_hash import take_shipped_chains
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
+from atom.observability import tracing
 from atom.utils import (
     envs,
     get_open_zmq_inproc_path,
@@ -931,6 +932,7 @@ class CoreManager:
             )
 
     def add_request(self, seqs: list[Sequence]):
+        tracing.bind_sequences(seqs)
         logger.debug(
             f"{self.label}: Add request, sequence ids: {[seq.id for seq in seqs]}"
         )
