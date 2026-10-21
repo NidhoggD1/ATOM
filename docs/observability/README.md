@@ -2,8 +2,8 @@
 
 This experimental, opt-in implementation propagates W3C trace context from the
 standalone HTTP server into the engine scheduler and exports request phases over
-OTLP/HTTP. It is disabled by default. The measured scope and open issues are in
-[the MI325 PoC report](mi325-poc.md).
+OTLP/HTTP. It is disabled by default. Validation results, performance measurements and
+trace examples are retained in [PR #2644](https://github.com/ROCm/ATOM/pull/2644).
 
 ## Enable in an isolated service
 
@@ -106,4 +106,4 @@ trees, public IDs, usage, zero cached tokens, phase continuity and dye/parent
 propagation. Do not apply that cold-input check to a cache-hit experiment.
 
 PD is explicitly marked unsupported by this PoC. Multi-GPU TP/DP, PP, MTP,
-other models and additional HTTP APIs are not GPU-qualified by the MI325 report.
+other models and additional HTTP APIs are not GPU-qualified by the MI325 validation recorded in the PR.
