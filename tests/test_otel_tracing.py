@@ -29,6 +29,9 @@ def spans(monkeypatch):
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     monkeypatch.setattr(tracing, "_ENABLED", True)
     monkeypatch.setattr(tracing, "_provider", provider)
+    monkeypatch.setattr(
+        tracing, "_cached_tracer", provider.get_tracer("atom.standalone")
+    )
     monkeypatch.setattr(tracing, "_provider_pid", os.getpid())
     monkeypatch.setattr(tracing, "_init_failed_pid", None)
     monkeypatch.setattr(tracing, "_warned", False)
@@ -290,9 +293,10 @@ def test_disabled_path_does_not_load_sdk(monkeypatch):
     assert not hasattr(seq, "_atom_trace_carrier")
 
 
-def test_pd_is_marked_unsupported_not_misattributed(spans):
+@pytest.mark.parametrize("direction", ["do_remote_prefill", "do_remote_decode"])
+def test_pd_is_marked_unsupported_not_misattributed(spans, direction):
     async def app(scope, receive, send):
-        seq = sequence(kv_transfer_params={"do_remote_prefill": True})
+        seq = sequence(kv_transfer_params={direction: True})
         tracing.bind_sequences([seq])
         assert not hasattr(seq, "_atom_trace_carrier")
 
@@ -305,6 +309,9 @@ def test_exporter_initialization_failure_preserves_request(monkeypatch):
     monkeypatch.setattr(tracing, "_provider_pid", None)
     monkeypatch.setattr(tracing, "_init_failed_pid", None)
     monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
+    monkeypatch.setattr(tracing, "_cached_tracer", None)
+    tracing.initialize()
+    tracing.initialize()  # failure is sticky until restart
     called = []
 
     async def app(scope, receive, send):
@@ -363,3 +370,184 @@ def test_public_request_id_survives_add_carrier(spans, clock):
         s.attributes["gen_ai.request.id"] == "cmpl-public-id"
         for s in spans.get_finished_spans()
     )
+
+
+@pytest.mark.parametrize("phase", ["queue", "prefill", "decode"])
+def test_abort_marks_only_running_phase_and_root(spans, clock, phase):
+    async def app(scope, receive, send):
+        seq = sequence()
+        tracing.bind_sequences([seq])
+        tracing.enqueue(seq)
+        clock[0] += 1_000_000_000
+        if phase != "queue":
+            tracing.forward(seq, is_decode=False)
+            clock[0] += 1_000_000_000
+        if phase == "decode":
+            tracing.prefill_complete(seq)
+            tracing.first_token(seq)
+            clock[0] += 1_000_000_000
+        # Even an abort before the second output token has a decode phase.
+        tracing.finish(
+            seq, reason="aborted", num_tokens=101 if phase == "decode" else 100
+        )
+
+    execute(app)
+    result = {s.name: s for s in spans.get_finished_spans()}
+    active = {
+        "queue": "prefill_waiting",
+        "prefill": "prefill_forward",
+        "decode": "decode_forward",
+    }[phase]
+    assert {
+        name
+        for name, span in result.items()
+        if span.status.status_code == StatusCode.ERROR
+    } == {"engine.request", active}
+    for name, span in result.items():
+        assert ("error.type" in span.attributes) == (name in {"engine.request", active})
+
+
+@pytest.mark.parametrize(
+    "completion_tokens,decode_delay", [(1, 0), (1, 1), (4, 0), (4, 1)]
+)
+def test_latency_attributes_match_exported_phase_boundaries(
+    spans, clock, completion_tokens, decode_delay
+):
+    async def app(scope, receive, send):
+        seq = sequence()
+        tracing.bind_sequences([seq])
+        tracing.enqueue(seq)
+        clock[0] += 1_000_000_000
+        tracing.forward(seq, is_decode=False)
+        clock[0] += 1_000_000_000
+        tracing.prefill_complete(seq)
+        clock[0] += decode_delay * 1_000_000_000
+        tracing.finish(seq, reason="max_tokens", num_tokens=100 + completion_tokens)
+
+    execute(app)
+    result = {s.name: s for s in spans.get_finished_spans()}
+    root = result["engine.request"]
+    for name, attribute in tracing._PHASE_LATENCY.items():
+        assert (name in result) == (attribute in root.attributes)
+        if name in result:
+            span = result[name]
+            assert root.attributes[attribute] == (span.end_time - span.start_time) / 1e9
+    # Collecting usage across all spans must count each sequence exactly once.
+    assert (
+        sum(
+            s.attributes.get("gen_ai.usage.completion_tokens", 0)
+            for s in result.values()
+        )
+        == completion_tokens
+    )
+    for name in tracing._PHASE_LATENCY.keys() & result.keys():
+        assert set(result[name].attributes) == {
+            "gen_ai.request.id",
+            "atom.sequence.id",
+            "gen_ai.response.model",
+        }
+
+
+def test_request_and_finish_never_initialize_sdk(monkeypatch, clock):
+    monkeypatch.setattr(tracing, "_ENABLED", True)
+    monkeypatch.setattr(tracing, "_provider_pid", None)
+    monkeypatch.setattr(tracing, "_cached_tracer", None)
+    monkeypatch.setattr(
+        tracing, "initialize", lambda: pytest.fail("hot-path SDK initialization")
+    )
+    import builtins
+
+    original_import = builtins.__import__
+    imports = []
+
+    def import_module(name, *a, **k):
+        if name.startswith("opentelemetry"):
+            imports.append(name)
+            raise ImportError("unexpected hot-path SDK import")
+        return original_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", import_module)
+
+    async def app(scope, receive, send):
+        seq = sequence(
+            _atom_trace_carrier={"traceparent": f"00-{TRACE_ID}-{PARENT_ID}-01"}
+        )
+        tracing.enqueue(seq)
+        tracing.finish(seq, reason="max_tokens")
+
+    execute(app)
+    assert imports == []
+
+
+def test_initialize_caches_tracer_and_resets_after_fork(monkeypatch):
+    from opentelemetry.exporter.otlp.proto.http import trace_exporter
+
+    monkeypatch.setattr(tracing, "_ENABLED", True)
+    for name in ("_provider", "_cached_tracer", "_provider_pid", "_init_failed_pid"):
+        monkeypatch.setattr(tracing, name, None)
+    monkeypatch.setattr(tracing, "_lock", tracing.threading.Lock())
+    monkeypatch.setenv(
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://127.0.0.1:1/v1/traces"
+    )
+    exporters = []
+
+    def exporter(**kwargs):
+        exporters.append(InMemorySpanExporter())
+        return exporters[-1]
+
+    monkeypatch.setattr(trace_exporter, "OTLPSpanExporter", exporter)
+    tracing.initialize()
+    provider = tracing._provider
+    tracer = tracing._tracer()
+    monkeypatch.setattr(
+        provider, "get_tracer", lambda *a: pytest.fail("tracer recreated")
+    )
+    tracing.initialize()
+    assert tracing._tracer() is tracer
+    assert len(exporters) == 1
+    tracing._after_fork()
+    try:
+        assert tracing._tracer() is None
+        assert tracing._cached_tracer is None
+        assert tracing._request.get() is None
+        tracing.initialize()
+        assert tracing._tracer() is not tracer
+        assert len(exporters) == 2
+    finally:
+        tracing.shutdown()
+        provider.shutdown()
+
+
+def test_shutdown_still_closes_provider_after_flush_failure(monkeypatch):
+    calls = []
+
+    def flush(**kwargs):
+        calls.append("flush")
+        raise RuntimeError("flush failed")
+
+    monkeypatch.setattr(
+        tracing,
+        "_provider",
+        SimpleNamespace(force_flush=flush, shutdown=lambda: calls.append("shutdown")),
+    )
+    monkeypatch.setattr(tracing, "_provider_pid", os.getpid())
+    monkeypatch.setattr(tracing, "_cached_tracer", object())
+    tracing.shutdown()
+    tracing.shutdown()
+    assert calls == ["flush", "shutdown"]
+    assert tracing._tracer() is None
+
+
+def test_disabled_batch_hooks_do_not_visit_sequences(monkeypatch):
+    monkeypatch.setattr(tracing, "_ENABLED", False)
+
+    class UnusedBatch:
+        def __getattribute__(self, name):
+            pytest.fail("disabled tracing inspected a batch")
+
+    class UnusedSequences:
+        def __iter__(self):
+            pytest.fail("disabled tracing iterated sequences")
+
+    tracing.enqueue_many(UnusedSequences())
+    tracing.record_forward(UnusedBatch(), UnusedSequences())

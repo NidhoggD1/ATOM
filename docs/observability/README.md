@@ -63,16 +63,24 @@ pure GPU execution time. Engine first retained token time is recorded separately
 from final prompt-chunk completion. Single-output-token requests omit decode;
 requests cancelled while waiting omit phases that never executed.
 
-Attributes include the response model, normalized finish reason, prompt/output/
-cached tokens, queue/first-token/prefill/decode/end-to-end latency and errors.
+The `engine.request` span holds the response model, normalized finish reason,
+prompt/output/cached tokens, queue/first-token/prefill/decode/end-to-end latency
+and errors.
 Prompt text, generated text and raw exception messages are not exported.
-Normal SSE final-body completion is distinguished from early disconnect.
+Phase spans carry only request/sequence/model correlation and, on the phase
+active at an abnormal termination, `error.type` and ERROR status. Completed
+phases keep their normal status; usage and aggregate latency attributes are
+not copied to children. An omitted phase also has no corresponding root phase
+latency attribute. Normal SSE final-body completion is distinguished from early
+disconnect.
 
 ## Export and sampling behavior
 
 With the flag off, the module does not import the OpenTelemetry SDK. With it on,
-each emitting process owns a provider with `ALWAYS_ON` sampling, including when
-the incoming parent is `sampled=0`. The original trace ID and tracestate are
+the API lifespan initializes its provider on a startup worker thread, and each
+engine initializes its provider before READY. Request and scheduler paths only
+read a cached process-local tracer. Each emitting process owns a provider with
+`ALWAYS_ON` sampling, including when the incoming parent is `sampled=0`. The original trace ID and tracestate are
 preserved; newly recorded children may have the sampled bit set. This deliberate
 policy allows a downstream collector to calculate full phase spanmetrics before
 applying its own retention sampling.
@@ -105,5 +113,12 @@ records output hashes without text, and measures the complete closed-loop drain.
 trees, public IDs, usage, zero cached tokens, phase continuity and dye/parent
 propagation. Do not apply that cold-input check to a cache-hit experiment.
 
-PD is explicitly marked unsupported by this PoC. Multi-GPU TP/DP, PP, MTP,
-other models and additional HTTP APIs are not GPU-qualified by the MI325 validation recorded in the PR.
+Both connector-based and same-node P/D are explicitly marked
+`atom.trace.unsupported=pd` on the HTTP span and omit engine phase spans.
+Multi-GPU TP/DP, PP, MTP, other models and additional HTTP APIs are not
+GPU-qualified by the MI325 validation recorded in the PR.
+
+The review fixes after `072ef555` have CPU regression coverage, including PP
+phase accounting, but have not been rerun on a GPU. The MI325 performance
+measurements linked above apply to the earlier measured implementation; they
+are not a performance result for this revision. PP remains GPU-unqualified.

@@ -11,6 +11,7 @@ import json
 import multiprocessing
 import os
 import pickle
+import subprocess
 import sys
 import threading
 import time
@@ -33,6 +34,7 @@ from otlp_sink import receiver
 
 
 def engine_process(payload):
+    tracing.initialize()
     seq = pickle.loads(payload)
     tracing.enqueue(seq)
     time.sleep(0.002)
@@ -99,3 +101,27 @@ def test_spawned_worker_otlp_preserves_parent_and_dye(spans, monkeypatch, tmp_pa
         assert row["start_ns"] <= row["end_ns"]
         assert row["status_code"] != 2
     assert child_pid[0] != os.getpid()
+
+
+def test_disabled_startup_and_request_do_not_import_sdk():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+from atom.observability import tracing
+tracing.initialize()
+assert tracing._tracer() is None
+assert not any(name.startswith('opentelemetry') for name in sys.modules)
+tracing.shutdown()
+""",
+        ],
+        env={**os.environ, "ATOM_ENABLE_OTEL_TRACE": "0"},
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr

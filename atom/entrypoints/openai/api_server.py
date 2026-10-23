@@ -44,6 +44,7 @@ from atom.model_engine.sequence import new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
 from atom.multimodal.registry import get_native_multimodal_processor
 from atom.observability.tracing import TraceMiddleware, set_request_id
+from atom.observability.tracing import initialize as initialize_tracing
 from atom.observability.tracing import shutdown as shutdown_tracing
 from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
@@ -1529,6 +1530,7 @@ async def _periodic(interval: float, step: Callable[[], Awaitable[None]]) -> Non
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
+    await asyncio.to_thread(initialize_tracing)
     metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
     logger.info("Server started successfully and ready to accept requests")
     tune_gc()

@@ -228,6 +228,7 @@ class EngineCore:
 
         # KV cache allocated, graphs captured, BlockPool built: everything this
         # process holds for its lifetime exists, and the next thing is traffic.
+        tracing.initialize()
         self._freeze_after_startup()
 
         self._send_ready_signal()
@@ -435,17 +436,18 @@ class EngineCore:
                 elif self.has_pending_kv_work():
                     self._advance_idle_kv_transfer()
         finally:
-            # Teardown runs even on exceptions so the sender thread/socket
-            # don't leak. Isolate the final publish so a publisher hiccup
-            # cannot skip shutdown_kv_events().
-            self._drain_kv_work_at_exit()
             try:
-                self.scheduler.publish_kv_events()
-            except Exception:
-                logger.exception("KV event publish during shutdown failed")
-            self.scheduler.shutdown_kv_events()
-
-            tracing.shutdown()
+                # Teardown runs even on exceptions so the sender thread/socket
+                # don't leak. Isolate the final publish so a publisher hiccup
+                # cannot skip shutdown_kv_events().
+                self._drain_kv_work_at_exit()
+                try:
+                    self.scheduler.publish_kv_events()
+                except Exception:
+                    logger.exception("KV event publish during shutdown failed")
+                self.scheduler.shutdown_kv_events()
+            finally:
+                tracing.shutdown()
 
     def _process_engine_step(self):
         try:
@@ -502,6 +504,7 @@ class EngineCore:
         has_seqs = len(scheduled_batch.req_ids) > 0
         if has_seqs:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
+            tracing.record_forward(scheduled_batch, seqs)
             self.scheduler.metrics.record_forward(scheduled_batch, seqs)
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
@@ -765,6 +768,7 @@ class EngineCore:
                         continue
                     if request_type == EngineCoreRequestType.ADD:
                         attach_shipped_chains(reqs, *chains)
+                        tracing.enqueue_many(reqs, received_at=received_at)
                         for req in reqs:
                             SchedulerMetrics.enqueue(req, received_at=received_at)
                         req_ids = [req.id for req in reqs]
@@ -930,16 +934,17 @@ class DPEngineCoreProc(EngineCore):
 
                 self.engines_running = global_has_unfinished
         finally:
-            # Isolate the final publish so a publisher hiccup cannot skip
-            # shutdown_kv_events() (which closes the sender thread/socket).
-            self._drain_kv_work_at_exit()
             try:
-                self.scheduler.publish_kv_events()
-            except Exception:
-                logger.exception("KV event publish during DP shutdown failed")
-            self.scheduler.shutdown_kv_events()
-
-            tracing.shutdown()
+                # Isolate the final publish so a publisher hiccup cannot skip
+                # shutdown_kv_events() (which closes the sender thread/socket).
+                self._drain_kv_work_at_exit()
+                try:
+                    self.scheduler.publish_kv_events()
+                except Exception:
+                    logger.exception("KV event publish during DP shutdown failed")
+                self.scheduler.shutdown_kv_events()
+            finally:
+                tracing.shutdown()
 
     def _execute_dummy_batch(self):
         return self.runner_mgr.call_func("dummy_execution", wait_out=True)

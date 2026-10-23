@@ -2,6 +2,17 @@
 
 This document describes the environment variables used in the ATOM project.
 
+## OpenTelemetry tracing
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_ENABLE_OTEL_TRACE** | bool | false | Enable standalone request tracing with `1` or `true` (case insensitive). Requires the optional `tracing` dependencies and an explicit OTLP/HTTP traces endpoint. Read at process startup; restart to change. |
+| **ATOM_TRACE_VERSION** | str | `unknown` | Exact build version attached to each tracing resource as `atom.version`. Set before startup. |
+
+The standard `OTEL_SERVICE_NAME` and `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`
+variables configure service identity and delivery. See [tracing setup and
+limitations](observability/README.md).
+
 ## Metadata H2D
 
 | Variable | Type | Default | Description |

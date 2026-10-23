@@ -1450,11 +1450,13 @@ class Scheduler:
         )
 
     def add(self, seq: Sequence):
+        tracing.enqueue(seq)
         self.metrics.enqueue(seq)
         self._warn_if_unschedulable(seq)
         self.waiting.append(seq)
 
     def extend(self, seqs: list[Sequence]):
+        tracing.enqueue_many(seqs)
         for seq in seqs:
             self.metrics.enqueue(seq)
             self._warn_if_unschedulable(seq)
@@ -3956,6 +3958,8 @@ class Scheduler:
                 )
                 if not is_final:
                     pp_middle_chunk_ids.add(req_id)
+                elif i >= batch.total_seqs_num_decode:
+                    tracing.prefill_complete(seq)
         elif batch is not None:
             for i, req_id in enumerate(batch.req_ids):
                 seq = running_by_id.get(req_id)
@@ -4978,10 +4982,12 @@ class PrefillScheduler:
         pass
 
     def add(self, seq: Sequence):
+        tracing.enqueue(seq)
         self.metrics.enqueue(seq)
         self.waiting.append(seq)
 
     def extend(self, seqs: list):
+        tracing.enqueue_many(seqs)
         for seq in seqs:
             self.metrics.enqueue(seq)
         self.waiting.extend(seqs)

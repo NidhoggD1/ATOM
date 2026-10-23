@@ -2074,6 +2074,7 @@ class DisaggCoreManager(CoreManager):
 
     def add_request(self, seqs: list[Sequence]):
         """Fan-out: send every new sequence to BOTH prefill and decode."""
+        tracing.bind_sequences(seqs, unsupported="pd")
         logger.debug(f"{self.label}: fan-out {len(seqs)} seqs to prefill and decode")
         # Register stream callbacks before sending (decode will produce output).
         for seq in seqs:

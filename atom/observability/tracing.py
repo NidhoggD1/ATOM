@@ -15,9 +15,12 @@ import time
 from contextvars import ContextVar
 from dataclasses import dataclass
 
+from atom.utils import envs
+
 logger = logging.getLogger("atom")
-_ENABLED = os.getenv("ATOM_ENABLE_OTEL_TRACE", "0").lower() in {"1", "true"}
+_ENABLED = envs.ATOM_ENABLE_OTEL_TRACE
 _provider = None
+_cached_tracer = None
 _provider_pid = None
 _init_failed_pid = None
 _lock = threading.Lock()
@@ -26,8 +29,9 @@ _request: ContextVar = ContextVar("atom_otel_request", default=None)
 
 
 def _after_fork():
-    global _provider, _provider_pid, _lock, _init_failed_pid
+    global _provider, _cached_tracer, _provider_pid, _lock, _init_failed_pid
     _provider = None
+    _cached_tracer = None
     _provider_pid = None
     _init_failed_pid = None
     _lock = threading.Lock()
@@ -46,11 +50,12 @@ def _warn_once():
         logger.warning("ATOM trace operation failed; inference continues")
 
 
-def _tracer():
-    global _provider, _provider_pid, _init_failed_pid
+def initialize():
+    """Build process-local SDK state at startup, before accepting traffic."""
+    global _provider, _cached_tracer, _provider_pid, _init_failed_pid
     pid = os.getpid()
     if not _ENABLED or _init_failed_pid == pid:
-        return None
+        return
     if _provider_pid != pid:
         with _lock:
             if _provider_pid != pid:
@@ -74,9 +79,7 @@ def _tracer():
                             {
                                 "service.name": os.getenv("OTEL_SERVICE_NAME", "atom"),
                                 "service.instance.id": f"{os.uname().nodename}:{pid}",
-                                "atom.version": os.getenv(
-                                    "ATOM_TRACE_VERSION", "unknown"
-                                ),
+                                "atom.version": envs.ATOM_TRACE_VERSION,
                             }
                         ),
                         shutdown_on_exit=False,
@@ -89,22 +92,34 @@ def _tracer():
                             schedule_delay_millis=1000,
                         )
                     )
+                    _cached_tracer = provider.get_tracer("atom.standalone")
                     _provider = provider
                     _provider_pid = pid
                     atexit.register(shutdown)
                 except Exception:  # noqa: BLE001 - telemetry must not fail inference
                     _init_failed_pid = pid
                     _warn_once()
-                    return None
-    return _provider.get_tracer("atom.standalone")
+                    return
+
+
+def _tracer():
+    # No imports, construction or locks on the event loop / scheduler path.
+    if _ENABLED and _provider_pid == os.getpid():
+        return _cached_tracer
+    return None
 
 
 def shutdown():
     """Flush only this process's provider, off any inference request path."""
+    global _provider, _cached_tracer, _provider_pid
     if _provider is not None and _provider_pid == os.getpid():
+        provider = _provider
+        _provider = _cached_tracer = _provider_pid = None
         try:
-            _provider.force_flush(timeout_millis=2000)
-            _provider.shutdown()
+            try:
+                provider.force_flush(timeout_millis=2000)
+            finally:
+                provider.shutdown()
         except Exception:  # noqa: BLE001 - best-effort shutdown
             _warn_once()
 
@@ -124,7 +139,7 @@ class SequenceTiming:
         return self.epoch_ns + (time.perf_counter_ns() - self.monotonic_ns)
 
 
-def bind_sequences(seqs):
+def bind_sequences(seqs, *, unsupported=None):
     """Runs on the API event-loop thread, before CoreManager serializes ADD."""
     if not _ENABLED:
         return
@@ -132,12 +147,17 @@ def bind_sequences(seqs):
     if request is None:
         return
     for seq in seqs:
-        # This PoC does not claim distributed P/D timing. Its two schedulers
-        # need distinct span identities and a transfer boundary first.
-        if (getattr(seq, "kv_transfer_params", None) or {}).get(
-            "do_remote_prefill"
-        ) or (getattr(seq, "kv_transfer_params", None) or {}).get("do_remote_decode"):
-            request["span"].set_attribute("atom.trace.unsupported", "pd")
+        # P/D needs distinct span identities and transfer boundaries first.
+        transfer = getattr(seq, "kv_transfer_params", None) or {}
+        if (
+            unsupported
+            or transfer.get("do_remote_prefill")
+            or transfer.get("do_remote_decode")
+        ):
+            request["span"].set_attribute("atom.trace.unsupported", unsupported or "pd")
+            # Also safe if an already-bound sequence is passed through again.
+            seq.__dict__.pop("_atom_trace_carrier", None)
+            seq.__dict__.pop("_atom_trace_timing", None)
             continue
         seq._atom_trace_carrier = dict(request["carrier"])
         seq._atom_trace_model = request["model"]
@@ -166,6 +186,19 @@ def enqueue(seq, *, received_at=None):
     epoch = time.time_ns()
     received = mono if received_at is None else int(received_at * 1e9)
     seq._atom_trace_timing = SequenceTiming(epoch - (mono - received), received)
+
+
+def enqueue_many(seqs, *, received_at=None):
+    if _ENABLED:
+        for seq in seqs:
+            enqueue(seq, received_at=received_at)
+
+
+def record_forward(batch, seqs):
+    """Observe real dispatch independently of Prometheus metrics."""
+    if _ENABLED and not batch.is_dummy_run:
+        for i, req_id in enumerate(batch.req_ids):
+            forward(seqs[req_id], is_decode=i < batch.total_seqs_num_decode)
 
 
 def forward(seq, *, is_decode):
@@ -210,6 +243,42 @@ def _completed(tracer, name, parent, start, end, attributes, failed):
         span.set_status(Status(StatusCode.ERROR))
     span.end(end_time=max(start, end))
     return span
+
+
+def _phases(timing, end, completion_tokens, failed):
+    queue_end = timing.forward_ns if timing.forward_ns is not None else end
+    phases = [
+        ("prefill_waiting", timing.epoch_ns, queue_end, timing.forward_ns is None)
+    ]
+    if timing.forward_ns is not None and timing.decode_ns is None:
+        prefill_end = (
+            timing.prefill_end_ns if timing.prefill_end_ns is not None else end
+        )
+        phases.append(
+            (
+                "prefill_forward",
+                timing.forward_ns,
+                prefill_end,
+                timing.prefill_end_ns is None,
+            )
+        )
+    decode_start = (
+        timing.decode_ns if timing.decode_ns is not None else timing.prefill_end_ns
+    )
+    if (
+        decode_start is not None
+        and decode_start < end
+        and (completion_tokens > 1 or failed)
+    ):
+        phases.append(("decode_forward", decode_start, end, True))
+    return phases
+
+
+_PHASE_LATENCY = {
+    "prefill_waiting": "gen_ai.latency.time_in_queue",
+    "prefill_forward": "gen_ai.latency.time_in_model_prefill",
+    "decode_forward": "gen_ai.latency.time_in_model_decode",
+}
 
 
 def finish(seq, *, reason, num_tokens=None):
@@ -268,20 +337,12 @@ def finish(seq, *, reason, num_tokens=None):
         }
         if failed:
             attributes["error.type"] = reason.split(":", 1)[0]
-        queue_end = timing.forward_ns or end
-        attributes["gen_ai.latency.time_in_queue"] = (queue_end - timing.epoch_ns) / 1e9
+        phases = _phases(timing, end, max(0, int(finalized) - prompt_tokens), failed)
+        for name, start_ns, end_ns, _ in phases:
+            attributes[_PHASE_LATENCY[name]] = (end_ns - start_ns) / 1e9
         if timing.first_token_ns is not None:
             attributes["gen_ai.latency.time_to_first_token"] = (
                 timing.first_token_ns - timing.epoch_ns
-            ) / 1e9
-        if timing.forward_ns is not None and timing.decode_ns is None:
-            attributes["gen_ai.latency.time_in_model_prefill"] = (
-                (timing.prefill_end_ns or end) - timing.forward_ns
-            ) / 1e9
-        decode_start = timing.decode_ns or timing.prefill_end_ns
-        if decode_start is not None and int(finalized) - prompt_tokens > 1:
-            attributes["gen_ai.latency.time_in_model_decode"] = (
-                end - decode_start
             ) / 1e9
         # Completed spans preserve the actual boundaries while avoiding live
         # spans across scheduler iterations, preemption, and request pickling.
@@ -292,36 +353,30 @@ def finish(seq, *, reason, num_tokens=None):
             attributes=attributes,
         )
         parent = set_span_in_context(root)
-        _completed(
-            tracer,
-            "prefill_waiting",
-            parent,
-            timing.epoch_ns,
-            queue_end,
-            attributes,
-            failed,
-        )
-        if timing.forward_ns is not None and timing.decode_ns is None:
-            prefill_end = timing.prefill_end_ns or end
+        # Phase spans carry correlation only. Request usage and aggregate
+        # latencies belong to engine.request, so collectors count them once.
+        phase_attributes = {
+            key: attributes[key]
+            for key in (
+                "gen_ai.request.id",
+                "atom.sequence.id",
+                "gen_ai.response.model",
+            )
+        }
+        for name, start_ns, end_ns, active in phases:
+            phase_failed = failed and active
             _completed(
                 tracer,
-                "prefill_forward",
+                name,
                 parent,
-                timing.forward_ns,
-                prefill_end,
-                attributes,
-                failed,
-            )
-        else:
-            prefill_end = None
-        decode_start = timing.decode_ns or prefill_end
-        if (
-            decode_start is not None
-            and decode_start < end
-            and int(finalized) - prompt_tokens > 1
-        ):
-            _completed(
-                tracer, "decode_forward", parent, decode_start, end, attributes, failed
+                start_ns,
+                end_ns,
+                (
+                    {**phase_attributes, "error.type": normalized_reason}
+                    if phase_failed
+                    else phase_attributes
+                ),
+                phase_failed,
             )
         if failed:
             from opentelemetry.trace import Status, StatusCode
