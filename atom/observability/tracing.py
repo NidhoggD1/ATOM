@@ -198,6 +198,7 @@ def enqueue(seq, *, received_at=None):
         received = mono if received_at is None else int(received_at * 1e9)
         seq._atom_trace_timing = SequenceTiming(epoch - (mono - received), received)
     except Exception:  # noqa: BLE001 - telemetry must not fail admission
+        _unbind(seq)
         _warn_once()
 
 
@@ -232,6 +233,7 @@ def forward(seq, *, is_decode):
             if is_decode:
                 timing.decode_ns = timing.forward_ns
     except Exception:  # noqa: BLE001 - telemetry must not fail a forward
+        _unbind(seq)
         _warn_once()
 
 
@@ -247,6 +249,7 @@ def prefill_complete(seq):
         ):
             timing.prefill_end_ns = timing.now()
     except Exception:  # noqa: BLE001 - telemetry must not fail postprocess
+        _unbind(seq)
         _warn_once()
 
 
@@ -258,6 +261,7 @@ def first_token(seq):
         if timing is not None and timing.first_token_ns is None:
             timing.first_token_ns = timing.now()
     except Exception:  # noqa: BLE001 - telemetry must not fail postprocess
+        _unbind(seq)
         _warn_once()
 
 
@@ -312,12 +316,12 @@ _PHASE_LATENCY = {
 def finish(seq, *, reason, num_tokens=None):
     if not _ENABLED:
         return
-    timing = getattr(seq, "_atom_trace_timing", None)
-    if timing is None or timing.done:
-        return
-    timing.done = True
-    end = timing.now()
     try:
+        timing = getattr(seq, "_atom_trace_timing", None)
+        if timing is None or timing.done:
+            return
+        timing.done = True
+        end = timing.now()
         tracer = _tracer()
         if tracer is None:
             return
@@ -412,6 +416,7 @@ def finish(seq, *, reason, num_tokens=None):
             root.set_status(Status(StatusCode.ERROR))
         root.end(end_time=end)
     except Exception:  # noqa: BLE001 - telemetry must not fail inference
+        _unbind(seq)
         _warn_once()
 
 

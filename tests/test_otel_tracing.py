@@ -612,3 +612,67 @@ def test_hooks_fail_open_and_leave_request_untraced(spans, clock):
     execute(app)
     assert tracing._warned
     assert [s.name for s in spans.get_finished_spans()] == ["atom.request"]
+
+
+@pytest.mark.parametrize(
+    "hook", ["enqueue", "forward", "prefill_complete", "first_token", "finish"]
+)
+def test_failed_timing_hook_drops_trace_and_later_finish_still_runs(
+    spans, clock, monkeypatch, hook
+):
+    class BrokenTiming:
+        def __getattr__(self, name):
+            raise RuntimeError("broken timing")
+
+    async def app(scope, receive, send):
+        seq = sequence()
+        tracing.bind_sequences([seq])
+        if hook == "enqueue":
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    tracing.time,
+                    "time_ns",
+                    lambda: (_ for _ in ()).throw(RuntimeError("clock failure")),
+                )
+                tracing.enqueue(seq)
+        else:
+            tracing.enqueue(seq)
+            seq._atom_trace_timing = BrokenTiming()
+            if hook == "forward":
+                tracing.forward(seq, is_decode=False)
+            elif hook == "prefill_complete":
+                tracing.prefill_complete(seq)
+            elif hook == "first_token":
+                tracing.first_token(seq)
+            else:
+                tracing.finish(seq, reason="max_tokens")
+        assert not hasattr(seq, "_atom_trace_carrier")
+        assert not hasattr(seq, "_atom_trace_timing")
+        tracing.enqueue(seq)  # no re-admission of a partial trace
+        tracing.finish(seq, reason="max_tokens")
+        await send({"type": "http.response.start", "status": 200})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    execute(app)
+    assert [s.name for s in spans.get_finished_spans()] == ["atom.request"]
+
+
+def test_finish_clock_failure_preserves_request_completion(spans, clock, monkeypatch):
+    async def app(scope, receive, send):
+        seq = sequence()
+        tracing.bind_sequences([seq])
+        tracing.enqueue(seq)
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                tracing.time,
+                "perf_counter_ns",
+                lambda: (_ for _ in ()).throw(RuntimeError("clock failure")),
+            )
+            tracing.finish(seq, reason="max_tokens")
+        assert not hasattr(seq, "_atom_trace_carrier")
+        tracing.finish(seq, reason="max_tokens")
+        await send({"type": "http.response.start", "status": 200})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    execute(app)
+    assert [s.name for s in spans.get_finished_spans()] == ["atom.request"]
