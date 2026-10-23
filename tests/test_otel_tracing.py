@@ -551,3 +551,64 @@ def test_disabled_batch_hooks_do_not_visit_sequences(monkeypatch):
 
     tracing.enqueue_many(UnusedSequences())
     tracing.record_forward(UnusedBatch(), UnusedSequences())
+
+
+@pytest.mark.parametrize("status,failed", [(200, False), (429, False), (503, True)])
+def test_only_server_errors_mark_http_span_failed(spans, status, failed):
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": status})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    execute(app)
+    span = spans.get_finished_spans()[0]
+    assert span.attributes["http.response.status_code"] == status
+    assert (span.status.status_code == StatusCode.ERROR) == failed
+
+
+def test_repeated_tracestate_headers_are_combined(spans):
+    carriers = []
+
+    async def app(scope, receive, send):
+        carriers.append(tracing._request.get()["carrier"])
+
+    request = scope()
+    request["headers"].append((b"TraceState", b"lastvendor=y"))
+    asyncio.run(
+        tracing.TraceMiddleware(app, model=lambda: "test-model")(
+            request, no_receive, no_send
+        )
+    )
+    span = spans.get_finished_spans()[0]
+    assert span.context.trace_state.get("othervendor") == "x"
+    assert span.context.trace_state.get("nsdye") == "1"
+    assert span.context.trace_state.get("lastvendor") == "y"
+    assert "lastvendor=y" in carriers[0]["tracestate"]
+
+
+def test_hooks_fail_open_and_leave_request_untraced(spans, clock):
+    class BrokenTiming:
+        def __getattr__(self, name):
+            raise RuntimeError("broken timing")
+
+    async def app(scope, receive, send):
+        # A truthy non-dict transfer payload cannot be inspected.
+        bad = sequence(1, kv_transfer_params=["unexpected"])
+        tracing.bind_sequences([bad])
+        assert not hasattr(bad, "_atom_trace_carrier")
+        tracing.enqueue(bad)
+        assert getattr(bad, "_atom_trace_timing", None) is None
+
+        broken = sequence(2, _atom_trace_timing=BrokenTiming())
+        tracing.forward(broken, is_decode=False)
+        tracing.prefill_complete(broken)
+        tracing.first_token(broken)
+        batch = SimpleNamespace(
+            is_dummy_run=False, req_ids=[99], total_seqs_num_decode=0
+        )
+        tracing.record_forward(batch, {})  # missing sequence id
+        await send({"type": "http.response.start", "status": 200})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    execute(app)
+    assert tracing._warned
+    assert [s.name for s in spans.get_finished_spans()] == ["atom.request"]

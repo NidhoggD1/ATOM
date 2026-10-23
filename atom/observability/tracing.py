@@ -147,22 +147,32 @@ def bind_sequences(seqs, *, unsupported=None):
     if request is None:
         return
     for seq in seqs:
-        # P/D needs distinct span identities and transfer boundaries first.
-        transfer = getattr(seq, "kv_transfer_params", None) or {}
-        if (
-            unsupported
-            or transfer.get("do_remote_prefill")
-            or transfer.get("do_remote_decode")
-        ):
-            request["span"].set_attribute("atom.trace.unsupported", unsupported or "pd")
-            # Also safe if an already-bound sequence is passed through again.
-            seq.__dict__.pop("_atom_trace_carrier", None)
-            seq.__dict__.pop("_atom_trace_timing", None)
-            continue
-        seq._atom_trace_carrier = dict(request["carrier"])
-        seq._atom_trace_model = request["model"]
-        seq._atom_trace_request_id = request.get("request_id")
-        seq._atom_trace_timing = None
+        try:
+            # P/D needs distinct span identities and transfer boundaries first.
+            transfer = getattr(seq, "kv_transfer_params", None) or {}
+            if (
+                unsupported
+                or transfer.get("do_remote_prefill")
+                or transfer.get("do_remote_decode")
+            ):
+                request["span"].set_attribute(
+                    "atom.trace.unsupported", unsupported or "pd"
+                )
+                _unbind(seq)
+                continue
+            seq._atom_trace_carrier = dict(request["carrier"])
+            seq._atom_trace_model = request["model"]
+            seq._atom_trace_request_id = request.get("request_id")
+            seq._atom_trace_timing = None
+        except Exception:  # noqa: BLE001 - an untraced request still runs
+            _unbind(seq)
+            _warn_once()
+
+
+def _unbind(seq):
+    # Also safe if an already-bound sequence is passed through again.
+    seq.__dict__.pop("_atom_trace_carrier", None)
+    seq.__dict__.pop("_atom_trace_timing", None)
 
 
 def set_request_id(request_id):
@@ -182,10 +192,13 @@ def enqueue(seq, *, received_at=None):
         return
     if getattr(seq, "_atom_trace_timing", None) is not None:
         return
-    mono = time.perf_counter_ns()
-    epoch = time.time_ns()
-    received = mono if received_at is None else int(received_at * 1e9)
-    seq._atom_trace_timing = SequenceTiming(epoch - (mono - received), received)
+    try:
+        mono = time.perf_counter_ns()
+        epoch = time.time_ns()
+        received = mono if received_at is None else int(received_at * 1e9)
+        seq._atom_trace_timing = SequenceTiming(epoch - (mono - received), received)
+    except Exception:  # noqa: BLE001 - telemetry must not fail admission
+        _warn_once()
 
 
 def enqueue_many(seqs, *, received_at=None):
@@ -196,41 +209,56 @@ def enqueue_many(seqs, *, received_at=None):
 
 def record_forward(batch, seqs):
     """Observe real dispatch independently of Prometheus metrics."""
-    if _ENABLED and not batch.is_dummy_run:
+    if not _ENABLED:
+        return
+    try:
+        if batch.is_dummy_run:
+            return
         for i, req_id in enumerate(batch.req_ids):
             forward(seqs[req_id], is_decode=i < batch.total_seqs_num_decode)
+    except Exception:  # noqa: BLE001 - telemetry must not fail a forward
+        _warn_once()
 
 
 def forward(seq, *, is_decode):
     if not _ENABLED:
         return
-    timing = getattr(seq, "_atom_trace_timing", None)
-    if timing is None or timing.done:
-        return
-    if timing.forward_ns is None:
-        timing.forward_ns = timing.now()
-        if is_decode:
-            timing.decode_ns = timing.forward_ns
+    try:
+        timing = getattr(seq, "_atom_trace_timing", None)
+        if timing is None or timing.done:
+            return
+        if timing.forward_ns is None:
+            timing.forward_ns = timing.now()
+            if is_decode:
+                timing.decode_ns = timing.forward_ns
+    except Exception:  # noqa: BLE001 - telemetry must not fail a forward
+        _warn_once()
 
 
 def prefill_complete(seq):
     if not _ENABLED:
         return
-    timing = getattr(seq, "_atom_trace_timing", None)
-    if (
-        timing is not None
-        and timing.forward_ns is not None
-        and timing.prefill_end_ns is None
-    ):
-        timing.prefill_end_ns = timing.now()
+    try:
+        timing = getattr(seq, "_atom_trace_timing", None)
+        if (
+            timing is not None
+            and timing.forward_ns is not None
+            and timing.prefill_end_ns is None
+        ):
+            timing.prefill_end_ns = timing.now()
+    except Exception:  # noqa: BLE001 - telemetry must not fail postprocess
+        _warn_once()
 
 
 def first_token(seq):
     if not _ENABLED:
         return
-    timing = getattr(seq, "_atom_trace_timing", None)
-    if timing is not None and timing.first_token_ns is None:
-        timing.first_token_ns = timing.now()
+    try:
+        timing = getattr(seq, "_atom_trace_timing", None)
+        if timing is not None and timing.first_token_ns is None:
+            timing.first_token_ns = timing.now()
+    except Exception:  # noqa: BLE001 - telemetry must not fail postprocess
+        _warn_once()
 
 
 def _completed(tracer, name, parent, start, end, attributes, failed):
@@ -421,11 +449,16 @@ class TraceMiddleware:
                 )
 
                 propagator = TraceContextTextMapPropagator()
-                headers = {
-                    k.decode("latin1").lower(): v.decode("latin1")
-                    for k, v in scope.get("headers", [])
-                    if k.lower() in {b"traceparent", b"tracestate"}
-                }
+                headers = {}
+                for k, v in scope.get("headers", []):
+                    key = k.decode("latin1").lower()
+                    if key not in {"traceparent", "tracestate"}:
+                        continue
+                    value = v.decode("latin1")
+                    # W3C: repeated tracestate lines form one combined list.
+                    if key == "tracestate" and key in headers:
+                        value = f"{headers[key]},{value}"
+                    headers[key] = value
                 model = str(self.model() or "unknown")
                 span = tracer.start_span(
                     "atom.request",
@@ -448,7 +481,8 @@ class TraceMiddleware:
             if span is not None and message["type"] == "http.response.start":
                 try:
                     span.set_attribute("http.response.status_code", message["status"])
-                    if message["status"] >= 400:
+                    # OTel HTTP semconv: a SERVER span leaves 4xx unset.
+                    if message["status"] >= 500:
                         from opentelemetry.trace import Status, StatusCode
 
                         span.set_status(Status(StatusCode.ERROR))
@@ -470,23 +504,30 @@ class TraceMiddleware:
                 and message["type"] == "http.disconnect"
                 and not response_complete
             ):
-                from opentelemetry.trace import Status, StatusCode
-
-                span.set_attribute("error.type", "client_disconnect")
-                span.set_status(Status(StatusCode.ERROR))
+                _mark_error(span, "client_disconnect")
             return message
 
         try:
             await self.app(scope, traced_receive, traced_send)
         except BaseException as exc:
             if span is not None:
-                from opentelemetry.trace import Status, StatusCode
-
-                span.set_attribute("error.type", type(exc).__name__)
-                span.set_status(Status(StatusCode.ERROR))
+                _mark_error(span, type(exc).__name__)
             raise
         finally:
             if token is not None:
                 _request.reset(token)
             if span is not None:
-                span.end()
+                try:
+                    span.end()
+                except Exception:  # noqa: BLE001 - never mask the app's outcome
+                    _warn_once()
+
+
+def _mark_error(span, error_type):
+    try:
+        from opentelemetry.trace import Status, StatusCode
+
+        span.set_attribute("error.type", error_type)
+        span.set_status(Status(StatusCode.ERROR))
+    except Exception:  # noqa: BLE001 - never mask the app's outcome
+        _warn_once()

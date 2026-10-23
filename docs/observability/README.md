@@ -72,7 +72,11 @@ active at an abnormal termination, `error.type` and ERROR status. Completed
 phases keep their normal status; usage and aggregate latency attributes are
 not copied to children. An omitted phase also has no corresponding root phase
 latency attribute. Normal SSE final-body completion is distinguished from early
-disconnect.
+disconnect. On `atom.request`, 5xx responses, exceptions and early disconnects
+set ERROR; 4xx responses keep the status unset, as the OpenTelemetry HTTP
+server conventions require, and are still visible through
+`http.response.status_code`. Repeated `tracestate` request headers are combined
+into one list before extraction.
 
 ## Export and sampling behavior
 
